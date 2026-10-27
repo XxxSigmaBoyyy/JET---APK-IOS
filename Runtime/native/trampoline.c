@@ -49,31 +49,13 @@ static uint64_t tramp_enter(int idx,
     jet_args a = {0};
     tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r = 0;
-    int do_stats = stats_wanted(c);
-    uint64_t insn0 = 0;
-    struct timespec t0, t1;
-    if (do_stats) {
-        insn0 = c->insn_count;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-    }
-    jet_native_call(c, c->tramps[idx].guest_fn, &a, &r, NULL);
-    if (do_stats) {
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        uint64_t ns = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull
-                    + (uint64_t)(t1.tv_nsec - t0.tv_nsec);
-        uint64_t di = c->insn_count - insn0;
-        if (!c->native_stats[idx].used) {
-            c->native_stats[idx].used = 1;
-            snprintf(c->native_stats[idx].key, sizeof c->native_stats[idx].key,
-                     "%s.%s%s",
-                     c->tramps[idx].class_name[0] ? c->tramps[idx].class_name : "?",
-                     c->tramps[idx].method_name[0] ? c->tramps[idx].method_name : "?",
-                     c->tramps[idx].method_sig);
-        }
-        c->native_stats[idx].calls++;
-        c->native_stats[idx].insn += di;
-        c->native_stats[idx].wall_ns += ns;
-    }
+    char namebuf[192];
+    snprintf(namebuf, sizeof namebuf, "%s.%s",
+             c->tramps[idx].class_name[0] ? c->tramps[idx].class_name : "?",
+             c->tramps[idx].method_name[0] ? c->tramps[idx].method_name : "?");
+    jet_native_call_named(c, namebuf, c->tramps[idx].method_sig,
+                          c->tramps[idx].guest_fn, &a, &r, NULL);
+    (void)stats_wanted(c); /* ensure JET_NATIVE_STATS env enables ctx->stats_enabled */
     jet_loader_pop(c);
     return r;
 }

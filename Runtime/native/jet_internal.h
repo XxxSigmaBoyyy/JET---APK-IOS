@@ -27,6 +27,7 @@ typedef __int128          s128;
 #define JET_BLOCK_CACHE   65536
 #define JET_BLOCK_MAX_INS 64
 #define JET_TRAMP_POOL    256
+#define JET_STATS_POOL    512
 #define JET_GUEST_STACK_DEFAULT (8ull << 20)
 
 /* Bionic arm64 TCB: TPIDR_EL0 points here. 8 words reserved so that
@@ -69,6 +70,13 @@ typedef struct jet_cpu {
     uint64_t stack_base;     /* mmap base of guest stack */
     size_t   stack_size;
     void    *tls_alloc;      /* calloc base for TLS (or NULL) */
+    /* Per-PE exclusive monitor (ARM local monitor). MUST NOT be process-global:
+     * a shared ctx monitor lets concurrent guest threads steal each other's
+     * LDAXR marking and livelock STLXR forever (Telegram ~76s multi-JNI stall). */
+    int       excl_valid;
+    uint64_t  excl_addr;
+    uint64_t  excl_val;
+    uint8_t   excl_size;     /* log2 access size */
 } jet_cpu;
 
 /* Decoded instruction (fixed-size for the block cache). */
@@ -300,7 +308,10 @@ struct jet_ctx {
         uint64_t wall_ns;
         uint64_t calls;
         int      used;
-    } native_stats[JET_TRAMP_POOL];
+    } native_stats[JET_STATS_POOL];
+    /* Optional name for the in-flight jet_native_call (TLS-ish via ctx slot). */
+    /* Actual name passed through jet_native_call_named / tramp. */
+
 
     /* Guest-emulated signal state. NEVER installed on the host process —
      * the embedding JVM owns SIGSEGV/SIGBUS. */

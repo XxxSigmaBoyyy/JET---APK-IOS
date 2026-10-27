@@ -119,11 +119,17 @@ public final class JetEGL10 implements EGL11 {
             if (o.sink != null) {
                 if (o.buf == null) o.buf = new int[o.w * o.hh];
                 boolean okRead = JetEGLNative.readFrame(o.w, o.hh, o.buf);
+                if (okRead && DUMP != null && frames < 40) dump(o.buf, o.w, o.hh);
                 if (okRead) { o.sink.jetPostFrame(o.buf, o.w, o.hh); frames++; if (frames == 1) { firstFrameNanos = System.nanoTime(); System.err.println("[JETGL] first frame presented " + o.w + "x" + o.hh + " sink=" + o.sink.getClass().getName() + " renderer=" + renderer + " (Linux-only Mesa)"); } }
                 else if (frames == 0 && Boolean.getBoolean("jet.texdebug")) System.err.println("[JETGL] readFrame failed " + o.w + "x" + o.hh);
             } else if (frames == 0 && Boolean.getBoolean("jet.texdebug")) System.err.println("[JETGL] swap with null sink");
         }
         return ok(JetEGLNative.swapBuffers(h(d), h(s)));
+    }
+    static final String DUMP = System.getProperty("jet.gl.dump");   // debug: raw ARGB frames -> DUMP/frameN_WxH.argb
+    private static void dump(int[] px, int w, int h) {
+        try (java.io.DataOutputStream o = new java.io.DataOutputStream(new java.io.BufferedOutputStream(new java.io.FileOutputStream(DUMP + "/frame" + frames + "_" + w + "x" + h + ".argb")))) { for (int i = 0; i < w * h; i++) o.writeInt(px[i]); }
+        catch (Throwable t) { System.err.println("[JETGL] dump failed " + t); }
     }
     @Override public boolean eglCopyBuffers(EGLDisplay d, EGLSurface s, Object p) { return false; }
     @Override public boolean eglQuerySurface(EGLDisplay d, EGLSurface s, int attr, int[] v) {

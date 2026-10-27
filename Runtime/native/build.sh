@@ -6,7 +6,7 @@ CFLAGS="-O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function
 LDFLAGS="-lpthread -ldl -lm -Lthird_party -lz"
 mkdir -p build
 
-SRCS="ctx.c decode.c elf_loader.c interp.c host_bionic.c jni_bridge.c trampoline.c setjmp_guest.c asimd.c"
+SRCS="ctx.c decode.c elf_loader.c interp.c host_bionic.c guest_abi.c jni_bridge.c trampoline.c setjmp_guest.c asimd.c"
 OBJS=""
 for s in $SRCS; do
   o="build/${s%.c}.o"
@@ -30,4 +30,17 @@ $CC $CFLAGS tests/test_tg.c -I. build/libjet_native.a $LDFLAGS -o build/test_tg
 echo "CC test_jni"
 $CC $CFLAGS tests/test_jni.c -I. build/libjet_native.a $LDFLAGS -o build/test_jni
 
+
+echo "CC test_mem_bitfield"
+$CC $CFLAGS tests/test_mem_bitfield.c -I. build/libjet_native.a $LDFLAGS -o build/test_mem_bitfield
+echo "CC test_v9_jni_dl"
+$CC $CFLAGS tests/test_v9_jni_dl.c -I. build/libjet_native.a $LDFLAGS -o build/test_v9_jni_dl
+echo "CC test_cxx_eh"
+$CC $CFLAGS tests/test_cxx_eh.c -I. build/libjet_native.a $LDFLAGS -o build/test_cxx_eh
+echo "CC test_v10_trap_abi"
+$CC $CFLAGS tests/test_v10_trap_abi.c -I. build/libjet_native.a $LDFLAGS -o build/test_v10_trap_abi
+echo "CC test_v11_xzr_excl"
+$CC $CFLAGS tests/test_v11_xzr_excl.c -I. build/libjet_native.a $LDFLAGS -o build/test_v11_xzr_excl
+echo "CC test_v101_guest_abi"
+$CC $CFLAGS tests/test_v101_guest_abi.c -I. build/libjet_native.a $LDFLAGS -o build/test_v101_guest_abi
 echo "BUILD OK"

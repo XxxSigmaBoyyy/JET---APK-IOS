@@ -1,5 +1,6 @@
 /* host_bionic.c - bionic/Linux host trap implementations for guest imports. */
 #include "jet_internal.h"
+#include "guest_abi.h"
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -16,6 +17,9 @@
 #include <sys/utsname.h>
 #include <poll.h>
 #include <dirent.h>
+#include <termios.h>
+#include <poll.h>
+#include <sys/resource.h>
 #include <pthread.h>
 #include <sched.h>
 #include <semaphore.h>
@@ -45,6 +49,7 @@
 
 /* Linux-only host headers — guest getauxval/prctl are emulated, never call host. */
 #ifdef __linux__
+#  include <sys/eventfd.h>
 #  include <sys/prctl.h>
 #  include <sys/auxv.h>
 #  include <sys/syscall.h>
@@ -70,65 +75,10 @@ static uint64_t va_arg_gr(jet_va_list_aapcs64 *ap) {
     return v;
 }
 
-/* ---- Android/bionic LP64 struct stat (aarch64) — 128 bytes.
- * Host glibc x86_64 struct stat is 144 bytes with different field order
- * (nlink before mode). Writing host sizeof into a guest buffer smashes the
- * guest stack (saved x19–x28) — root cause of SQLite prepare SIGSEGV after
- * fstat (partner v9: x20 clobbered → ldr [x20,#0xc8]). */
-typedef struct { int64_t tv_sec; int64_t tv_nsec; } jet_guest_timespec;
-typedef struct {
-    uint64_t st_dev;
-    uint64_t st_ino;
-    uint32_t st_mode;
-    uint32_t st_nlink;
-    uint32_t st_uid;
-    uint32_t st_gid;
-    uint64_t st_rdev;
-    uint64_t __pad1;
-    int64_t  st_size;
-    int32_t  st_blksize;
-    int32_t  __pad2;
-    int64_t  st_blocks;
-    jet_guest_timespec st_atim;
-    jet_guest_timespec st_mtim;
-    jet_guest_timespec st_ctim;
-    uint32_t __unused4;
-    uint32_t __unused5;
-} jet_guest_stat;
-_Static_assert(sizeof(jet_guest_stat) == 128, "bionic LP64 struct stat must be 128");
-
-static void host_stat_to_guest(const struct stat *h, jet_guest_stat *g) {
-    memset(g, 0, sizeof *g);
-    g->st_dev = (uint64_t)h->st_dev;
-    g->st_ino = (uint64_t)h->st_ino;
-    g->st_mode = (uint32_t)h->st_mode;
-    g->st_nlink = (uint32_t)h->st_nlink;
-    g->st_uid = (uint32_t)h->st_uid;
-    g->st_gid = (uint32_t)h->st_gid;
-    g->st_rdev = (uint64_t)h->st_rdev;
-    g->st_size = (int64_t)h->st_size;
-    g->st_blksize = (int32_t)h->st_blksize;
-    g->st_blocks = (int64_t)h->st_blocks;
-#if defined(st_atime) || defined(__linux__) || defined(__APPLE__)
-    g->st_atim.tv_sec = (int64_t)h->st_atim.tv_sec;
-    g->st_atim.tv_nsec = (int64_t)h->st_atim.tv_nsec;
-    g->st_mtim.tv_sec = (int64_t)h->st_mtim.tv_sec;
-    g->st_mtim.tv_nsec = (int64_t)h->st_mtim.tv_nsec;
-    g->st_ctim.tv_sec = (int64_t)h->st_ctim.tv_sec;
-    g->st_ctim.tv_nsec = (int64_t)h->st_ctim.tv_nsec;
-#else
-    g->st_atim.tv_sec = (int64_t)h->st_atime;
-    g->st_mtim.tv_sec = (int64_t)h->st_mtime;
-    g->st_ctim.tv_sec = (int64_t)h->st_ctime;
-#endif
-}
-
+/* Guest struct layouts + converters live in guest_abi.h / guest_abi.c (v10.1). */
 static int write_guest_stat(uint64_t guest_buf, const struct stat *h) {
     if (!guest_buf) { errno = EFAULT; return -1; }
-    jet_guest_stat gs;
-    host_stat_to_guest(h, &gs);
-    memcpy(G2H(guest_buf), &gs, sizeof gs);
-    return 0;
+    return jet_write_guest_stat(G2H(guest_buf), h);
 }
 
 
@@ -574,7 +524,17 @@ static uint64_t h_gettid(jet_ctx *c, const jet_args *a, void *u){
 }
 static uint64_t h_getuid(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)a;(void)u; return (uint64_t)getuid(); }
 static uint64_t h_geteuid(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)a;(void)u; return (uint64_t)geteuid(); }
-static uint64_t h_uname(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)uname((struct utsname*)G2H(a->x[0])); }
+static uint64_t h_uname(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    struct utsname hu;
+    int rc = uname(&hu);
+    if (rc == 0 && a->x[0]) {
+        jet_guest_utsname gu;
+        jet_host_utsname_to_guest(&hu, &gu);
+        memcpy(G2H(a->x[0]), &gu, sizeof gu);
+    }
+    return (uint64_t)(int64_t)rc;
+}
 static uint64_t h_prctl(jet_ctx *c, const jet_args *a, void *u){
     (void)u;
     /* Emulate Linux prctl; do not require host <sys/prctl.h> on Darwin. */
@@ -605,10 +565,9 @@ static uint64_t h_prctl(jet_ctx *c, const jet_args *a, void *u){
     return 0;
 }
 
-/* Fake FD allocator so socket/epoll/eventfd never collide with stdin/out/err.
- * Network I/O is intentionally stubbed: connect fails, epoll_wait/poll idle. */
+/* ---- FD tracking: real FDs + Darwin kqueue-backed epoll ---- */
 static int jet_fake_fd_next = 100;
-static uint8_t jet_fake_fd_map[4096]; /* fd -> 1 if fake */
+static uint8_t jet_fake_fd_map[4096];
 static int jet_fake_fd_alloc(void) {
     int fd = jet_fake_fd_next++;
     if (jet_fake_fd_next >= 4000) jet_fake_fd_next = 100;
@@ -618,63 +577,705 @@ static int jet_fake_fd_alloc(void) {
 static int jet_is_fake_fd(int fd) {
     return fd >= 0 && fd < 4096 && jet_fake_fd_map[fd];
 }
+
+/* DIR* table for getdents64 / opendir emulation (fd or cookie → DIR*). */
+#define JET_DIR_SLOTS 64
+static struct { int used; int fd; DIR *dp; long tell; } jet_dirs[JET_DIR_SLOTS];
+static int jet_dir_alloc(DIR *dp, int fd) {
+    for (int i = 0; i < JET_DIR_SLOTS; i++) if (!jet_dirs[i].used) {
+        jet_dirs[i].used = 1; jet_dirs[i].fd = fd; jet_dirs[i].dp = dp; jet_dirs[i].tell = 0;
+        return i;
+    }
+    return -1;
+}
+static void jet_dir_free_slot(int i) {
+    if (i < 0 || i >= JET_DIR_SLOTS) return;
+    if (jet_dirs[i].dp) closedir(jet_dirs[i].dp);
+    memset(&jet_dirs[i], 0, sizeof jet_dirs[i]);
+}
+
+#if defined(__APPLE__)
+#  include <sys/event.h>
+#  include <sys/mount.h>
+/* epoll-on-kqueue: map epfd → kq, and interest list */
+#define JET_EPOLL_MAX 32
+#define JET_EPOLL_INTEREST 256
+typedef struct {
+    int used;
+    int kq;
+    struct { int fd; uint32_t events; uint64_t data; int oneshot; int et; } interest[JET_EPOLL_INTEREST];
+    int ninterest;
+} jet_epoll_kq;
+static jet_epoll_kq jet_epolls[JET_EPOLL_MAX];
+static jet_epoll_kq *jet_epoll_get(int epfd) {
+    for (int i = 0; i < JET_EPOLL_MAX; i++)
+        if (jet_epolls[i].used && jet_epolls[i].kq == epfd) return &jet_epolls[i];
+    return NULL;
+}
+#endif
+
+#if defined(__linux__)
+#  include <sys/epoll.h>
+#  include <sys/statfs.h>
+#  include <sys/statvfs.h>
+#  include <sys/syscall.h>
+#endif
+
 static uint64_t h_socket(jet_ctx *c, const jet_args *a, void *u) {
-    (void)u; (void)a;
+    (void)u;
+#if defined(__APPLE__)
+    /* Real sockets on Darwin so Telegram network can progress under kqueue epoll. */
+    int fd = socket((int)a->x[0], (int)a->x[1], (int)a->x[2]);
+    jet_log(c, 3, "socket() -> %d", fd);
+    return (uint64_t)(int64_t)fd;
+#else
+    /* Linux harness: keep fake sockets (partner network stub) unless JET_REAL_SOCKETS=1 */
+    const char *real = getenv("JET_REAL_SOCKETS");
+    if (real && real[0] == '1') {
+        int fd = socket((int)a->x[0], (int)a->x[1], (int)a->x[2]);
+        return (uint64_t)(int64_t)fd;
+    }
     int fd = jet_fake_fd_alloc();
     jet_log(c, 3, "socket() -> fake fd %d", fd);
     return (uint64_t)(int64_t)fd;
+#endif
 }
+
 static uint64_t h_epoll_create(jet_ctx *c, const jet_args *a, void *u) {
     (void)u; (void)a;
-    int fd = jet_fake_fd_alloc();
-    jet_log(c, 3, "epoll_create -> fake fd %d", fd);
+#if defined(__APPLE__)
+    int kq = kqueue();
+    if (kq < 0) return (uint64_t)(int64_t)-1;
+    for (int i = 0; i < JET_EPOLL_MAX; i++) if (!jet_epolls[i].used) {
+        jet_epolls[i].used = 1; jet_epolls[i].kq = kq; jet_epolls[i].ninterest = 0;
+        jet_log(c, 3, "epoll_create -> kq %d", kq);
+        return (uint64_t)(int64_t)kq;
+    }
+    close(kq); errno = EMFILE; return (uint64_t)(int64_t)-1;
+#elif defined(__linux__)
+    int fd = epoll_create1(0);
+    jet_log(c, 3, "epoll_create -> %d", fd);
     return (uint64_t)(int64_t)fd;
+#else
+    return (uint64_t)(int64_t)jet_fake_fd_alloc();
+#endif
 }
 static uint64_t h_epoll_create1(jet_ctx *c, const jet_args *a, void *u) {
+#if defined(__linux__)
+    (void)u;
+    int flags = (int)a->x[0];
+    int fd = epoll_create1(flags);
+    jet_log(c, 3, "epoll_create1(%d) -> %d", flags, fd);
+    return (uint64_t)(int64_t)fd;
+#else
     return h_epoll_create(c, a, u);
+#endif
 }
+
+/* Linux epoll event flags (guest) */
+#ifndef EPOLLIN
+#define EPOLLIN 0x001
+#define EPOLLOUT 0x004
+#define EPOLLERR 0x008
+#define EPOLLHUP 0x010
+#define EPOLLET 0x80000000u
+#define EPOLLONESHOT 0x40000000u
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 2
+#define EPOLL_CTL_MOD 3
+#endif
+
+static uint64_t h_epoll_ctl(jet_ctx *c, const jet_args *a, void *u) {
+    (void)u; (void)c;
+    int epfd = (int)a->x[0], op = (int)a->x[1], fd = (int)a->x[2];
+    jet_guest_epoll_event *gev = a->x[3] ? (jet_guest_epoll_event *)G2H(a->x[3]) : NULL;
+#if defined(__linux__)
+    struct epoll_event hev;
+    memset(&hev, 0, sizeof hev);
+    if (gev) jet_guest_epoll_to_host(gev, &hev);
+    return (uint64_t)(int64_t)epoll_ctl(epfd, op, fd, gev ? &hev : NULL);
+#elif defined(__APPLE__)
+    jet_epoll_kq *e = jet_epoll_get(epfd);
+    if (!e) { errno = EBADF; return (uint64_t)(int64_t)-1; }
+    if (op == EPOLL_CTL_DEL) {
+        for (int i = 0; i < e->ninterest; i++) if (e->interest[i].fd == fd) {
+            struct kevent kev[2]; int n = 0;
+            EV_SET(&kev[n++], fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+            EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+            kevent(e->kq, kev, n, NULL, 0, NULL);
+            e->interest[i] = e->interest[--e->ninterest];
+            return 0;
+        }
+        errno = ENOENT; return (uint64_t)(int64_t)-1;
+    }
+    if (!gev) { errno = EINVAL; return (uint64_t)(int64_t)-1; }
+    uint32_t ev = gev->events;
+    uint64_t data = gev->data.u64;
+    int oneshot = !!(ev & EPOLLONESHOT);
+    int et = !!(ev & EPOLLET);
+    /* upsert interest */
+    int idx = -1;
+    for (int i = 0; i < e->ninterest; i++) if (e->interest[i].fd == fd) { idx = i; break; }
+    if (idx < 0) {
+        if (e->ninterest >= JET_EPOLL_INTEREST) { errno = ENOMEM; return (uint64_t)(int64_t)-1; }
+        idx = e->ninterest++;
+        e->interest[idx].fd = fd;
+    }
+    e->interest[idx].events = ev;
+    e->interest[idx].data = data;
+    e->interest[idx].oneshot = oneshot;
+    e->interest[idx].et = et;
+    struct kevent kev[2]; int n = 0;
+    unsigned short flags = EV_ADD | (oneshot ? EV_ONESHOT : 0) | (et ? EV_CLEAR : 0);
+    if (ev & EPOLLIN) EV_SET(&kev[n++], fd, EVFILT_READ, flags, 0, 0, (void*)(uintptr_t)idx);
+    if (ev & EPOLLOUT) EV_SET(&kev[n++], fd, EVFILT_WRITE, flags, 0, 0, (void*)(uintptr_t)idx);
+    if (n && kevent(e->kq, kev, n, NULL, 0, NULL) < 0) return (uint64_t)(int64_t)-1;
+    return 0;
+#else
+    (void)epfd;(void)op;(void)fd;(void)gev; return 0;
+#endif
+}
+
+static uint64_t h_epoll_wait(jet_ctx *c, const jet_args *a, void *u) {
+    (void)u; (void)c;
+    int epfd = (int)a->x[0];
+    jet_guest_epoll_event *gev = a->x[1] ? (jet_guest_epoll_event *)G2H(a->x[1]) : NULL;
+    int maxevents = (int)a->x[2];
+    int timeout = (int)a->x[3];
+    if (maxevents <= 0 || !gev) return 0;
+#if defined(__linux__)
+    struct epoll_event *hev = calloc((size_t)maxevents, sizeof *hev);
+    if (!hev) { errno = ENOMEM; return (uint64_t)(int64_t)-1; }
+    int n = epoll_wait(epfd, hev, maxevents, timeout);
+    for (int i = 0; i < n; i++) jet_host_epoll_to_guest(&hev[i], &gev[i]);
+    free(hev);
+    return (uint64_t)(int64_t)n;
+#elif defined(__APPLE__)
+    jet_epoll_kq *e = jet_epoll_get(epfd);
+    if (!e) { errno = EBADF; return (uint64_t)(int64_t)-1; }
+    struct kevent *kev = calloc((size_t)maxevents, sizeof *kev);
+    if (!kev) { errno = ENOMEM; return (uint64_t)(int64_t)-1; }
+    struct timespec ts, *tsp = NULL;
+    if (timeout >= 0) {
+        ts.tv_sec = timeout / 1000;
+        ts.tv_nsec = (timeout % 1000) * 1000000L;
+        tsp = &ts;
+    }
+    int n = kevent(e->kq, NULL, 0, kev, maxevents, tsp);
+    int out = 0;
+    for (int i = 0; i < n && out < maxevents; i++) {
+        int idx = (int)(uintptr_t)kev[i].udata;
+        if (idx < 0 || idx >= e->ninterest) continue;
+        uint32_t ev = 0;
+        if (kev[i].filter == EVFILT_READ) ev |= EPOLLIN;
+        if (kev[i].filter == EVFILT_WRITE) ev |= EPOLLOUT;
+        if (kev[i].flags & EV_EOF) ev |= EPOLLHUP;
+        if (kev[i].flags & EV_ERROR) ev |= EPOLLERR;
+        /* merge if same fd already in output */
+        int merged = 0;
+        for (int j = 0; j < out; j++) if (gev[j].data.u64 == e->interest[idx].data) {
+            gev[j].events |= ev; merged = 1; break;
+        }
+        if (!merged) {
+            memset(&gev[out], 0, sizeof gev[out]);
+            gev[out].events = ev;
+            gev[out].data.u64 = e->interest[idx].data;
+            out++;
+        }
+    }
+    free(kev);
+    return (uint64_t)(int64_t)out;
+#else
+    (void)epfd;(void)timeout;
+    struct timespec ts = {0, 50 * 1000 * 1000};
+    nanosleep(&ts, NULL);
+    return 0;
+#endif
+}
+
 static uint64_t h_eventfd(jet_ctx *c, const jet_args *a, void *u) {
-    (void)u; (void)a;
-    return (uint64_t)(int64_t)jet_fake_fd_alloc();
+    (void)u; (void)a; (void)c;
+#if defined(__linux__)
+    return (uint64_t)(int64_t)eventfd((unsigned)a->x[0], (int)a->x[1]);
+#else
+    /* Darwin: pipe pair, return read end; write end leaked for now — fine for stubs */
+    int p[2];
+    if (pipe(p) != 0) return (uint64_t)(int64_t)-1;
+    return (uint64_t)(int64_t)p[0];
+#endif
 }
 static uint64_t h_pipe_fn(jet_ctx *c, const jet_args *a, void *u) {
-    (void)u;
+    (void)u; (void)c;
+    int hs[2];
+    if (pipe(hs) != 0) return (uint64_t)(int64_t)-1;
     int *p = a->x[0] ? (int*)G2H(a->x[0]) : NULL;
-    if (p) { p[0] = jet_fake_fd_alloc(); p[1] = jet_fake_fd_alloc(); }
+    if (p) { p[0] = hs[0]; p[1] = hs[1]; }
     return 0;
 }
+
+/* sockaddr-aware bind/connect/accept/sendto/recvfrom/getsockname/getpeername */
+static uint64_t h_bind_fn(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    int fd = (int)a->x[0];
+    if (jet_is_fake_fd(fd)) return 0;
+    uint8_t host_sa[128];
+    int hlen = jet_guest_sockaddr_to_host(a->x[1] ? G2H(a->x[1]) : NULL, (uint32_t)a->x[2],
+                                          host_sa, sizeof host_sa);
+    if (hlen < 0) { errno = EINVAL; return (uint64_t)(int64_t)-1; }
+    return (uint64_t)(int64_t)bind(fd, (struct sockaddr*)host_sa, (socklen_t)hlen);
+}
 static uint64_t h_connect(jet_ctx *c, const jet_args *a, void *u) {
-    (void)u; (void)a;
-    jet_log(c, 2, "connect(fd=%d) stub → EINPROGRESS", (int)a->x[0]);
-    errno = EINPROGRESS;
-    return (uint64_t)(int64_t)-1;
+    (void)u;
+    int fd = (int)a->x[0];
+    if (jet_is_fake_fd(fd)) {
+        jet_log(c, 2, "connect(fd=%d) stub → EINPROGRESS", fd);
+        errno = EINPROGRESS; return (uint64_t)(int64_t)-1;
+    }
+    uint8_t host_sa[128];
+    int hlen = jet_guest_sockaddr_to_host(a->x[1] ? G2H(a->x[1]) : NULL, (uint32_t)a->x[2],
+                                          host_sa, sizeof host_sa);
+    if (hlen < 0) { errno = EINVAL; return (uint64_t)(int64_t)-1; }
+    return (uint64_t)(int64_t)connect(fd, (struct sockaddr*)host_sa, (socklen_t)hlen);
 }
-static uint64_t h_bind_fn(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u;(void)a; return 0; }
-static uint64_t h_listen_fn(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u;(void)a; return 0; }
-static uint64_t h_setsockopt(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u;(void)a; return 0; }
-static uint64_t h_getsockopt(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u;(void)a; return 0; }
-static uint64_t h_epoll_ctl(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u;(void)a; return 0; }
-static uint64_t h_epoll_wait(jet_ctx *c, const jet_args *a, void *u){
-    (void)u; (void)a; (void)c;
-    /* Idle briefly so network thread doesn't hot-spin the host. */
-    struct timespec ts = {0, 50 * 1000 * 1000}; /* 50ms */
-    nanosleep(&ts, NULL);
-    return 0; /* no events */
+static uint64_t h_listen_fn(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    int fd = (int)a->x[0];
+    if (jet_is_fake_fd(fd)) return 0;
+    return (uint64_t)(int64_t)listen(fd, (int)a->x[1]);
 }
-static uint64_t h_poll_fn(jet_ctx *c, const jet_args *a, void *u){
-    (void)u; (void)c;
-    int timeout = (int)a->x[2];
-    if (timeout != 0) {
-        struct timespec ts = {0, 20 * 1000 * 1000};
-        nanosleep(&ts, NULL);
+static uint64_t h_accept(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    int fd = (int)a->x[0];
+    if (jet_is_fake_fd(fd)) { errno = EAGAIN; return (uint64_t)(int64_t)-1; }
+    uint8_t host_sa[128];
+    socklen_t hlen = sizeof host_sa;
+    int nfd = accept(fd, (struct sockaddr*)host_sa, &hlen);
+    if (nfd < 0) return (uint64_t)(int64_t)-1;
+    if (a->x[1] && a->x[2]) {
+        uint32_t *glenp = (uint32_t*)G2H(a->x[2]);
+        uint32_t cap = glenp ? *glenp : 128;
+        int gl = jet_host_sockaddr_to_guest(host_sa, hlen, G2H(a->x[1]), cap);
+        if (glenp && gl >= 0) *glenp = (uint32_t)gl;
+    }
+    return (uint64_t)(int64_t)nfd;
+}
+static uint64_t h_getsockname_peer(jet_ctx *c, const jet_args *a, void *u, int peer){
+    (void)c;(void)u;
+    int fd = (int)a->x[0];
+    if (jet_is_fake_fd(fd)) { errno = EINVAL; return (uint64_t)(int64_t)-1; }
+    uint8_t host_sa[128];
+    socklen_t hlen = sizeof host_sa;
+    int rc = peer ? getpeername(fd, (struct sockaddr*)host_sa, &hlen)
+                  : getsockname(fd, (struct sockaddr*)host_sa, &hlen);
+    if (rc != 0) return (uint64_t)(int64_t)rc;
+    if (a->x[1] && a->x[2]) {
+        uint32_t *glenp = (uint32_t*)G2H(a->x[2]);
+        uint32_t cap = glenp ? *glenp : 128;
+        int gl = jet_host_sockaddr_to_guest(host_sa, hlen, G2H(a->x[1]), cap);
+        if (glenp && gl >= 0) *glenp = (uint32_t)gl;
     }
     return 0;
 }
+static uint64_t h_getsockname(jet_ctx *c, const jet_args *a, void *u){ return h_getsockname_peer(c,a,u,0); }
+static uint64_t h_getpeername(jet_ctx *c, const jet_args *a, void *u){ return h_getsockname_peer(c,a,u,1); }
+
+static uint64_t h_sendto(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    int fd = (int)a->x[0];
+    if (jet_is_fake_fd(fd)) return a->x[2];
+    const void *buf = a->x[1] ? G2H(a->x[1]) : NULL;
+    size_t len = (size_t)a->x[2];
+    int flags = (int)a->x[3];
+    if (!a->x[4] || !a->x[5]) return (uint64_t)(int64_t)send(fd, buf, len, flags);
+    uint8_t host_sa[128];
+    int hlen = jet_guest_sockaddr_to_host(G2H(a->x[4]), (uint32_t)a->x[5], host_sa, sizeof host_sa);
+    if (hlen < 0) { errno = EINVAL; return (uint64_t)(int64_t)-1; }
+    return (uint64_t)(int64_t)sendto(fd, buf, len, flags, (struct sockaddr*)host_sa, (socklen_t)hlen);
+}
+static uint64_t h_recvfrom(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    int fd = (int)a->x[0];
+    if (jet_is_fake_fd(fd)) { errno = EAGAIN; return (uint64_t)(int64_t)-1; }
+    void *buf = a->x[1] ? G2H(a->x[1]) : NULL;
+    size_t len = (size_t)a->x[2];
+    int flags = (int)a->x[3];
+    if (!a->x[4]) return (uint64_t)(int64_t)recv(fd, buf, len, flags);
+    uint8_t host_sa[128];
+    socklen_t hlen = sizeof host_sa;
+    ssize_t n = recvfrom(fd, buf, len, flags, (struct sockaddr*)host_sa, &hlen);
+    if (n < 0) return (uint64_t)(int64_t)-1;
+    if (a->x[5]) {
+        uint32_t *glenp = (uint32_t*)G2H(a->x[5]);
+        uint32_t cap = glenp ? *glenp : 128;
+        int gl = jet_host_sockaddr_to_guest(host_sa, hlen, G2H(a->x[4]), cap);
+        if (glenp && gl >= 0) *glenp = (uint32_t)gl;
+    } else {
+        jet_host_sockaddr_to_guest(host_sa, hlen, G2H(a->x[4]), 128);
+    }
+    return (uint64_t)(int64_t)n;
+}
+static uint64_t h_send(jet_ctx *c, const jet_args *a, void *u){
+    jet_args a2 = *a; a2.x[4]=0; a2.x[5]=0; return h_sendto(c,&a2,u);
+}
+static uint64_t h_recv(jet_ctx *c, const jet_args *a, void *u){
+    jet_args a2 = *a; a2.x[4]=0; a2.x[5]=0; return h_recvfrom(c,&a2,u);
+}
+
+/* sendmsg/recvmsg — convert guest msghdr; iov bases are guest ptrs (identity-mapped). */
+static int guest_msghdr_to_host(const jet_guest_msghdr *gm, struct msghdr *hm,
+                                struct iovec *iov_storage, int iov_cap,
+                                uint8_t *name_storage, size_t name_cap,
+                                socklen_t *name_len_out) {
+    memset(hm, 0, sizeof *hm);
+    if (gm->msg_iovlen > (uint64_t)iov_cap) return -1;
+    jet_guest_iovec *giov = gm->msg_iov ? (jet_guest_iovec*)G2H(gm->msg_iov) : NULL;
+    for (uint64_t i = 0; i < gm->msg_iovlen; i++) {
+        iov_storage[i].iov_base = giov[i].iov_base ? G2H(giov[i].iov_base) : NULL;
+        iov_storage[i].iov_len = (size_t)giov[i].iov_len;
+    }
+    hm->msg_iov = iov_storage;
+    hm->msg_iovlen =
+#if defined(__APPLE__)
+        (int)
+#endif
+        gm->msg_iovlen;
+    if (gm->msg_name && gm->msg_namelen) {
+        int hl = jet_guest_sockaddr_to_host(G2H(gm->msg_name), gm->msg_namelen,
+                                            name_storage, name_cap);
+        if (hl < 0) return -1;
+        hm->msg_name = name_storage;
+        hm->msg_namelen = (socklen_t)hl;
+        if (name_len_out) *name_len_out = (socklen_t)hl;
+    }
+    if (gm->msg_control && gm->msg_controllen) {
+        hm->msg_control = G2H(gm->msg_control);
+        hm->msg_controllen =
+#if defined(__APPLE__)
+            (socklen_t)
+#endif
+            gm->msg_controllen;
+    }
+    hm->msg_flags = gm->msg_flags;
+    return 0;
+}
+
+static uint64_t h_sendmsg(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    int fd = (int)a->x[0];
+    if (jet_is_fake_fd(fd)) return 0;
+    jet_guest_msghdr *gm = a->x[1] ? (jet_guest_msghdr*)G2H(a->x[1]) : NULL;
+    if (!gm) { errno = EINVAL; return (uint64_t)(int64_t)-1; }
+    struct iovec iov[64];
+    uint8_t name[128];
+    struct msghdr hm;
+    if (guest_msghdr_to_host(gm, &hm, iov, 64, name, sizeof name, NULL) < 0) {
+        errno = EINVAL; return (uint64_t)(int64_t)-1;
+    }
+    return (uint64_t)(int64_t)sendmsg(fd, &hm, (int)a->x[2]);
+}
+static uint64_t h_recvmsg(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    int fd = (int)a->x[0];
+    if (jet_is_fake_fd(fd)) { errno = EAGAIN; return (uint64_t)(int64_t)-1; }
+    jet_guest_msghdr *gm = a->x[1] ? (jet_guest_msghdr*)G2H(a->x[1]) : NULL;
+    if (!gm) { errno = EINVAL; return (uint64_t)(int64_t)-1; }
+    struct iovec iov[64];
+    uint8_t name[128];
+    struct msghdr hm;
+    socklen_t nlen = 0;
+    if (guest_msghdr_to_host(gm, &hm, iov, 64, name, sizeof name, &nlen) < 0) {
+        errno = EINVAL; return (uint64_t)(int64_t)-1;
+    }
+    /* Ensure name buffer is writable for recv */
+    if (gm->msg_name) { hm.msg_name = name; hm.msg_namelen = sizeof name; }
+    ssize_t n = recvmsg(fd, &hm, (int)a->x[2]);
+    if (n < 0) return (uint64_t)(int64_t)-1;
+    gm->msg_flags = hm.msg_flags;
+    if (gm->msg_name && hm.msg_namelen) {
+        int gl = jet_host_sockaddr_to_guest(name, hm.msg_namelen, G2H(gm->msg_name), gm->msg_namelen);
+        if (gl >= 0) gm->msg_namelen = (uint32_t)gl;
+    }
+#if defined(__APPLE__)
+    gm->msg_controllen = (uint64_t)hm.msg_controllen;
+#else
+    gm->msg_controllen = (uint64_t)hm.msg_controllen;
+#endif
+    return (uint64_t)(int64_t)n;
+}
+
+static uint64_t h_setsockopt(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    int fd = (int)a->x[0];
+    if (jet_is_fake_fd(fd)) return 0;
+    return (uint64_t)(int64_t)setsockopt(fd, (int)a->x[1], (int)a->x[2],
+        a->x[3] ? G2H(a->x[3]) : NULL, (socklen_t)a->x[4]);
+}
+static uint64_t h_getsockopt(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    int fd = (int)a->x[0];
+    if (jet_is_fake_fd(fd)) return 0;
+    socklen_t len = a->x[4] ? *(socklen_t*)G2H(a->x[4]) : 0;
+    int rc = getsockopt(fd, (int)a->x[1], (int)a->x[2],
+        a->x[3] ? G2H(a->x[3]) : NULL, a->x[4] ? &len : NULL);
+    if (rc == 0 && a->x[4]) *(uint32_t*)G2H(a->x[4]) = (uint32_t)len;
+    return (uint64_t)(int64_t)rc;
+}
+
+static uint64_t h_poll_fn(jet_ctx *c, const jet_args *a, void *u){
+    (void)u; (void)c;
+    jet_guest_pollfd *gp = a->x[0] ? (jet_guest_pollfd*)G2H(a->x[0]) : NULL;
+    nfds_t nfds = (nfds_t)a->x[1];
+    int timeout = (int)a->x[2];
+    if (!gp || nfds == 0) {
+        if (timeout > 0) { struct timespec ts = { timeout/1000, (timeout%1000)*1000000L }; nanosleep(&ts, NULL); }
+        return 0;
+    }
+    /* Guest pollfd matches Linux/Darwin layout (8 bytes) — pass through. */
+    struct pollfd *hp = (struct pollfd *)gp;
+    /* If any fake fds, just idle */
+    for (nfds_t i = 0; i < nfds; i++) if (jet_is_fake_fd(hp[i].fd)) {
+        if (timeout != 0) { struct timespec ts = {0, 20*1000*1000}; nanosleep(&ts, NULL); }
+        return 0;
+    }
+    return (uint64_t)(int64_t)poll(hp, nfds, timeout);
+}
+
+static uint64_t h_select_fn(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    int nfds = (int)a->x[0];
+    jet_guest_fd_set *gr = a->x[1] ? (jet_guest_fd_set*)G2H(a->x[1]) : NULL;
+    jet_guest_fd_set *gw = a->x[2] ? (jet_guest_fd_set*)G2H(a->x[2]) : NULL;
+    jet_guest_fd_set *ge = a->x[3] ? (jet_guest_fd_set*)G2H(a->x[3]) : NULL;
+    jet_guest_timeval *gtv = a->x[4] ? (jet_guest_timeval*)G2H(a->x[4]) : NULL;
+    /* Guest fd_set is 128 bytes (1024 bits) — same as Linux. Darwin FD_SETSIZE may differ;
+     * copy into host fd_set safely. */
+    fd_set hr, hw, he;
+    FD_ZERO(&hr); FD_ZERO(&hw); FD_ZERO(&he);
+    if (gr) memcpy(&hr, gr, sizeof *gr < sizeof hr ? sizeof *gr : sizeof hr);
+    if (gw) memcpy(&hw, gw, sizeof *gw < sizeof hw ? sizeof *gw : sizeof hw);
+    if (ge) memcpy(&he, ge, sizeof *ge < sizeof he ? sizeof *ge : sizeof he);
+    struct timeval tv, *tvp = NULL;
+    if (gtv) { tv.tv_sec = (time_t)gtv->tv_sec; tv.tv_usec = (suseconds_t)gtv->tv_usec; tvp = &tv; }
+    int rc = select(nfds, gr?&hr:NULL, gw?&hw:NULL, ge?&he:NULL, tvp);
+    if (rc >= 0) {
+        if (gr) memcpy(gr, &hr, sizeof *gr);
+        if (gw) memcpy(gw, &hw, sizeof *gw);
+        if (ge) memcpy(ge, &he, sizeof *ge);
+    }
+    return (uint64_t)(int64_t)rc;
+}
+
 static uint64_t h_getaddrinfo(jet_ctx *c, const jet_args *a, void *u){
     (void)u; (void)a;
     jet_log(c, 2, "getaddrinfo stub → EAI_FAIL");
-    return (uint64_t)(int64_t)-1; /* EAI_FAIL-ish */
+    return (uint64_t)(int64_t)-1;
 }
+
+/* ---- statfs / statvfs ---- */
+static uint64_t h_statfs(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+#if defined(__linux__)
+    struct statfs hs;
+    int rc = statfs((char*)G2H(a->x[0]), &hs);
+    if (rc == 0 && a->x[1]) {
+        jet_guest_statfs gs; jet_host_statfs_to_guest(&hs, &gs);
+        memcpy(G2H(a->x[1]), &gs, sizeof gs);
+    }
+    return (uint64_t)(int64_t)rc;
+#elif defined(__APPLE__)
+    struct statfs hs;
+    int rc = statfs((char*)G2H(a->x[0]), &hs);
+    if (rc == 0 && a->x[1]) {
+        jet_guest_statfs gs; jet_host_statfs_to_guest_apple(&hs, &gs);
+        memcpy(G2H(a->x[1]), &gs, sizeof gs);
+    }
+    return (uint64_t)(int64_t)rc;
+#else
+    (void)a; errno = ENOSYS; return (uint64_t)(int64_t)-1;
+#endif
+}
+static uint64_t h_fstatfs(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+#if defined(__linux__)
+    struct statfs hs;
+    int rc = fstatfs((int)a->x[0], &hs);
+    if (rc == 0 && a->x[1]) {
+        jet_guest_statfs gs; jet_host_statfs_to_guest(&hs, &gs);
+        memcpy(G2H(a->x[1]), &gs, sizeof gs);
+    }
+    return (uint64_t)(int64_t)rc;
+#elif defined(__APPLE__)
+    struct statfs hs;
+    int rc = fstatfs((int)a->x[0], &hs);
+    if (rc == 0 && a->x[1]) {
+        jet_guest_statfs gs; jet_host_statfs_to_guest_apple(&hs, &gs);
+        memcpy(G2H(a->x[1]), &gs, sizeof gs);
+    }
+    return (uint64_t)(int64_t)rc;
+#else
+    (void)a; errno = ENOSYS; return (uint64_t)(int64_t)-1;
+#endif
+}
+static uint64_t h_statvfs(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+#if defined(__linux__)
+    struct statvfs hs;
+    int rc = statvfs((char*)G2H(a->x[0]), &hs);
+    if (rc == 0 && a->x[1]) {
+        jet_guest_statvfs gs; jet_host_statvfs_to_guest(&hs, &gs);
+        memcpy(G2H(a->x[1]), &gs, sizeof gs);
+    }
+    return (uint64_t)(int64_t)rc;
+#else
+    /* Darwin: synthesize from statfs */
+    return h_statfs(c, a, u);
+#endif
+}
+
+/* ---- getdents64 / opendir / readdir ---- */
+static uint64_t h_getdents64(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    int fd = (int)a->x[0];
+    void *buf = a->x[1] ? G2H(a->x[1]) : NULL;
+    size_t count = (size_t)a->x[2];
+    if (!buf || !count) return 0;
+#if defined(__linux__)
+    /* Prefer raw getdents64; fall back to fdopendir/readdir packing. */
+    long n = syscall(SYS_getdents64, fd, buf, count);
+    if (n >= 0) return (uint64_t)(int64_t)n;
+    /* If ENOSYS etc., fall through to portable path */
+#endif
+    /* Portable: find/create DIR* for fd via fdopendir duplicate */
+    DIR *dp = NULL; int slot = -1;
+    for (int i = 0; i < JET_DIR_SLOTS; i++) if (jet_dirs[i].used && jet_dirs[i].fd == fd) {
+        dp = jet_dirs[i].dp; slot = i; break;
+    }
+    if (!dp) {
+        int dupfd = dup(fd);
+        if (dupfd < 0) return (uint64_t)(int64_t)-1;
+        dp = fdopendir(dupfd);
+        if (!dp) { close(dupfd); return (uint64_t)(int64_t)-1; }
+        slot = jet_dir_alloc(dp, fd);
+        if (slot < 0) { closedir(dp); return (uint64_t)(int64_t)-1; }
+    }
+    size_t filled = 0;
+    while (filled < count) {
+        errno = 0;
+        long tell_before = telldir(dp);
+        struct dirent *de = readdir(dp);
+        if (!de) break;
+        long tell = telldir(dp);
+        uint8_t type = 0;
+#if defined(DT_UNKNOWN)
+        type = (uint8_t)de->d_type;
+#endif
+        int reclen = jet_pack_guest_dirent64((uint8_t*)buf + filled, count - filled,
+                                             (uint64_t)de->d_ino, (int64_t)tell, type, de->d_name);
+        if (reclen < 0) {
+            /* no room — rewind so next getdents64 sees this entry again */
+            if (tell_before >= 0) seekdir(dp, tell_before);
+            break;
+        }
+        filled += (size_t)reclen;
+        jet_dirs[slot].tell = tell;
+    }
+    return (uint64_t)filled;
+}
+
+static uint64_t h_opendir(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    DIR *dp = opendir(a->x[0] ? (char*)G2H(a->x[0]) : ".");
+    if (!dp) return 0;
+    int slot = jet_dir_alloc(dp, -1);
+    if (slot < 0) { closedir(dp); return 0; }
+    return H2G(&jet_dirs[slot]); /* cookie */
+}
+static uint64_t h_readdir(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    /* Return pointer to TLS guest dirent buffer (bionic linux_dirent64-shaped) */
+    typedef struct {
+        uint64_t d_ino; int64_t d_off; uint16_t d_reclen; uint8_t d_type; char d_name[256];
+    } guest_dirent_fixed;
+    static __thread guest_dirent_fixed gde;
+    if (!a->x[0]) return 0;
+    /* cookie is &jet_dirs[slot] */
+    for (int i = 0; i < JET_DIR_SLOTS; i++) {
+        if (!jet_dirs[i].used) continue;
+        if ((void*)G2H(a->x[0]) == (void*)&jet_dirs[i] || a->x[0] == H2G(&jet_dirs[i])) {
+            struct dirent *de = readdir(jet_dirs[i].dp);
+            if (!de) return 0;
+            memset(&gde, 0, sizeof gde);
+            gde.d_ino = (uint64_t)de->d_ino;
+            gde.d_off = (int64_t)telldir(jet_dirs[i].dp);
+            gde.d_reclen = (uint16_t)sizeof gde;
+#if defined(DT_UNKNOWN)
+            gde.d_type = (uint8_t)de->d_type;
+#endif
+            snprintf(gde.d_name, sizeof gde.d_name, "%s", de->d_name);
+            return H2G(&gde);
+        }
+    }
+    return 0;
+}
+static uint64_t h_closedir(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    if (!a->x[0]) return 0;
+    for (int i = 0; i < JET_DIR_SLOTS; i++) {
+        if (jet_dirs[i].used && a->x[0] == H2G(&jet_dirs[i])) {
+            jet_dir_free_slot(i); return 0;
+        }
+    }
+    return 0;
+}
+
+/* ---- rlimit / rusage ---- */
+static uint64_t h_getrlimit(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    struct rlimit hr;
+    int rc = getrlimit((int)a->x[0], &hr);
+    if (rc == 0 && a->x[1]) {
+        jet_guest_rlimit gr; jet_host_rlimit_to_guest(&hr, &gr);
+        memcpy(G2H(a->x[1]), &gr, sizeof gr);
+    }
+    return (uint64_t)(int64_t)rc;
+}
+static uint64_t h_setrlimit(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    jet_guest_rlimit *gr = a->x[1] ? (jet_guest_rlimit*)G2H(a->x[1]) : NULL;
+    if (!gr) { errno = EFAULT; return (uint64_t)(int64_t)-1; }
+    struct rlimit hr; jet_guest_rlimit_to_host(gr, &hr);
+    return (uint64_t)(int64_t)setrlimit((int)a->x[0], &hr);
+}
+static uint64_t h_getrusage(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    struct rusage hr;
+    int rc = getrusage((int)a->x[0], &hr);
+    if (rc == 0 && a->x[1]) {
+        jet_guest_rusage gr; jet_host_rusage_to_guest(&hr, &gr);
+        memcpy(G2H(a->x[1]), &gr, sizeof gr);
+    }
+    return (uint64_t)(int64_t)rc;
+}
+
+/* ---- termios ---- */
+static uint64_t h_tcgetattr(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    struct termios ht;
+    int rc = tcgetattr((int)a->x[0], &ht);
+    if (rc == 0 && a->x[1]) {
+        jet_guest_termios gt; jet_host_termios_to_guest(&ht, &gt);
+        memcpy(G2H(a->x[1]), &gt, sizeof gt);
+    }
+    return (uint64_t)(int64_t)rc;
+}
+static uint64_t h_tcsetattr(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    jet_guest_termios *gt = a->x[2] ? (jet_guest_termios*)G2H(a->x[2]) : NULL;
+    if (!gt) { errno = EFAULT; return (uint64_t)(int64_t)-1; }
+    struct termios ht; jet_guest_termios_to_host(gt, &ht);
+    return (uint64_t)(int64_t)tcsetattr((int)a->x[0], (int)a->x[1], &ht);
+}
+
 
 /* file IO */
 static uint64_t h_open(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)open((char*)G2H(a->x[0]),(int)a->x[1],(mode_t)a->x[2]); }
@@ -1319,10 +1920,13 @@ int jet_host_install_bionic(jet_ctx *ctx) {
     /* misc frequently needed */
     reg(ctx,"syscall",h_syscall);
     reg(ctx,"sched_yield",h_stub0);
-    reg(ctx,"poll",h_poll_fn); reg(ctx,"select",h_stub0);
+    reg(ctx,"poll",h_poll_fn); reg(ctx,"ppoll",h_poll_fn); reg(ctx,"select",h_select_fn); reg(ctx,"pselect",h_select_fn);
     reg(ctx,"socket",h_socket); reg(ctx,"bind",h_bind_fn); reg(ctx,"listen",h_listen_fn);
-    reg(ctx,"accept",h_stub0); reg(ctx,"connect",h_connect); reg(ctx,"setsockopt",h_setsockopt);
+    reg(ctx,"accept",h_accept); reg(ctx,"connect",h_connect); reg(ctx,"setsockopt",h_setsockopt);
     reg(ctx,"getsockopt",h_getsockopt); reg(ctx,"getaddrinfo",h_getaddrinfo); reg(ctx,"freeaddrinfo",h_free);
+    reg(ctx,"getsockname",h_getsockname); reg(ctx,"getpeername",h_getpeername);
+    reg(ctx,"send",h_send); reg(ctx,"recv",h_recv); reg(ctx,"sendto",h_sendto); reg(ctx,"recvfrom",h_recvfrom);
+    reg(ctx,"sendmsg",h_sendmsg); reg(ctx,"recvmsg",h_recvmsg);
     reg(ctx,"ioctl",h_ioctl); reg(ctx,"fcntl",h_fcntl);
     reg(ctx,"pipe",h_pipe_fn); reg(ctx,"eventfd",h_eventfd);
     reg(ctx,"epoll_create",h_epoll_create); reg(ctx,"epoll_create1",h_epoll_create1);
@@ -1342,7 +1946,10 @@ int jet_host_install_bionic(jet_ctx *ctx) {
     reg(ctx,"rename",h_stub0); reg(ctx,"unlink",h_stub0); reg(ctx,"rmdir",h_stub0);
     reg(ctx,"chmod",h_stub0); reg(ctx,"fchmod",h_stub0); reg(ctx,"fchown",h_stub0);
     reg(ctx,"ftruncate",h_stub0); reg(ctx,"fsync",h_stub0);
-    reg(ctx,"opendir",h_stub0); reg(ctx,"readdir",h_stub0); reg(ctx,"closedir",h_stub0);
+    reg(ctx,"opendir",h_opendir); reg(ctx,"readdir",h_readdir); reg(ctx,"closedir",h_closedir);
+    reg(ctx,"statfs",h_statfs); reg(ctx,"fstatfs",h_fstatfs); reg(ctx,"statvfs",h_statvfs);
+    reg(ctx,"getdents64",h_getdents64); reg(ctx,"getrlimit",h_getrlimit); reg(ctx,"setrlimit",h_setrlimit);
+    reg(ctx,"getrusage",h_getrusage); reg(ctx,"tcgetattr",h_tcgetattr); reg(ctx,"tcsetattr",h_tcsetattr);
     reg(ctx,"sigaction",h_guest_sigaction); reg(ctx,"sigemptyset",h_guest_sigemptyset);
     reg(ctx,"sigfillset",h_guest_sigfillset); reg(ctx,"sigaddset",h_guest_sigaddset);
     reg(ctx,"sigismember",h_guest_sigismember);
@@ -1361,8 +1968,8 @@ int jet_host_install_bionic(jet_ctx *ctx) {
         "wcsnrtombs","wcrtomb","wcslen","wcstoul","wcstoll","wcstod","wcstof","wmemmove","wmemcpy",
         "wmemset","wmemcmp","wctob","btowc","mbrtowc","mbrlen","mbsnrtowcs","mbsrtowcs","mbtowc",
         "frexp","fseeko","ftello","getc","putc","fputc","ungetc","freopen","fdopen","mkstemp",
-        "gai_strerror","getsockname","getpeername","if_indextoname","inet_ntop","inet_pton","inet_ntoa",
-        "shutdown","send","recv","sendto","recvfrom","socketpair","sched_get_priority_max",
+        "gai_strerror","if_indextoname","inet_ntop","inet_pton","inet_ntoa",
+        "shutdown","socketpair","sched_get_priority_max",
         "sched_get_priority_min","sched_getaffinity","__sched_cpucount","abs","labs","nan",
         "freelocale","newlocale","uselocale","setlocale","localeconv","__ctype_get_mb_cur_max",
         "clock","isatty","putenv","madvise","swprintf","wcscoll","cosh","__FD_CLR_chk","__FD_ISSET_chk",
@@ -1525,8 +2132,9 @@ typedef struct {
     uint64_t handler;
     uint64_t flags;
     uint64_t restorer;
-    uint8_t  mask[16];
+    uint8_t  mask[16]; /* guest-emulated; never write host Darwin/glibc sigaction */
 } jet_guest_sigaction;
+_Static_assert(sizeof(jet_guest_sigaction) == 40, "guest sigaction emulated size");
 
 static uint64_t h_guest_sigemptyset(jet_ctx *c, const jet_args *a, void *u) {
     (void)c;(void)u;
@@ -1768,8 +2376,16 @@ int64_t jet_emulate_linux_syscall(jet_ctx *ctx, jet_cpu *cpu,
     case JET_NR_brk:
         /* Don't support brk heap; return current. */
         return (int64_t)a0;
-    case JET_NR_uname:
-        return (int64_t)uname((struct utsname*)G2H(a0));
+    case JET_NR_uname: {
+        struct utsname hu;
+        int rc = uname(&hu);
+        if (rc == 0 && a0) {
+            jet_guest_utsname gu;
+            jet_host_utsname_to_guest(&hu, &gu);
+            memcpy(G2H(a0), &gu, sizeof gu);
+        }
+        return (int64_t)rc;
+    }
     case JET_NR_prctl: {
         jet_args aa = {0};
         aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4;
@@ -1795,15 +2411,77 @@ int64_t jet_emulate_linux_syscall(jet_ctx *ctx, jet_cpu *cpu,
     case JET_NR_fcntl:
         return (int64_t)fcntl((int)a0, (int)a1, a2);
     case JET_NR_epoll_create1: {
-        int fd = jet_fake_fd_alloc();
-        return (int64_t)fd;
+        jet_args aa = {0}; aa.x[0]=a0;
+        return (int64_t)h_epoll_create1(ctx, &aa, NULL);
     }
-    case JET_NR_epoll_ctl:
-        return 0;
+    case JET_NR_epoll_ctl: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3;
+        return (int64_t)h_epoll_ctl(ctx, &aa, NULL);
+    }
     case JET_NR_epoll_pwait: {
-        struct timespec ts = {0, 50 * 1000 * 1000};
-        nanosleep(&ts, NULL);
-        return 0;
+        /* a0=epfd a1=events a2=maxevents a3=timeout a4=sigmask — ignore mask */
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3;
+        return (int64_t)h_epoll_wait(ctx, &aa, NULL);
+    }
+    case JET_NR_statfs: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1;
+        return (int64_t)h_statfs(ctx, &aa, NULL);
+    }
+    case JET_NR_fstatfs: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1;
+        return (int64_t)h_fstatfs(ctx, &aa, NULL);
+    }
+    case JET_NR_getdents64: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2;
+        return (int64_t)h_getdents64(ctx, &aa, NULL);
+    }
+    case JET_NR_getrlimit: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1;
+        return (int64_t)h_getrlimit(ctx, &aa, NULL);
+    }
+    case JET_NR_setrlimit: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1;
+        return (int64_t)h_setrlimit(ctx, &aa, NULL);
+    }
+    case JET_NR_getrusage: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1;
+        return (int64_t)h_getrusage(ctx, &aa, NULL);
+    }
+    case JET_NR_bind: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2;
+        return (int64_t)h_bind_fn(ctx, &aa, NULL);
+    }
+    case JET_NR_connect: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2;
+        return (int64_t)h_connect(ctx, &aa, NULL);
+    }
+    case JET_NR_accept: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2;
+        return (int64_t)h_accept(ctx, &aa, NULL);
+    }
+    case JET_NR_getsockname: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2;
+        return (int64_t)h_getsockname(ctx, &aa, NULL);
+    }
+    case JET_NR_getpeername: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2;
+        return (int64_t)h_getpeername(ctx, &aa, NULL);
+    }
+    case JET_NR_sendto: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5;
+        return (int64_t)h_sendto(ctx, &aa, NULL);
+    }
+    case JET_NR_recvfrom: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5;
+        return (int64_t)h_recvfrom(ctx, &aa, NULL);
+    }
+    case JET_NR_sendmsg: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2;
+        return (int64_t)h_sendmsg(ctx, &aa, NULL);
+    }
+    case JET_NR_recvmsg: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2;
+        return (int64_t)h_recvmsg(ctx, &aa, NULL);
     }
     case JET_NR_sigaltstack: {
         jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1;

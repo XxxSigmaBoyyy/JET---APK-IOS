@@ -5,6 +5,9 @@
 #include <errno.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <time.h>
+#include <stdlib.h>
+#include <string.h>
 
 void jet_log(jet_ctx *ctx, int level, const char *fmt, ...) {
     if (!ctx || !ctx->cfg.log) return;
@@ -285,6 +288,43 @@ static void setup_call(jet_ctx *ctx, jet_cpu *cpu, uint64_t guest_fn,
     cpu->pc = guest_fn;
 }
 
+
+/* ---- JET_NATIVE_STATS (direct call path + trampoline) ---- */
+static __thread char jet_stats_name_tls[192];
+static __thread int  jet_stats_name_set;
+
+static int jet_stats_wanted(jet_ctx *c) {
+    if (c->stats_enabled) return 1;
+    static int once, en;
+    if (!once) {
+        const char *e = getenv("JET_NATIVE_STATS");
+        en = (e && e[0] == '1');
+        once = 1;
+    }
+    if (en) c->stats_enabled = 1;
+    return en;
+}
+
+static void jet_stats_record(jet_ctx *c, const char *key, uint64_t di, uint64_t ns) {
+    if (!c || !key || !key[0]) return;
+    int free_i = -1;
+    for (int i = 0; i < JET_STATS_POOL; i++) {
+        if (c->native_stats[i].used && strcmp(c->native_stats[i].key, key) == 0) {
+            c->native_stats[i].calls++;
+            c->native_stats[i].insn += di;
+            c->native_stats[i].wall_ns += ns;
+            return;
+        }
+        if (!c->native_stats[i].used && free_i < 0) free_i = i;
+    }
+    if (free_i < 0) return; /* pool full — drop */
+    c->native_stats[free_i].used = 1;
+    snprintf(c->native_stats[free_i].key, sizeof c->native_stats[free_i].key, "%s", key);
+    c->native_stats[free_i].calls = 1;
+    c->native_stats[free_i].insn = di;
+    c->native_stats[free_i].wall_ns = ns;
+}
+
 int jet_native_call_ex(jet_ctx *ctx, uint64_t guest_fn, const jet_args *a,
                        uint32_t nstack, uint64_t *ret_x0, double *ret_d0) {
     if (!ctx || !guest_fn) return -1;
@@ -322,7 +362,27 @@ int jet_native_call_ex(jet_ctx *ctx, uint64_t guest_fn, const jet_args *a,
     cpu->x[30] = jet_stub_addr(ctx, JET_STUB_RETURN);
     cpu->pc = guest_fn;
 
+    int do_stats = jet_stats_wanted(ctx);
+    uint64_t insn0 = 0;
+    struct timespec t0, t1;
+    if (do_stats) {
+        insn0 = ctx->insn_count;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+    }
     int rc = jet_interp_run(ctx, cpu);
+    if (do_stats) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        uint64_t ns = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull
+                    + (uint64_t)(t1.tv_nsec - t0.tv_nsec);
+        uint64_t di = ctx->insn_count - insn0;
+        char key[192];
+        if (jet_stats_name_set && jet_stats_name_tls[0]) {
+            snprintf(key, sizeof key, "%s", jet_stats_name_tls);
+        } else {
+            snprintf(key, sizeof key, "fn:%llx", (unsigned long long)guest_fn);
+        }
+        jet_stats_record(ctx, key, di, ns);
+    }
     if (ret_x0) *ret_x0 = cpu->x[0];
     if (ret_d0) memcpy(ret_d0, &cpu->v[0][0], 8);
 
@@ -343,6 +403,30 @@ int jet_native_call_ex(jet_ctx *ctx, uint64_t guest_fn, const jet_args *a,
 int jet_native_call(jet_ctx *ctx, uint64_t guest_fn, const jet_args *a,
                     uint64_t *ret_x0, double *ret_d0) {
     return jet_native_call_ex(ctx, guest_fn, a, 0, ret_x0, ret_d0);
+}
+
+int jet_native_call_named(jet_ctx *ctx, const char *name, const char *sig,
+                          uint64_t guest_fn, const jet_args *a,
+                          uint64_t *ret_x0, double *ret_d0) {
+    char prev[192];
+    int prev_set = jet_stats_name_set;
+    if (prev_set) memcpy(prev, jet_stats_name_tls, sizeof prev);
+    if (name && name[0]) {
+        if (sig && sig[0])
+            snprintf(jet_stats_name_tls, sizeof jet_stats_name_tls, "%s%s", name, sig);
+        else
+            snprintf(jet_stats_name_tls, sizeof jet_stats_name_tls, "%s", name);
+        jet_stats_name_set = 1;
+    }
+    int rc = jet_native_call_ex(ctx, guest_fn, a, 0, ret_x0, ret_d0);
+    if (prev_set) {
+        memcpy(jet_stats_name_tls, prev, sizeof jet_stats_name_tls);
+        jet_stats_name_set = 1;
+    } else {
+        jet_stats_name_set = 0;
+        jet_stats_name_tls[0] = 0;
+    }
+    return rc;
 }
 
 uint64_t jet_tramp_invoke(jet_ctx *ctx, uint64_t guest_fn, const jet_args *a) {
@@ -411,7 +495,7 @@ void jet_native_dump_stats(jet_ctx *ctx) {
     if (!ctx) return;
     fprintf(stderr, "[jet:stats] insn_total=%llu globals=%d\n",
             (unsigned long long)ctx->insn_count, ctx->n_global_refs);
-    for (int i = 0; i < JET_TRAMP_POOL; i++) {
+    for (int i = 0; i < JET_STATS_POOL; i++) {
         if (!ctx->native_stats[i].used) continue;
         fprintf(stderr, "[jet:stats] %s calls=%llu insn=%llu wall_ns=%llu\n",
                 ctx->native_stats[i].key,

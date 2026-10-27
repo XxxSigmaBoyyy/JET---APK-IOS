@@ -91,6 +91,8 @@ public final class Natives {
      *  Returns x0, or the raw bits of d0 for F/D. */
     static native long invoke0(long fn, Object recv, String desc, long[] prims, long[] fbits, Object[] refs);
     /** Same for reference-returning methods (x0 is a host reference). */
+    /** Names a guest JNI function for the partner's JET_NATIVE_STATS dump (class.method + signature). */
+    static native void nameFn(long fn, String name, String sig);
     static native Object invokeRef0(long fn, Object recv, String desc, long[] prims, long[] fbits, Object[] refs);
 
     static final ConcurrentHashMap<String, Long> FN = new ConcurrentHashMap<>();
@@ -129,7 +131,7 @@ public final class Natives {
         String key = cls + "." + name + desc;
         if (firstCall == null) firstCall = key;
         Long fn = FN.get(key);
-        if (fn == null) { fn = lookup(cls, name, desc); FN.put(key, fn); }
+        if (fn == null) { fn = lookup(cls, name, desc); FN.put(key, fn); if (fn != 0) try { nameFn(fn, cls + "." + name, desc); } catch (UnsatisfiedLinkError ignore) {} }
         if (SEEN.putIfAbsent(key, Boolean.TRUE) == null)
             System.err.println("[jet.natives] first call " + key + " -> " + (fn == 0 ? "UNBOUND" : "guest 0x" + Long.toHexString(fn)) + strArgs(args));
         if (fn == 0) throw new UnsatisfiedLinkError("'" + key + "' (no guest JNI function registered or exported)");

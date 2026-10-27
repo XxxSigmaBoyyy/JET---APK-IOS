@@ -184,6 +184,30 @@ static jlong JNICALL N_resolveAny(JNIEnv *env, jclass cls, jstring jsym) {
     return (jlong)a;
 }
 
+/* Guest fn -> "pkg/Class.method" + JNI signature, registered once per method by Natives (JET_NATIVE_STATS rows). */
+#define NAME_SLOTS 8192
+static struct { uint64_t fn; char *name; char *sig; } g_names[NAME_SLOTS];
+static pthread_mutex_t g_names_mu = PTHREAD_MUTEX_INITIALIZER;
+static void JNICALL N_nameFn(JNIEnv *env, jclass cls, jlong fn, jstring jn, jstring js) {
+    (void)cls; if (!fn || !jn) return;
+    const char *n = (*env)->GetStringUTFChars(env, jn, NULL), *g = js ? (*env)->GetStringUTFChars(env, js, NULL) : NULL;
+    pthread_mutex_lock(&g_names_mu);
+    for (uint32_t i = (uint32_t)(((uint64_t)fn >> 2) * 2654435761u) % NAME_SLOTS, k = 0; k < NAME_SLOTS; k++, i = (i + 1) % NAME_SLOTS) {
+        if (g_names[i].fn == (uint64_t)fn) break;
+        if (!g_names[i].fn) { g_names[i].name = strdup(n); g_names[i].sig = g ? strdup(g) : NULL; g_names[i].fn = (uint64_t)fn; break; }
+    }
+    pthread_mutex_unlock(&g_names_mu);
+    (*env)->ReleaseStringUTFChars(env, jn, n); if (g) (*env)->ReleaseStringUTFChars(env, js, g);
+}
+static int name_of(uint64_t fn, const char **n, const char **g) {
+    int ok = 0;
+    pthread_mutex_lock(&g_names_mu);
+    for (uint32_t i = (uint32_t)((fn >> 2) * 2654435761u) % NAME_SLOTS, k = 0; k < NAME_SLOTS && g_names[i].fn; k++, i = (i + 1) % NAME_SLOTS)
+        if (g_names[i].fn == fn) { *n = g_names[i].name; *g = g_names[i].sig; ok = 1; break; }
+    pthread_mutex_unlock(&g_names_mu);
+    return ok;
+}
+
 /* Lay out a JNI call per Linux AAPCS64: x0 = guest JNIEnv, x1 = receiver, then args of `desc` in order; integer-class
  * and references take x2..x7, F/D take d0..d7 (raw bits; floats in the low 32 bits), the rest 8-byte stack slots. */
 static int guest_jni_call(JNIEnv *env, jlong fn, jobject recv, jstring jdesc, jlongArray jp, jlongArray jf,
@@ -218,7 +242,11 @@ static int guest_jni_call(JNIEnv *env, jlong fn, jobject recv, jstring jdesc, jl
     pthread_mutex_lock(&g_call_mu);
     jet_jni_bind(g_ctx, g_vm, env);   /* the guest's JNI calls go to this thread's env */
     uint64_t x0 = 0; double d0 = 0;
-    int rc = jet_native_call_ex(g_ctx, (uint64_t)fn, &a, ns, &x0, &d0);
+    /* Named call so JET_NATIVE_STATS rows read class.method+sig. jet_native_call_named (v11) copies no stack slots,
+       so methods with stack-passed args stay on jet_native_call_ex (stats under fn:<addr>). */
+    const char *nm = NULL, *sg = NULL; int rc;
+    if (ns == 0 && name_of((uint64_t)fn, &nm, &sg)) rc = jet_native_call_named(g_ctx, nm, sg, (uint64_t)fn, &a, &x0, &d0);
+    else rc = jet_native_call_ex(g_ctx, (uint64_t)fn, &a, ns, &x0, &d0);
     pthread_mutex_unlock(&g_call_mu);
     *rx = x0; memcpy(rdbits, &d0, 8);
     return rc;
@@ -262,6 +290,7 @@ static int register_natives_class(JNIEnv *env) {
         { "registered", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)J", (void *)N_registered },
         { "resolveAny", "(Ljava/lang/String;)J", (void *)N_resolveAny },
         { "invoke0", "(JLjava/lang/Object;Ljava/lang/String;[J[J[Ljava/lang/Object;)J", (void *)N_invoke0 },
+        { "nameFn", "(JLjava/lang/String;Ljava/lang/String;)V", (void *)N_nameFn },
         { "invokeRef0", "(JLjava/lang/Object;Ljava/lang/String;[J[J[Ljava/lang/Object;)Ljava/lang/Object;", (void *)N_invokeRef0 },
     };
     return (*env)->RegisterNatives(env, c, m, (jint)(sizeof m / sizeof m[0]));
@@ -289,6 +318,7 @@ int32_t jet_jni_bridge_init(char *err, int32_t errlen) {
     { const char *lv = getenv("JET_LOG_LEVEL"); g_log_level = lv ? atoi(lv) : 2; }
     jet_config cfg; memset(&cfg, 0, sizeof cfg); cfg.log = jet_bridge_log;
     g_ctx = jet_native_create(&cfg);
+    { extern int jet_gles_bridge_install(jet_ctx *); int n = jet_gles_bridge_install(g_ctx); if (n) { char m[96]; snprintf(m, sizeof m, "guest GLES forwarded to host GL (%d entry points)", n); jet_bridge_log(NULL, 2, m); } }
     { const char *st = getenv("JET_NATIVE_STATS"); if (g_ctx && st && *st && *st != '0') atexit(jet_bridge_dump_stats); }
     JNIEnv *env = NULL;
     if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {

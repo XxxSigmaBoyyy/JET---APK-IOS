@@ -6,6 +6,7 @@
 #include <math.h>
 #include <time.h>
 #include <unistd.h>
+#include <sched.h>
 #include <sys/syscall.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -81,6 +82,14 @@ static uint64_t add_with_carry(jet_cpu *c, int sf, uint64_t a, uint64_t b, int c
     return res;
 }
 
+
+/* Clear this PE's exclusive monitor if it watches `addr` (any size overlap). */
+static inline void excl_clear_if_watch(jet_cpu *c, uint64_t addr, unsigned sz) {
+    if (!c->excl_valid) return;
+    uint64_t a0 = c->excl_addr, a1 = c->excl_addr + (1ull << c->excl_size);
+    uint64_t b0 = addr, b1 = addr + (sz ? sz : 1);
+    if (a0 < b1 && b0 < a1) c->excl_valid = 0;
+}
 static uint64_t shift_reg(int sf, uint64_t v, int type, unsigned amount) {
     unsigned bits = sf ? 64u : 32u;
     amount &= (bits - 1);
@@ -246,8 +255,18 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
         return 0;
     }
 
-    case OP_NOP: case OP_HINT: case OP_PRFM_LIT:
+    case OP_NOP: case OP_PRFM_LIT:
         return 0;
+    case OP_HINT: {
+        /* uimm = CRm:op2 from HINT encoding. YIELD=1 WFE=2 WFI=3 SEV=4 SEVL=5.
+         * Without a host event stream, WFE/WFI/YIELD must sched_yield or guest
+         * spin-wait loops burn a core and serialize other JNI threads (~76s stalls). */
+        unsigned h = i->uimm;
+        if (h == 1 || h == 2 || h == 3) {
+            sched_yield();
+        }
+        return 0;
+    }
 
     case OP_MOVZ:
         jet_set_x(c, i->rd, mask_sf(i->sf, (uint64_t)i->uimm << i->shift));
@@ -316,23 +335,28 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
     }
 
     case OP_ADD: case OP_ADDS: case OP_SUB: case OP_SUBS: {
-        uint64_t a = (i->rn == 31) ? c->sp : jet_x(c, i->rn);
+        /* SP vs XZR for Rn/Rd=31:
+         *   shifted-register (opc==0): Rn/Rd = XZR (never SP)
+         *   extended-register (opc==1): Rn/Rd = SP when !setf (ADDS/SUBS Rd=XZR)
+         *   ADC/SBC (opc==2): Rn/Rd = XZR
+         * Immediate forms are OP_ADDI* and already use SP correctly. */
+        int use_sp_n = (i->opc == 1); /* extended only */
+        uint64_t a = (i->rn == 31 && use_sp_n) ? c->sp : jet_x(c, i->rn);
         uint64_t b;
         if (i->opc == 1) /* extended */ b = extend_reg(i->sf, jet_x(c, i->rm), i->cond, i->uimm);
-        else if (i->opc == 2) { /* ADC/SBC */
+        else if (i->opc == 2) { /* ADC/SBC — Rn/Rm/Rd are XZR when 31 */
             b = jet_x(c, i->rm);
             int is_sub = (i->op == OP_SUB || i->op == OP_SUBS);
             int setf = (i->op == OP_ADDS || i->op == OP_SUBS);
             uint64_t res = add_with_carry(c, i->sf, a, is_sub ? ~b : b,
                                           is_sub ? get_c(c) : get_c(c), setf);
-            /* For ADC carry_in = C; for SBC carry_in = C (with ~b). OK. */
             jet_set_x(c, i->rd, res);
             return 0;
         } else b = shift_reg(i->sf, jet_x(c, i->rm), i->shift, i->uimm);
         int is_sub = (i->op == OP_SUB || i->op == OP_SUBS);
         int setf = (i->op == OP_ADDS || i->op == OP_SUBS);
         uint64_t res = add_with_carry(c, i->sf, a, is_sub ? ~b : b, is_sub ? 1 : 0, setf);
-        if (i->rd == 31 && !setf) c->sp = res;
+        if (i->rd == 31 && !setf && use_sp_n) c->sp = res;
         else jet_set_x(c, i->rd, res);
         return 0;
     }
@@ -555,6 +579,10 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
             addr = base + idx;
         } else addr = base + (int64_t)i->imm;
 
+        if (i->op == OP_STR || i->op == OP_STRB || i->op == OP_STRH) {
+            unsigned sz = i->op == OP_STRB ? 1 : i->op == OP_STRH ? 2 : (i->sf ? 8 : 4);
+            excl_clear_if_watch(c, addr, sz);
+        }
         if (i->op == OP_STR)  { if (i->sf) st8(addr, jet_x(c, i->rd)); else st4(addr, (uint32_t)jet_x(c, i->rd)); }
         else if (i->op == OP_STRB) st1(addr, (uint8_t)jet_x(c, i->rd));
         else if (i->op == OP_STRH) st2(addr, (uint16_t)jet_x(c, i->rd));
@@ -583,6 +611,7 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
         uint64_t addr = (mode == 1) ? base : base + (int64_t)i->imm;
         int step = i->sf ? 8 : 4;
         if (i->op == OP_STP) {
+            excl_clear_if_watch(c, addr, i->sf ? 16u : 8u);
             if (i->sf) { st8(addr, jet_x(c, i->rd)); st8(addr+8, jet_x(c, i->ra)); }
             else { st4(addr, (uint32_t)jet_x(c, i->rd)); st4(addr+4, (uint32_t)jet_x(c, i->ra)); }
         } else if (i->op == OP_LDPSW) {
@@ -612,9 +641,10 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
         }
         jet_set_x(c, i->rd, v);
         if (i->op == OP_LDXR || i->op == OP_LDAXR) {
-            pthread_mutex_lock(&ctx->excl_mu);
-            ctx->excl_valid = 1; ctx->excl_addr = addr; ctx->excl_val = v;
-            pthread_mutex_unlock(&ctx->excl_mu);
+            c->excl_valid = 1;
+            c->excl_addr = addr;
+            c->excl_val = v;
+            c->excl_size = (uint8_t)i->size;
         }
         return 0;
     }
@@ -624,12 +654,11 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
         uint64_t v = jet_x(c, i->rd);
         int ok = 1;
         if (i->op == OP_STXR || i->op == OP_STLXR) {
-            /* Emulate exclusive store with host CAS against monitored value. */
-            pthread_mutex_lock(&ctx->excl_mu);
-            ok = ctx->excl_valid && ctx->excl_addr == addr;
-            uint64_t expected = ctx->excl_val;
-            ctx->excl_valid = 0;
-            pthread_mutex_unlock(&ctx->excl_mu);
+            /* Per-CPU local monitor + host CAS. Other guest threads no longer
+             * steal this marking; intervening stores fail the CAS on expected. */
+            ok = c->excl_valid && c->excl_addr == addr;
+            uint64_t expected = c->excl_val;
+            c->excl_valid = 0;
             if (ok) {
                 int success = 0;
                 switch (i->size) {
@@ -662,6 +691,8 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
             }
             jet_set_x(c, i->rm, ok ? 0 : 1);
         } else {
+            unsigned sz = 1u << i->size;
+            excl_clear_if_watch(c, addr, sz);
             switch (i->size) {
             case 0: __atomic_store_n((uint8_t *)p, (uint8_t)v, __ATOMIC_RELEASE); break;
             case 1: __atomic_store_n((uint16_t *)p, (uint16_t)v, __ATOMIC_RELEASE); break;
@@ -923,9 +954,7 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
         return 0;
     case OP_CLREX:
-        pthread_mutex_lock(&ctx->excl_mu);
-        ctx->excl_valid = 0;
-        pthread_mutex_unlock(&ctx->excl_mu);
+        c->excl_valid = 0;
         return 0;
 
     /* ---- FP scalar (minimal) ---- */

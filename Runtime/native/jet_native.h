@@ -75,6 +75,12 @@ int jet_native_call(jet_ctx *ctx, uint64_t guest_fn, const jet_args *a,
 int jet_native_call_ex(jet_ctx *ctx, uint64_t guest_fn, const jet_args *a,
                        uint32_t nstack, uint64_t *ret_x0, double *ret_d0);
 
+/* Like jet_native_call, but records JET_NATIVE_STATS under "name" + optional "sig".
+ * Preferred for Agent invoke0 / RegisterNatives paths that bypass tramp_enter. */
+int jet_native_call_named(jet_ctx *ctx, const char *name, const char *sig,
+                          uint64_t guest_fn, const jet_args *a,
+                          uint64_t *ret_x0, double *ret_d0);
+
 /* Register host data object (e.g. __sF, SL_IID_ENGINE) for OBJECT imports. */
 int jet_native_register_data(jet_ctx *ctx, const char *sym, void *addr);
 
