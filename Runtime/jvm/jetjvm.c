@@ -22,6 +22,7 @@ double jet_jvm_boot_ms(void) { return g_boot_ms; }
 
 #if JET_HAVE_JNI
 static JavaVM *g_vm;
+void *jet_jvm_vm(void) { return (void *)g_vm; }
 static FILE *g_log;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -164,6 +165,7 @@ int32_t jet_jvm_call_string(const char *cls, const char *method, const char *arg
 }
 
 #else  // no jni.h at build time
+void *jet_jvm_vm(void) { return NULL; }
 int32_t jet_jvm_boot(const char *h, const char *cp, const char *x, const char *l, char *err, int32_t errlen) {
     (void)h; (void)cp; (void)x; (void)l;
     if (err && errlen) snprintf(err, errlen, "JET built without JNI headers (no JRE bundled)");

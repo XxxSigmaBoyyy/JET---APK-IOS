@@ -57,6 +57,10 @@ final class SmokeTest {
             try? await Task.sleep(nanoseconds: 1_200_000_000)
             captureKeyWindow("00_jvm"); finish("FAIL boot: \(boot.error)"); return
         }
+        // Bind JVM <-> partner native API (stub until Runtime/native lands). Soft-fail.
+        var berr = [CChar](repeating: 0, count: 256)
+        let brc = jet_jni_bridge_init(&berr, 256)
+        note("jni_bridge_init rc=\(brc) \(String(cString: berr))")
         let t1 = ProcessInfo.processInfo.systemUptime
         let r = await Task.detached { JetJVM.callString("dev/jet/Hello", "run", "JET smoke \(mode)") }.value
         let t2 = ProcessInfo.processInfo.systemUptime

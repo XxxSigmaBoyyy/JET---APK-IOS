@@ -23,6 +23,9 @@ int32_t jet_jvm_call_string(const char *cls, const char *method, const char *arg
 /// Milliseconds spent in JNI_CreateJavaVM by jet_jvm_boot (or -1).
 double jet_jvm_boot_ms(void);
 
+/// Borrowed JavaVM* after a successful boot (NULL otherwise).
+void *jet_jvm_vm(void);
+
 #ifdef __cplusplus
 }
 #endif
