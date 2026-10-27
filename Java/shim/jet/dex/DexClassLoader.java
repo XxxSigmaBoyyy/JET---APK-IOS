@@ -266,9 +266,18 @@ public final class DexClassLoader extends ClassLoader {
             T_deadCode.transform(irMethod); T_removeLocal.transform(irMethod); T_removeConst.transform(irMethod);
             T_zero.transform(irMethod);
             if (T_npe.transformReportChanged(irMethod)) { T_deadCode.transform(irMethod); T_removeLocal.transform(irMethod); T_removeConst.transform(irMethod); }
-            T_new.transform(irMethod); T_fillArray.transform(irMethod); T_agg.transform(irMethod); T_multiArray.transform(irMethod); T_voidInvoke.transform(irMethod);
+            T_new.transform(irMethod); if (hasConstNewArray(irMethod)) T_fillArray.transform(irMethod); T_agg.transform(irMethod); T_multiArray.transform(irMethod); T_voidInvoke.transform(irMethod);
             T_deadCode.transform(irMethod); T_removeLocal.transform(irMethod); T_removeConst.transform(irMethod);
             T_type.transform(irMethod); T_unssa.transform(irMethod); T_ir2jRegAssign.transform(irMethod); T_trimEx.transform(irMethod);
+        }
+        /** FillArrayTransformer only acts on `local = new T[const]`; its CFG build + DFS is wasted on methods without one (most). */
+        static boolean hasConstNewArray(IrMethod m) {
+            if (m.locals.isEmpty()) return false;
+            for (com.googlecode.dex2jar.ir.stmt.Stmt p : m.stmts)
+                if (p.st == com.googlecode.dex2jar.ir.stmt.Stmt.ST.ASSIGN && p.getOp2().vt == com.googlecode.dex2jar.ir.expr.Value.VT.NEW_ARRAY
+                        && p.getOp1().vt == com.googlecode.dex2jar.ir.expr.Value.VT.LOCAL
+                        && ((com.googlecode.dex2jar.ir.expr.TypeExpr) p.getOp2()).getOp().vt == com.googlecode.dex2jar.ir.expr.Value.VT.CONSTANT) return true;
+            return false;
         }
         @Override public void ir2j(IrMethod irMethod, MethodVisitor mv, ClzCtx clzCtx) {
             new IR2JConverter().optimizeSynchronized(false).clzCtx(clzCtx).ir(irMethod).asm(mv).convert();
