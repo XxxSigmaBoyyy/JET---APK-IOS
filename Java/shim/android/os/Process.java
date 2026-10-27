@@ -10,7 +10,11 @@ public class Process {
     private static final long START_ELAPSED = SystemClock.elapsedRealtime(), START_UPTIME = SystemClock.uptimeMillis();
     private static final java.util.Map<Long, Integer> PRIO = new java.util.concurrent.ConcurrentHashMap<>();
     public Process() {}
-    public static final long getElapsedCpuTime() { java.lang.management.ThreadMXBean b = java.lang.management.ManagementFactory.getThreadMXBean(); long t = 0; for (long id : b.getAllThreadIds()) { long c = b.getThreadCpuTime(id); if (c > 0) t += c; } return t / 1_000_000L; }
+    public static final long getElapsedCpuTime() {
+        try { java.lang.management.ThreadMXBean b = java.lang.management.ManagementFactory.getThreadMXBean(); long t = 0; for (long id : b.getAllThreadIds()) { long c = b.getThreadCpuTime(id); if (c > 0) t += c; } return t / 1_000_000L; }
+        catch (Throwable e) { return (System.nanoTime() - START_NANOS) / 1_000_000L; } // no java.management on iOS
+    }
+    private static final long START_NANOS = System.nanoTime();
     public static long getStartElapsedRealtime() { return START_ELAPSED; }
     public static long getStartUptimeMillis() { return START_UPTIME; }
     public static long getStartRequestedElapsedRealtime() { return START_ELAPSED; }

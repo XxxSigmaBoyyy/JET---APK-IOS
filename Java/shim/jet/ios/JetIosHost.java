@@ -195,7 +195,7 @@ public final class JetIosHost {
             firstFrameMs = (long) ms(t0);
             log("screen", W + "x" + H);
             log("first_frame_ms", firstFrameMs + " (launch call -> first frame rendered)");
-            log("jvm_uptime_ms", java.lang.management.ManagementFactory.getRuntimeMXBean().getUptime());
+            log("jvm_uptime_ms", jvmUptimeMs());
             state = "running";
             firstFrame.countDown();
             loop(root, act);
@@ -342,5 +342,11 @@ public final class JetIosHost {
         }
         System.out.println(status(""));
         System.exit(0);
+    }
+
+    // java.management is not in the iOS JRE image: never let a diagnostic kill the launch.
+    static long jvmUptimeMs() {
+        try { return java.lang.management.ManagementFactory.getRuntimeMXBean().getUptime(); }
+        catch (Throwable t) { return -1; }
     }
 }
