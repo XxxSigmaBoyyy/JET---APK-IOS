@@ -59,6 +59,17 @@ static void on_register(void *user, const char *cls, const char *name, const cha
     pthread_mutex_unlock(&g_reg_mu);
 }
 
+/* Guest getcwd/relative paths (sqlite unixFullPathname etc.) resolve against this; Java sets it to the package's
+ * absolute getFilesDir() before the first JNI_OnLoad. */
+static jboolean JNICALL N_setCwd(JNIEnv *env, jclass cls, jstring jpath) {
+    (void)cls;
+    if (!g_ctx || !jpath) return JNI_FALSE;
+    const char *path = (*env)->GetStringUTFChars(env, jpath, NULL);
+    int rc = path ? jet_native_set_cwd(g_ctx, path) : -1;
+    if (path) (*env)->ReleaseStringUTFChars(env, jpath, path);
+    return rc == 0 ? JNI_TRUE : JNI_FALSE;
+}
+
 static jet_lib *find_lib(const char *path) {
     for (int i = 0; i < g_nlibs; i++) if (!strcmp(g_libnames[i], path)) return g_libs[i];
     return NULL;
@@ -166,11 +177,6 @@ static int guest_jni_call(JNIEnv *env, jlong fn, jobject recv, jstring jdesc, jl
     jet_args a; memset(&a, 0, sizeof a);
     uint64_t stack[64]; uint32_t ns = 0;
     int nx = 0, nd = 0, pi = 0, fi = 0, ri = 0;
-    /* The partner's guest JNIEnv (Runtime/native/jni_bridge.c) treats a jstring as a plain char* (UTF-8, guest==host
-     * addresses) and does not forward to the real JNIEnv. Passing a HotSpot local ref made GetStringUTFChars hand
-     * the guest the handle's bytes as a "path" (Telegram opendb -> relative garbage -> getcwd -> CANTOPEN). Until the
-     * guest env forwards, marshal String args as owned UTF-8 copies freed after the call. */
-    char *owned[16]; int nowned = 0;
     a.x[nx++] = jet_jni_guest_env(g_ctx);
     a.x[nx++] = (uint64_t)(uintptr_t)recv;
     const char *d = strchr(desc, '(');
@@ -180,12 +186,6 @@ static int guest_jni_call(JNIEnv *env, jlong fn, jobject recv, jstring jdesc, jl
         else if (*d == 'L' || *d == '[') {
             jobject o = (*env)->GetObjectArrayElement(env, jr, ri++);   /* local ref, alive until we return to Java */
             v = (uint64_t)(uintptr_t)o;
-            if (o && *d == 'L' && strncmp(d, "Ljava/lang/String;", 18) == 0 && nowned < 16) {
-                const char *u = (*env)->GetStringUTFChars(env, (jstring)o, NULL);
-                char *c = u ? strdup(u) : NULL;
-                if (u) (*env)->ReleaseStringUTFChars(env, (jstring)o, u);
-                if (c) { owned[nowned++] = c; v = (uint64_t)(uintptr_t)c; }
-            }
             while (*d == '[') d++;
             if (*d == 'L') { const char *e = strchr(d, ';'); d = e ? e + 1 : d + strlen(d); } else d++;
         } else { v = (uint64_t)(pi < np ? p[pi] : 0); pi++; d++; }
@@ -202,7 +202,6 @@ static int guest_jni_call(JNIEnv *env, jlong fn, jobject recv, jstring jdesc, jl
     uint64_t x0 = 0; double d0 = 0;
     int rc = jet_native_call_ex(g_ctx, (uint64_t)fn, &a, ns, &x0, &d0);
     pthread_mutex_unlock(&g_call_mu);
-    while (nowned) free(owned[--nowned]);
     *rx = x0; memcpy(rdbits, &d0, 8);
     return rc;
 }
@@ -238,6 +237,7 @@ static int register_natives_class(JNIEnv *env) {
     if (!c) { (*env)->ExceptionClear(env); return -1; }
     JNINativeMethod m[] = {
         { "loadPath", "(Ljava/lang/String;)Z", (void *)N_loadPath },
+        { "setCwd",   "(Ljava/lang/String;)Z", (void *)N_setCwd },
         { "resolve",  "(Ljava/lang/String;Ljava/lang/String;)J", (void *)N_resolve },
         { "call",     "(J[J[D)J", (void *)N_call },
         { "registered", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)J", (void *)N_registered },

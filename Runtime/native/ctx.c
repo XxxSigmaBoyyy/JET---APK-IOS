@@ -349,3 +349,16 @@ uint64_t jet_tramp_invoke(jet_ctx *ctx, uint64_t guest_fn, const jet_args *a) {
     jet_native_call(ctx, guest_fn, a, &r, NULL);
     return r;
 }
+
+
+int jet_native_call_host(jet_ctx *ctx, const char *sym, const jet_args *a, uint64_t *ret) {
+    if (!ctx || !sym) return -1;
+    for (int i = 1; i < ctx->ntraps; i++) {
+        if (ctx->traps[i].name && strcmp(ctx->traps[i].name, sym) == 0 && ctx->traps[i].fn) {
+            uint64_t r = ctx->traps[i].fn(ctx, a, ctx->traps[i].user);
+            if (ret) *ret = r;
+            return 0;
+        }
+    }
+    return -1;
+}

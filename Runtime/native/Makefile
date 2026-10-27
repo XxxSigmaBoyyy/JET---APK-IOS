@@ -4,12 +4,12 @@ CFLAGS ?= -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-unused-functi
 CFLAGS += -fno-strict-aliasing -D_GNU_SOURCE -Ithird_party
 LDFLAGS ?= -lpthread -ldl -lm -Lthird_party -lz
 
-SRCS = ctx.c decode.c asimd.c elf_loader.c interp.c host_bionic.c jni_bridge.c trampoline.c setjmp_guest.c
+SRCS = ctx.c decode.c elf_loader.c interp.c host_bionic.c jni_bridge.c trampoline.c setjmp_guest.c asimd.c
 OBJS = $(SRCS:%.c=build/%.o)
 
-.PHONY: all clean test test-unit test-tg ios-syntax check
+.PHONY: all clean test test-unit test-tg test-jni ios-syntax check
 
-all: build/libjet_native.a build/test_unit build/test_tg build/decode_sweep
+all: build/libjet_native.a build/test_unit build/test_tg build/test_jni build/decode_sweep
 
 build:
 	mkdir -p build
@@ -26,6 +26,9 @@ build/test_unit: tests/test_unit.c build/libjet_native.a tests/guest_lib.so
 build/test_tg: tests/test_tg.c build/libjet_native.a
 	$(CC) $(CFLAGS) tests/test_tg.c -I. -Lbuild -ljet_native $(LDFLAGS) -o $@
 
+build/test_jni: tests/test_jni.c build/libjet_native.a
+	$(CC) $(CFLAGS) tests/test_jni.c -I. -Lbuild -ljet_native $(LDFLAGS) -o $@
+
 # Tiny guest shared library (AArch64), linked with nostdlib
 tests/guest_lib.so: tests/guest_lib.c
 	$(CC) --target=aarch64-linux-gnu -nostdlib -shared -fPIC -O2 \
@@ -39,10 +42,13 @@ test-unit: build/test_unit
 test-tg: build/test_tg
 	./build/test_tg
 
+test-jni: build/test_jni
+	./build/test_jni
+
 build/decode_sweep: tests/decode_sweep.c build/libjet_native.a
 	$(CC) $(CFLAGS) tests/decode_sweep.c -I. -Lbuild -ljet_native $(LDFLAGS) -o $@
 
-test: test-unit test-tg
+test: test-unit test-tg test-jni
 
 
 # Ensure core sources are free of Linux-only headers in the public path.

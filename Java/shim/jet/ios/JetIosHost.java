@@ -129,6 +129,7 @@ public final class JetIosHost {
             System.setProperty("jet.apkPath", apk.getPath()); System.setProperty("jet.package", pkg);
             System.setProperty("jet.app.label", props.getProperty("label", pkg));
             File data = new File(dir, "data"); data.mkdirs(); System.setProperty("jet.data.dir", data.getPath());
+            File files = new File(new File(data, pkg), "files"); files.mkdirs(); System.setProperty("jet.files.dir", files.getPath()); // == Context.getFilesDir()
             File libDir = new File(dir, "lib"); System.setProperty("jet.nativeLibraryDir", libDir.getPath()); System.setProperty("jet.native.lib.dir", libDir.getPath());
             System.setProperty("java.runtime.name", "Android Runtime"); System.setProperty("java.vm.vendor", "The Android Project");
             System.setProperty("java.vendor", "The Android Project"); System.setProperty("java.vm.name", "Dalvik");

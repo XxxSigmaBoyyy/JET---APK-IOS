@@ -648,6 +648,32 @@ static uint64_t h_dladdr(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)u;
 
 /* stubs for GLES / EGL / OpenSLES / android / jnigraphics — return 0 / no-op */
 
+
+/* Emulated getcwd: returns ctx->guest_cwd. buf=NULL allocates (bionic/glibc). */
+static uint64_t h_getcwd(jet_ctx *c, const jet_args *a, void *u) {
+    (void)u;
+    const char *cwd = c->guest_cwd[0] ? c->guest_cwd : "/data/data/app";
+    size_t need = strlen(cwd) + 1;
+    uint64_t buf_g = a->x[0];
+    size_t size = (size_t)a->x[1];
+    char *buf;
+    if (!buf_g) {
+        /* POSIX/bionic: allocate. size==0 → allocate need; else allocate size. */
+        size_t alloc = size ? size : need;
+        if (alloc < need) { errno = ERANGE; return 0; }
+        buf = malloc(alloc);
+        if (!buf) { errno = ENOMEM; return 0; }
+        memcpy(buf, cwd, need);
+        if (alloc > need) memset(buf + need, 0, alloc - need);
+        return H2G(buf);
+    }
+    buf = (char*)G2H(buf_g);
+    if (size == 0) { errno = EINVAL; return 0; }
+    if (size < need) { errno = ERANGE; return 0; }
+    memcpy(buf, cwd, need);
+    return buf_g;
+}
+
 uint64_t jet_host_stub0(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)a;(void)u; return 0; }
 static uint64_t h_stub0(jet_ctx *c,const jet_args *a,void *u){ return jet_host_stub0(c,a,u); }
 
@@ -929,7 +955,7 @@ int jet_host_install_bionic(jet_ctx *ctx) {
     reg(ctx,"fwrite",h_stub0); reg(ctx,"fprintf",h_printf); reg(ctx,"fputs",h_stub0);
     reg(ctx,"fgets",h_stub0); reg(ctx,"fflush",h_stub0); reg(ctx,"fseek",h_stub0);
     reg(ctx,"ftell",h_stub0); reg(ctx,"fileno",h_stub0);
-    reg(ctx,"getcwd",h_stub0); reg(ctx,"mkdir",h_stub0); reg(ctx,"remove",h_stub0);
+    reg(ctx,"getcwd",h_getcwd); reg(ctx,"mkdir",h_stub0); reg(ctx,"remove",h_stub0);
     reg(ctx,"rename",h_stub0); reg(ctx,"unlink",h_stub0); reg(ctx,"rmdir",h_stub0);
     reg(ctx,"chmod",h_stub0); reg(ctx,"fchmod",h_stub0); reg(ctx,"fchown",h_stub0);
     reg(ctx,"ftruncate",h_stub0); reg(ctx,"fsync",h_stub0);
@@ -1235,6 +1261,12 @@ int64_t jet_emulate_linux_syscall(jet_ctx *ctx, jet_cpu *cpu,
                                   uint64_t a5) {
     (void)cpu; (void)a4; (void)a5;
     switch ((int)nr) {
+    case JET_NR_getcwd: {
+        /* a0=buf, a1=size — same semantics as h_getcwd */
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1;
+        uint64_t r = h_getcwd(ctx, &aa, NULL);
+        return r ? (int64_t)r : -1;
+    }
     case JET_NR_getpid:  return (int64_t)getpid();
     case JET_NR_getppid: return (int64_t)getppid();
     case JET_NR_getuid:  return (int64_t)getuid();

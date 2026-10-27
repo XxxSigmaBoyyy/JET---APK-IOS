@@ -242,6 +242,10 @@ struct jet_ctx {
     void           *host_jnienv;
     void           *guest_jnienv;   /* guest-visible JNIEnv (table of stubs) */
     void           *guest_javavm;   /* guest-visible JavaVM */
+    void           *jni_pending;     /* fake throwable struct */
+    uint64_t        jni_pending_obj; /* guest ref returned by ExceptionOccurred */
+    int             jni_pending_is_throwable;
+    char            guest_cwd[512];  /* emulated process cwd */
     jet_register_cb reg_cb;
     void           *reg_cb_user;
     /* captured RegisterNatives for tests */

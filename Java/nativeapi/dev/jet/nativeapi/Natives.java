@@ -15,6 +15,23 @@ public final class Natives {
     /** Load one APK .so (absolute path) and run its JNI_OnLoad via the interpreter. */
     public static native boolean loadPath(String absPath);
 
+    /** Guest process cwd (getcwd, relative paths) for the partner runtime; must be absolute. */
+    public static native boolean setCwd(String absDir);
+    private static String cwdSet;
+    /** Point the guest cwd at the package's absolute getFilesDir() (jet.files.dir, else jet.data.dir/jet.package/files). */
+    static synchronized void ensureCwd() {
+        String d = System.getProperty("jet.files.dir");
+        if (d == null) {
+            String data = System.getProperty("jet.data.dir"), pkg = System.getProperty("jet.package");
+            if (data == null || pkg == null || pkg.isEmpty()) return;
+            d = new File(new File(data, pkg), "files").getAbsolutePath();
+        }
+        File f = new File(d).getAbsoluteFile(); f.mkdirs();
+        if (f.getPath().equals(cwdSet)) return;
+        try { if (setCwd(f.getPath())) { cwdSet = f.getPath(); System.err.println("[jet.natives] guest cwd=" + cwdSet); } }
+        catch (UnsatisfiedLinkError e) { System.err.println("[jet.natives] setCwd unavailable: " + e); }
+    }
+
     /** jet_native_sym — e.g. Java_com_foo_Bar_baz when RegisterNatives was not used. */
     public static native long resolve(String libPath, String sym);
 
@@ -40,6 +57,7 @@ public final class Natives {
                 File f = new File(p);
                 if (f.isFile()) {
                     System.err.println("[jet.natives] loadLibrary(" + name + ") -> " + f.getAbsolutePath());
+                    ensureCwd();
                     return loadPath(f.getAbsolutePath());
                 }
             }
@@ -50,6 +68,7 @@ public final class Natives {
 
     /** Absolute-path System.load substitute. */
     public static boolean load(String absPath) {
+        ensureCwd();
         return loadPath(absPath);
     }
 

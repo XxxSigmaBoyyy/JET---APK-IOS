@@ -109,8 +109,19 @@ typedef void (*jet_register_cb)(void *user, const char *cls, const char *name,
                                 const char *sig, uint64_t guest_fn);
 void jet_jni_on_register_natives(jet_ctx *ctx, jet_register_cb cb, void *user);
 
+/* Emulated guest cwd (absolute path). Used by getcwd / syscall getcwd. */
+int         jet_native_set_cwd(jet_ctx *ctx, const char *path);
+const char *jet_native_get_cwd(jet_ctx *ctx);
+
+/* Test helpers */
+const char *jet_jni_slot_name(int idx);
+uint64_t    jet_jni_call_env(jet_ctx *ctx, int idx, const jet_args *a);
+
 /* Introspection: last unimplemented-opcode info (for reporting). */
 const char *jet_native_last_error(jet_ctx *ctx);
+
+/* Invoke a registered host trap by symbol name (tests / tooling). */
+int jet_native_call_host(jet_ctx *ctx, const char *sym, const jet_args *a, uint64_t *ret);
 
 #ifdef __cplusplus
 }
