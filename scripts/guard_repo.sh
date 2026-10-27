@@ -3,6 +3,7 @@
 #   * no Android packages, iOS packages or signing material are tracked
 #     (*.apk *.xapk *.apks *.aab *.obb *.dex *.ipa *.p12 *.pfx *.cer *.mobileprovision *.keystore *.jks);
 #   * no build outputs (dist/, Vendor/JetRuntime/, build/);
+#   * no native binaries (*.so *.dylib *.o *.a ...) and no ELF / Mach-O magic in any tracked file;
 #   * no token-like strings or private keys in tracked text files. Matches are reported as file:line only — the
 #     matched value is never printed.
 set -euo pipefail
@@ -13,6 +14,23 @@ if git ls-files | grep -Ei '\.(apk|xapk|apks|aab|obb|dex|ipa|p12|pfx|cer|mobilep
 fi
 if git ls-files | grep -E '^(dist|build|Vendor/JetRuntime|Vendor/jre-[a-z]+|Vendor/jni|Vendor/jvm-app)/'; then
   echo "::error::dist/, build/, Vendor/JetRuntime/ and staged JRE dirs are build outputs and must never be committed."; fail=1
+fi
+# Native binaries / object code (partner native sources only: .c/.h/Makefile)
+if git ls-files | grep -Ei '\.(so|so\.[0-9.]+|dylib|o|a|obj|lib|dll|exe|elf|bundle)$'; then
+  echo "::error::native binaries / object files must never be committed (files listed above)."; fail=1
+fi
+# ELF (7f454c46) and Mach-O thin/fat (feedface feedfacf cefaedfe cffaedfe cafebabe-with-non-class) magic in any tracked file
+magic_hits=""
+while IFS= read -r -d '' f; do
+  [ -f "$f" ] || continue
+  m="$(head -c 4 "$f" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  case "$m" in
+    7f454c46|feedface|feedfacf|cefaedfe|cffaedfe) magic_hits="$magic_hits$f ($m)"$'\n' ;;
+    cafebabe) case "$f" in *.class) ;; *) magic_hits="$magic_hits$f ($m)"$'\n' ;; esac ;;
+  esac
+done < <(git ls-files -z)
+if [ -n "$magic_hits" ]; then
+  printf '%s' "$magic_hits"; echo "::error::ELF / Mach-O binaries must never be committed (files listed above)."; fail=1
 fi
 PATTERNS=(
   'gh[pousr]_[A-Za-z0-9]{36,}'                  # GitHub classic tokens

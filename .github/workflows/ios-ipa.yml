@@ -40,6 +40,23 @@ jobs:
             build/runtime-test/*.ops
           if-no-files-found: ignore
 
+  native-ios:
+    name: Partner native (Runtime/native) ios-arm64 compile (device + simulator)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Repository guard
+        run: scripts/guard_repo.sh
+      - name: Compile Runtime/native for iphoneos + iphonesimulator (arm64)
+        run: scripts/build_native_ios.sh build/native-ios
+      - name: Upload native compile log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-ios-build-log
+          path: build/native-ios/*.txt
+
   jre:
     name: JRE (OpenJDK 21 Zero, no JIT)
     uses: ./.github/workflows/jre-ios.yml
@@ -105,6 +122,7 @@ jobs:
           strings "$BIN" | grep -E 'aot-0\.2' || { echo "::error::JET runtime (aot-0.2) not linked into $BIN"; exit 1; }
           if strings "$BIN" | grep -q 'stub-0\.'; then echo "::error::stub bridge still linked"; exit 1; fi
           nm -gU "$BIN" 2>/dev/null | grep -E ' _jet_runtime_(frame|touch|main)$' || true
+          nm -gU "$BIN" 2>/dev/null | grep -E ' _jet_(interp_run|native_load|jni_onload)$' || { echo "::error::partner arm64 interpreter (Runtime/native) not linked"; exit 1; }
           lipo -info "$BIN"
           APP="$DERIVED/Build/Products/$CONFIGURATION-iphoneos/JET.app"
           ls "$APP/jre/lib/zero/libjvm.dylib" "$APP/jvm-app/jethello.jar"
