@@ -222,6 +222,7 @@ public final class DexClassLoader extends ClassLoader {
             @Override public void visitPermittedSubclass(String p) {}
             @Override public RecordComponentVisitor visitRecordComponent(String n, String d, String s) { return null; }
             @Override public MethodVisitor visitMethod(int acc, String mn, String desc, String sig, String[] ex) {
+                if ((acc & Opcodes.ACC_NATIVE) != 0) { nativeStub(super.visitMethod(acc & ~Opcodes.ACC_NATIVE, mn, desc, sig, ex), self, acc, mn, desc); return null; }
                 return new MethodVisitor(Opcodes.ASM9, super.visitMethod(acc, mn, desc, sig, ex)) {
                     @Override public void visitFrame(int t, int nl, Object[] l, int ns, Object[] s) {}
                     @Override public void visitLdcInsn(Object v) {
@@ -251,6 +252,36 @@ public final class DexClassLoader extends ClassLoader {
         }, ClassReader.SKIP_FRAMES);
         return cw.toByteArray();
     }
+    /** `native` app method -> Java body dispatching to the guest JNI function (dev.jet.nativeapi.Natives.jni). */
+    static void nativeStub(MethodVisitor mv, String owner, int acc, String name, String desc) {
+        boolean st = (acc & Opcodes.ACC_STATIC) != 0;
+        Type[] at = Type.getArgumentTypes(desc); Type rt = Type.getReturnType(desc);
+        mv.visitCode();
+        mv.visitLdcInsn(Type.getObjectType(owner)); mv.visitLdcInsn(name); mv.visitLdcInsn(desc);
+        if (st) mv.visitInsn(Opcodes.ACONST_NULL); else mv.visitVarInsn(Opcodes.ALOAD, 0);
+        mv.visitLdcInsn(at.length); mv.visitTypeInsn(Opcodes.ANEWARRAY, "java/lang/Object");
+        int slot = st ? 0 : 1;
+        for (int i = 0; i < at.length; i++) {
+            Type t = at[i];
+            mv.visitInsn(Opcodes.DUP); mv.visitLdcInsn(i); mv.visitVarInsn(t.getOpcode(Opcodes.ILOAD), slot);
+            int k = "ZCBSIFJD".indexOf(t.getDescriptor().charAt(0));
+            if (t.getSort() <= Type.DOUBLE && k >= 0)
+                mv.visitMethodInsn(Opcodes.INVOKESTATIC, BOX[k + 1], "valueOf", "(" + t.getDescriptor() + ")L" + BOX[k + 1] + ";", false);
+            mv.visitInsn(Opcodes.AASTORE);
+            slot += t.getSize();
+        }
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, nativesOwner, "jni", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;", false);
+        if (rt.getSort() == Type.VOID) { mv.visitInsn(Opcodes.POP); mv.visitInsn(Opcodes.RETURN); }
+        else if (rt.getSort() <= Type.DOUBLE) {
+            int k = "ZCBSIFJD".indexOf(rt.getDescriptor().charAt(0)); String box = BOX[k + 1];
+            String[] unb = {"booleanValue", "charValue", "byteValue", "shortValue", "intValue", "floatValue", "longValue", "doubleValue"};
+            mv.visitTypeInsn(Opcodes.CHECKCAST, box);
+            mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, box, unb[k], "()" + rt.getDescriptor(), false);
+            mv.visitInsn(rt.getOpcode(Opcodes.IRETURN));
+        } else { mv.visitTypeInsn(Opcodes.CHECKCAST, rt.getSort() == Type.ARRAY ? rt.getDescriptor() : rt.getInternalName()); mv.visitInsn(Opcodes.ARETURN); }
+        mv.visitMaxs(-1, -1); mv.visitEnd();
+    }
+
     boolean itfExtends(String c, String target, int depth) {
         if (depth > 32) return false;
         String[] is = supers.get(c); if (is == null) return false;

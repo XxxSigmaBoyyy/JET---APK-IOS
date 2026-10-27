@@ -300,6 +300,8 @@ public final class JetIosHost {
 
     /** Linux/macOS check without iOS: java jet.ios.JetIosHost <apk> <appDir> <fwDir> <out.png> [tapX tapY out2.png] */
     public static void main(String[] a) throws Exception {
+        String host = System.getProperty("jet.jni.host.lib");   // desktop test: jet_jni_bridge.c + Runtime/native built as a JNI lib
+        if (host != null) System.load(host);
         System.out.println(importApk(a[0] + "\n" + a[1] + "\n" + a[2]));
         System.out.println(launch(a[1] + "\n750\n1334\n600000"));
         System.out.println(screenshot(a[3]));

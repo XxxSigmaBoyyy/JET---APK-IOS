@@ -1,6 +1,7 @@
 package dev.jet.nativeapi;
 
 import java.io.File;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * JVM-facing entry for APK native libraries (arm64-v8a .so).
@@ -50,6 +51,99 @@ public final class Natives {
     /** Absolute-path System.load substitute. */
     public static boolean load(String absPath) {
         return loadPath(absPath);
+    }
+
+    // ---- Java -> guest JNI dispatch. jet.dex.DexClassLoader rewrites every `native` method of a translated app class
+    // into `return (T) Natives.jni(Owner.class, "name", "desc", this|null, new Object[]{args...})`.
+
+    /** Guest function registered by JNI_OnLoad's RegisterNatives for cls/name/sig (0 if none). */
+    public static native long registered(String cls, String name, String sig);
+    /** Symbol lookup across every loaded guest library (0 if none). */
+    public static native long resolveAny(String sym);
+    /** Call a guest JNI function: x0 = guest JNIEnv, x1 = receiver (object or class), then the arguments of `desc`
+     *  (integer-class args from prims, float/double raw bits from fbits, references from refs, in order).
+     *  Returns x0, or the raw bits of d0 for F/D. */
+    static native long invoke0(long fn, Object recv, String desc, long[] prims, long[] fbits, Object[] refs);
+    /** Same for reference-returning methods (x0 is a host reference). */
+    static native Object invokeRef0(long fn, Object recv, String desc, long[] prims, long[] fbits, Object[] refs);
+
+    static final ConcurrentHashMap<String, Long> FN = new ConcurrentHashMap<>();
+    static final ConcurrentHashMap<String, Boolean> SEEN = new ConcurrentHashMap<>();
+    /** The first native method an app called, for diagnostics (null until then). */
+    public static volatile String firstCall;
+
+    public static Object jni(Class<?> owner, String name, String desc, Object self, Object[] args) {
+        String cls = owner.getName().replace('.', '/');
+        String key = cls + "." + name + desc;
+        if (firstCall == null) firstCall = key;
+        Long fn = FN.get(key);
+        if (fn == null) { fn = lookup(cls, name, desc); FN.put(key, fn); }
+        if (SEEN.putIfAbsent(key, Boolean.TRUE) == null)
+            System.err.println("[jet.natives] first call " + key + " -> " + (fn == 0 ? "UNBOUND" : "guest 0x" + Long.toHexString(fn)));
+        if (fn == 0) throw new UnsatisfiedLinkError("'" + key + "' (no guest JNI function registered or exported)");
+        int n = args.length, pi = 0, fi = 0, ri = 0;
+        long[] prims = new long[n]; long[] fbits = new long[n]; Object[] refs = new Object[n];
+        int i = desc.indexOf('(') + 1, a = 0;
+        while (desc.charAt(i) != ')') {
+            char c = desc.charAt(i);
+            Object v = args[a++];
+            switch (c) {
+                case 'Z': prims[pi++] = ((Boolean) v) ? 1 : 0; i++; break;
+                case 'B': prims[pi++] = (Byte) v; i++; break;
+                case 'C': prims[pi++] = (Character) v; i++; break;
+                case 'S': prims[pi++] = (Short) v; i++; break;
+                case 'I': prims[pi++] = (Integer) v; i++; break;
+                case 'J': prims[pi++] = (Long) v; i++; break;
+                case 'F': fbits[fi++] = Float.floatToRawIntBits((Float) v) & 0xffffffffL; i++; break;
+                case 'D': fbits[fi++] = Double.doubleToRawLongBits((Double) v); i++; break;
+                default: {
+                    refs[ri++] = v;
+                    while (desc.charAt(i) == '[') i++;
+                    if (desc.charAt(i) == 'L') i = desc.indexOf(';', i);
+                    i++;
+                }
+            }
+        }
+        char r = desc.charAt(i + 1);
+        Object recv = self != null ? self : owner;
+        if (r == 'L' || r == '[') return invokeRef0(fn, recv, desc, prims, fbits, refs);
+        long v = invoke0(fn, recv, desc, prims, fbits, refs);
+        switch (r) {
+            case 'V': return null;
+            case 'Z': return (v & 0xff) != 0;
+            case 'B': return (byte) v;
+            case 'C': return (char) v;
+            case 'S': return (short) v;
+            case 'I': return (int) v;
+            case 'J': return v;
+            case 'F': return Float.intBitsToFloat((int) v);
+            case 'D': return Double.longBitsToDouble(v);
+            default: throw new IllegalStateException(desc);
+        }
+    }
+
+    static long lookup(String cls, String name, String desc) {
+        long fn = registered(cls, name, desc);
+        if (fn != 0) return fn;
+        String shortSym = "Java_" + mangle(cls) + "_" + mangle(name);
+        fn = resolveAny(shortSym);
+        if (fn != 0) return fn;
+        return resolveAny(shortSym + "__" + mangle(desc.substring(1, desc.indexOf(')'))));
+    }
+
+    /** JNI name mangling (JNI spec, "Resolving Native Method Names"). */
+    static String mangle(String s) {
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '/' || c == '.') b.append('_');
+            else if (c == '_') b.append("_1");
+            else if (c == ';') b.append("_2");
+            else if (c == '[') b.append("_3");
+            else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) b.append(c);
+            else b.append(String.format("_0%04x", (int) c));
+        }
+        return b.toString();
     }
 
     public static String javaSym(String classBinaryName, String method) {
