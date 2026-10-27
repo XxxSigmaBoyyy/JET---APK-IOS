@@ -153,12 +153,24 @@ static uint64_t jni_fake_dispatch(jet_ctx *ctx, const jet_args *a, int idx) {
         const guest_JNINativeMethod *methods = a->x[2] ? (const guest_JNINativeMethod*)G2H(a->x[2]) : NULL;
         int n = (int)a->x[3];
         const char *cname = cls ? cls->class_name : "?";
+        void *loader = jet_loader_current(ctx);
+        if (loader) loader = jet_jni_new_global_ref(ctx, loader);
         if (!methods || n < 0 || n > 4096) return (uint64_t)(int64_t)-1;
         for (int i = 0; i < n; i++) {
             if (!methods[i].name || !methods[i].sig || !methods[i].fnPtr) continue;
             const char *name = (const char*)G2H(methods[i].name);
             const char *sig  = (const char*)G2H(methods[i].sig);
             uint64_t fn = methods[i].fnPtr;
+            jet_native_trampoline_ex(ctx, fn, loader, cname);
+            for (int ti = 0; ti < 64; ti++) {
+                if (ctx->tramps[ti].used && ctx->tramps[ti].guest_fn == fn) {
+                    snprintf(ctx->tramps[ti].method_name, sizeof ctx->tramps[ti].method_name,
+                             "%s", name ? name : "");
+                    snprintf(ctx->tramps[ti].method_sig, sizeof ctx->tramps[ti].method_sig,
+                             "%s", sig ? sig : "");
+                    break;
+                }
+            }
             if (ctx->nreg_log < 1024) {
                 int k = ctx->nreg_log++;
                 snprintf(ctx->reg_log[k].cls, sizeof ctx->reg_log[k].cls, "%s", cname);

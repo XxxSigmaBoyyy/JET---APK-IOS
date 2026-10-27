@@ -9,7 +9,7 @@ OBJS = $(SRCS:%.c=build/%.o)
 
 .PHONY: all clean test test-unit test-tg test-jni ios-syntax check
 
-all: build/libjet_native.a build/test_unit build/test_tg build/test_jni build/test_mem_bitfield build/test_v9_jni_dl build/test_cxx_eh build/decode_sweep
+all: build/libjet_native.a build/test_unit build/test_tg build/test_jni build/test_mem_bitfield build/test_v9_jni_dl build/test_cxx_eh build/test_v10_trap_abi build/decode_sweep
 
 build:
 	mkdir -p build

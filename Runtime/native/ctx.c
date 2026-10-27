@@ -1,5 +1,6 @@
 /* ctx.c - jet_ctx lifecycle, trap table, jet_native_call. */
 #include "jet_internal.h"
+#include <stdio.h>
 #include <stdarg.h>
 #include <errno.h>
 #include <sys/mman.h>
@@ -364,17 +365,63 @@ int jet_native_call_host(jet_ctx *ctx, const char *sym, const jet_args *a, uint6
 }
 
 
+void *jet_jni_new_global_ref(jet_ctx *ctx, void *local);
+void jet_jni_delete_global_ref(jet_ctx *ctx, void *global);
+
 int jet_native_set_class_loader(jet_ctx *ctx, void *class_loader) {
     if (!ctx) return -1;
-    ctx->default_class_loader = class_loader;
+    if (ctx->default_class_loader && ctx->default_loader_is_global)
+        jet_jni_delete_global_ref(ctx, ctx->default_class_loader);
+    if (class_loader) {
+        /* Always NewGlobalRef for the stored default. When host JNI exists,
+         * do NOT DeleteLocalRef — caller may still hold the local.
+         * jet_jni_new_global_ref deletes locals (for getClassLoader temps);
+         * here call NewGlobalRef directly. */
+        void **envp = (void **)ctx->host_jnienv;
+        void **f = (envp && *envp) ? (void **)*envp : NULL;
+        if (f) {
+            typedef void *(*fn_ngr)(void *, void *);
+            void *g = ((fn_ngr)f[21])(ctx->host_jnienv, class_loader);
+            ctx->default_class_loader = g ? g : class_loader;
+            ctx->n_global_refs++;
+        } else {
+            /* Fake JNI / no host: identity promote + count */
+            ctx->default_class_loader = jet_jni_new_global_ref(ctx, class_loader);
+        }
+        ctx->default_loader_is_global = 1;
+    } else {
+        ctx->default_class_loader = NULL;
+        ctx->default_loader_is_global = 0;
+    }
     return 0;
 }
 void *jet_native_get_class_loader(jet_ctx *ctx) {
     return ctx ? jet_loader_current(ctx) : NULL;
 }
 void jet_native_lib_set_class_loader(jet_lib *lib, void *class_loader) {
+    /* Store as-is; caller should pass a GlobalRef or use set_class_loader. */
     if (lib) lib->class_loader = class_loader;
 }
+
+int jet_native_global_ref_count(jet_ctx *ctx) {
+    return ctx ? ctx->n_global_refs : 0;
+}
+
+void jet_native_dump_stats(jet_ctx *ctx) {
+    if (!ctx) return;
+    fprintf(stderr, "[jet:stats] insn_total=%llu globals=%d\n",
+            (unsigned long long)ctx->insn_count, ctx->n_global_refs);
+    for (int i = 0; i < JET_TRAMP_POOL; i++) {
+        if (!ctx->native_stats[i].used) continue;
+        fprintf(stderr, "[jet:stats] %s calls=%llu insn=%llu wall_ns=%llu\n",
+                ctx->native_stats[i].key,
+                (unsigned long long)ctx->native_stats[i].calls,
+                (unsigned long long)ctx->native_stats[i].insn,
+                (unsigned long long)ctx->native_stats[i].wall_ns);
+    }
+    fflush(stderr);
+}
+
 void jet_loader_push(jet_ctx *ctx, void *loader) {
     if (!ctx) return;
     if (ctx->loader_sp < JET_LOADER_STACK)

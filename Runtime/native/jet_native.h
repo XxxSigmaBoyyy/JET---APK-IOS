@@ -129,6 +129,12 @@ const char *jet_native_last_error(jet_ctx *ctx);
 /* Invoke a registered host trap by symbol name (tests / tooling). */
 int jet_native_call_host(jet_ctx *ctx, const char *sym, const jet_args *a, uint64_t *ret);
 
+/* Perf: dump per-JNI-native insn/wall counters (also auto if JET_NATIVE_STATS=1). */
+void jet_native_dump_stats(jet_ctx *ctx);
+
+/* Test/introspection: how many NewGlobalRef promotions we've done. */
+int jet_native_global_ref_count(jet_ctx *ctx);
+
 #ifdef __cplusplus
 }
 #endif

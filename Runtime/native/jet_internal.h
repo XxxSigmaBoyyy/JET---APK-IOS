@@ -213,8 +213,10 @@ typedef struct {
     int      used;
     jet_ctx *ctx;
     uint64_t guest_fn;
-    void    *class_loader;   /* host jobject ClassLoader for FindClass */
+    void    *class_loader;   /* host jobject ClassLoader for FindClass (GlobalRef) */
     char     class_name[256];
+    char     method_name[128];
+    char     method_sig[128];
 } jet_tramp_slot;
 
 struct jet_ctx {
@@ -284,8 +286,21 @@ struct jet_ctx {
     uint64_t insn_count;
     char     last_trap_name[128];
     uint64_t last_trap_pc;
+    char     abort_msg[1024];   /* last android_set_abort_message / terminate text */
     uint64_t fault_x[8];
     uint64_t fault_sp, fault_lr, fault_pc;
+    /* ClassLoader global-ref accounting (tests / leak checks) */
+    int      n_global_refs;
+    int      default_loader_is_global;
+    /* Optional per-JNI-native perf (JET_NATIVE_STATS=1) */
+    int      stats_enabled;
+    struct {
+        char     key[192]; /* "class.method signature" */
+        uint64_t insn;
+        uint64_t wall_ns;
+        uint64_t calls;
+        int      used;
+    } native_stats[JET_TRAMP_POOL];
 
     /* Guest-emulated signal state. NEVER installed on the host process —
      * the embedding JVM owns SIGSEGV/SIGBUS. */
@@ -360,6 +375,8 @@ uint64_t jet_tramp_invoke(jet_ctx *ctx, uint64_t guest_fn, const jet_args *a);
 /* Guest setjmp helpers (registered as internal traps). */
 int jet_host_install_setjmp(jet_ctx *ctx);
 void jet_tramp_set_active(jet_ctx *ctx);
+void *jet_jni_new_global_ref(jet_ctx *ctx, void *local);
+void jet_jni_delete_global_ref(jet_ctx *ctx, void *global);
 void jet_loader_push(jet_ctx *ctx, void *loader);
 void jet_loader_pop(jet_ctx *ctx);
 void *jet_loader_current(jet_ctx *ctx);

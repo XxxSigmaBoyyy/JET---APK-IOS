@@ -70,6 +70,69 @@ static uint64_t va_arg_gr(jet_va_list_aapcs64 *ap) {
     return v;
 }
 
+/* ---- Android/bionic LP64 struct stat (aarch64) — 128 bytes.
+ * Host glibc x86_64 struct stat is 144 bytes with different field order
+ * (nlink before mode). Writing host sizeof into a guest buffer smashes the
+ * guest stack (saved x19–x28) — root cause of SQLite prepare SIGSEGV after
+ * fstat (partner v9: x20 clobbered → ldr [x20,#0xc8]). */
+typedef struct { int64_t tv_sec; int64_t tv_nsec; } jet_guest_timespec;
+typedef struct {
+    uint64_t st_dev;
+    uint64_t st_ino;
+    uint32_t st_mode;
+    uint32_t st_nlink;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint64_t st_rdev;
+    uint64_t __pad1;
+    int64_t  st_size;
+    int32_t  st_blksize;
+    int32_t  __pad2;
+    int64_t  st_blocks;
+    jet_guest_timespec st_atim;
+    jet_guest_timespec st_mtim;
+    jet_guest_timespec st_ctim;
+    uint32_t __unused4;
+    uint32_t __unused5;
+} jet_guest_stat;
+_Static_assert(sizeof(jet_guest_stat) == 128, "bionic LP64 struct stat must be 128");
+
+static void host_stat_to_guest(const struct stat *h, jet_guest_stat *g) {
+    memset(g, 0, sizeof *g);
+    g->st_dev = (uint64_t)h->st_dev;
+    g->st_ino = (uint64_t)h->st_ino;
+    g->st_mode = (uint32_t)h->st_mode;
+    g->st_nlink = (uint32_t)h->st_nlink;
+    g->st_uid = (uint32_t)h->st_uid;
+    g->st_gid = (uint32_t)h->st_gid;
+    g->st_rdev = (uint64_t)h->st_rdev;
+    g->st_size = (int64_t)h->st_size;
+    g->st_blksize = (int32_t)h->st_blksize;
+    g->st_blocks = (int64_t)h->st_blocks;
+#if defined(st_atime) || defined(__linux__) || defined(__APPLE__)
+    g->st_atim.tv_sec = (int64_t)h->st_atim.tv_sec;
+    g->st_atim.tv_nsec = (int64_t)h->st_atim.tv_nsec;
+    g->st_mtim.tv_sec = (int64_t)h->st_mtim.tv_sec;
+    g->st_mtim.tv_nsec = (int64_t)h->st_mtim.tv_nsec;
+    g->st_ctim.tv_sec = (int64_t)h->st_ctim.tv_sec;
+    g->st_ctim.tv_nsec = (int64_t)h->st_ctim.tv_nsec;
+#else
+    g->st_atim.tv_sec = (int64_t)h->st_atime;
+    g->st_mtim.tv_sec = (int64_t)h->st_mtime;
+    g->st_ctim.tv_sec = (int64_t)h->st_ctime;
+#endif
+}
+
+static int write_guest_stat(uint64_t guest_buf, const struct stat *h) {
+    if (!guest_buf) { errno = EFAULT; return -1; }
+    jet_guest_stat gs;
+    host_stat_to_guest(h, &gs);
+    memcpy(G2H(guest_buf), &gs, sizeof gs);
+    return 0;
+}
+
+
+
 /* ---- errno ---- */
 static uint64_t h___errno(jet_ctx *ctx, const jet_args *a, void *u) {
     (void)ctx; (void)a; (void)u;
@@ -174,26 +237,177 @@ static uint64_t h_strtod(jet_ctx *c, const jet_args *a, void *u){
 }
 static uint64_t h_atoi(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)atoi((char*)G2H(a->x[0])); }
 static uint64_t h_strerror(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return H2G(strerror((int)a->x[0])); }
+/* Dump guest FP-chain backtrace with PCs relative to each loaded .so base. */
+static void jet_dump_guest_backtrace(jet_ctx *c, jet_cpu *cpu, const char *why) {
+    if (!c || !cpu) return;
+    jet_log(c, 0, "guest backtrace (%s)%s%s",
+            why ? why : "?",
+            c->abort_msg[0] ? ": " : "",
+            c->abort_msg[0] ? c->abort_msg : "");
+    uint64_t fp = cpu->x[29];
+    uint64_t lr = cpu->x[30];
+    uint64_t pc = cpu->pc;
+    for (int frame = 0; frame < 32; frame++) {
+        /* Resolve PC against loaded libs */
+        const char *libn = "?";
+        uint64_t base = 0, off = pc;
+        for (jet_lib *L = c->libs; L; L = L->next) {
+            if (pc >= L->load_bias && pc < L->load_bias + L->map_size) {
+                libn = L->path ? L->path : "lib";
+                base = L->load_bias;
+                off = pc - base;
+                break;
+            }
+        }
+        if (base)
+            jet_log(c, 0, "  #%d pc=%llx %s+0x%llx lr=%llx fp=%llx",
+                    frame, (unsigned long long)pc, libn, (unsigned long long)off,
+                    (unsigned long long)lr, (unsigned long long)fp);
+        else
+            jet_log(c, 0, "  #%d pc=%llx lr=%llx fp=%llx",
+                    frame, (unsigned long long)pc,
+                    (unsigned long long)lr, (unsigned long long)fp);
+        if (!fp || fp < 0x1000) break;
+        /* AAPCS64 frame: [fp]=saved fp, [fp+8]=saved lr */
+        uint64_t *slot = (uint64_t *)G2H(fp);
+        uint64_t next_fp = slot[0];
+        uint64_t next_lr = slot[1];
+        if (next_fp == fp) break;
+        pc = lr;
+        lr = next_lr;
+        fp = next_fp;
+    }
+}
+
+static uint64_t h_android_set_abort_message(jet_ctx *c, const jet_args *a, void *u){
+    (void)u;
+    const char *msg = a->x[0] ? (const char *)G2H(a->x[0]) : "";
+    if (!msg) msg = "";
+    snprintf(c->abort_msg, sizeof c->abort_msg, "%s", msg);
+    jet_log(c, 0, "android_set_abort_message: %s", c->abort_msg);
+    fprintf(stderr, "[jet:E] abort_message: %s\n", c->abort_msg);
+    fflush(stderr);
+    return 0;
+}
+
 static uint64_t h_abort(jet_ctx *c, const jet_args *a, void *u){
     (void)a;(void)u;
     jet_cpu *cpu = jet_cpu_current(c);
-    jet_log(c,0,"guest abort() pc=%llx lr=%llx x0=%llx x1=%llx sp=%llx last_trap=%s",
+    jet_log(c,0,"guest abort() pc=%llx lr=%llx x0=%llx x1=%llx sp=%llx last_trap=%s abort_msg=%s",
             (unsigned long long)(cpu?cpu->pc:0),
             (unsigned long long)(cpu?cpu->x[30]:0),
             (unsigned long long)(cpu?cpu->x[0]:0),
             (unsigned long long)(cpu?cpu->x[1]:0),
             (unsigned long long)(cpu?cpu->sp:0),
-            c->last_trap_name[0]?c->last_trap_name:"-");
+            c->last_trap_name[0]?c->last_trap_name:"-",
+            c->abort_msg[0]?c->abort_msg:"-");
+    jet_dump_guest_backtrace(c, cpu, "abort");
     if (cpu) {
-        snprintf(cpu->err_msg, sizeof cpu->err_msg,
-                 "abort() lr=%llx x0=%llx last=%s",
-                 (unsigned long long)cpu->x[30],
-                 (unsigned long long)cpu->x[0],
-                 c->last_trap_name[0]?c->last_trap_name:"-");
+        if (c->abort_msg[0])
+            snprintf(cpu->err_msg, sizeof cpu->err_msg, "abort: %s", c->abort_msg);
+        else
+            snprintf(cpu->err_msg, sizeof cpu->err_msg,
+                     "abort() lr=%llx x0=%llx last=%s",
+                     (unsigned long long)cpu->x[30],
+                     (unsigned long long)cpu->x[0],
+                     c->last_trap_name[0]?c->last_trap_name:"-");
         cpu->err_code = 5; cpu->stop = 1;
     }
     return 0;
 }
+
+/* Format guest AAPCS64 va_list into out[]; returns length. */
+static size_t jet_format_guest_va(char *out, size_t outsz, const char *fmt,
+                                  jet_va_list_aapcs64 *ap) {
+    size_t o = 0;
+    if (!out || !outsz) return 0;
+    out[0] = 0;
+    if (!fmt) return 0;
+    for (const char *p = fmt; *p && o + 1 < outsz; p++) {
+        if (*p != '%') { out[o++] = *p; continue; }
+        p++;
+        int longness = 0;
+        while (*p == 'l' || *p == 'z' || *p == 't' || *p == 'h' || *p == 'j') {
+            if (*p == 'l') longness++;
+            p++;
+        }
+        char tmp[192];
+        switch (*p) {
+        case '%': out[o++] = '%'; break;
+        case 's': {
+            uint64_t gp = va_arg_gr(ap);
+            char *s = gp ? (char *)G2H(gp) : NULL;
+            if (!s) s = "(null)";
+            size_t l = strlen(s); if (o + l >= outsz) l = outsz - o - 1;
+            memcpy(out + o, s, l); o += l; break;
+        }
+        case 'd': case 'i': {
+            long long v = (long long)(int64_t)va_arg_gr(ap);
+            snprintf(tmp, sizeof tmp, "%lld", v);
+            size_t l = strlen(tmp); if (o + l >= outsz) l = outsz - o - 1;
+            memcpy(out + o, tmp, l); o += l; break;
+        }
+        case 'u': case 'x': case 'X': case 'p': case 'o': {
+            unsigned long long v = va_arg_gr(ap);
+            const char *f = (*p == 'p') ? "%p" : (*p == 'x') ? "%llx"
+                          : (*p == 'X') ? "%llX" : (*p == 'o') ? "%llo" : "%llu";
+            snprintf(tmp, sizeof tmp, f, v);
+            size_t l = strlen(tmp); if (o + l >= outsz) l = outsz - o - 1;
+            memcpy(out + o, tmp, l); o += l; break;
+        }
+        case 'c': { out[o++] = (char)va_arg_gr(ap); break; }
+        case 'f': case 'g': case 'e': case 'F': case 'G': case 'E': {
+            (void)longness;
+            if (ap->__vr_offs < 0) ap->__vr_offs += 16;
+            snprintf(tmp, sizeof tmp, "0");
+            size_t l = strlen(tmp); if (o + l >= outsz) l = outsz - o - 1;
+            memcpy(out + o, tmp, l); o += l; break;
+        }
+        default:
+            out[o++] = '%';
+            if (*p && o + 1 < outsz) out[o++] = *p;
+            break;
+        }
+    }
+    out[o] = 0;
+    return o;
+}
+
+static uint64_t h_vfprintf(jet_ctx *c, const jet_args *a, void *u){
+    (void)u;
+    /* vfprintf(FILE*, fmt, va_list) — print formatted message to stderr via jet_log. */
+    const char *fmt = a->x[1] ? (const char *)G2H(a->x[1]) : "";
+    jet_va_list_aapcs64 *ap = a->x[2] ? (jet_va_list_aapcs64 *)G2H(a->x[2]) : NULL;
+    char buf[4096];
+    if (ap) {
+        jet_format_guest_va(buf, sizeof buf, fmt, ap);
+    } else {
+        snprintf(buf, sizeof buf, "%s", fmt ? fmt : "");
+    }
+    jet_log(c, 1, "vfprintf: %s", buf);
+    fputs(buf, stderr);
+    if (buf[0] && buf[strlen(buf)-1] != '\n') fputc('\n', stderr);
+    fflush(stderr);
+    /* Capture likely abort/terminate messages */
+    if (fmt && (strstr(fmt, "terminat") || strstr(fmt, "exception") || strstr(buf, "terminat")))
+        snprintf(c->abort_msg, sizeof c->abort_msg, "%s", buf);
+    return (uint64_t)strlen(buf);
+}
+
+static uint64_t h_android_log_vprint(jet_ctx *c, const jet_args *a, void *u){
+    (void)u;
+    /* __android_log_vprint(prio, tag, fmt, va_list) */
+    int prio = (int)a->x[0];
+    const char *tag = a->x[1] ? (const char *)G2H(a->x[1]) : "?";
+    const char *fmt = a->x[2] ? (const char *)G2H(a->x[2]) : "";
+    jet_va_list_aapcs64 *ap = a->x[3] ? (jet_va_list_aapcs64 *)G2H(a->x[3]) : NULL;
+    char buf[2048];
+    if (ap) jet_format_guest_va(buf, sizeof buf, fmt, ap);
+    else snprintf(buf, sizeof buf, "%s", fmt ? fmt : "");
+    jet_log(c, 2, "android_log_v(p=%d,%s): %s", prio, tag, buf);
+    return 0;
+}
+
 static uint64_t h_exit_fn(jet_ctx *c, const jet_args *a, void *u){
     (void)u;
     jet_log(c, 0, "guest exit(%d) — soft-stop (not killing host)", (int)a->x[0]);
@@ -473,8 +687,34 @@ static uint64_t h_close(jet_ctx *c, const jet_args *a, void *u){
 static uint64_t h_read(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; if (jet_is_fake_fd((int)a->x[0])) { errno=EAGAIN; return (uint64_t)(int64_t)-1; } return (uint64_t)(int64_t)read((int)a->x[0],G2H(a->x[1]),(size_t)a->x[2]); }
 static uint64_t h_write(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; if (jet_is_fake_fd((int)a->x[0])) return a->x[2]; return (uint64_t)(int64_t)write((int)a->x[0],G2H(a->x[1]),(size_t)a->x[2]); }
 static uint64_t h_lseek(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)lseek((int)a->x[0],(off_t)a->x[1],(int)a->x[2]); }
-static uint64_t h_fstat(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)fstat((int)a->x[0],(struct stat*)G2H(a->x[1])); }
-static uint64_t h_stat_fn(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)stat((char*)G2H(a->x[0]),(struct stat*)G2H(a->x[1])); }
+static uint64_t h_fstat(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    struct stat hs;
+    int rc = fstat((int)a->x[0], &hs);
+    if (rc == 0) write_guest_stat(a->x[1], &hs);
+    return (uint64_t)(int64_t)rc;
+}
+static uint64_t h_stat_fn(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    struct stat hs;
+    int rc = stat((char*)G2H(a->x[0]), &hs);
+    if (rc == 0) write_guest_stat(a->x[1], &hs);
+    return (uint64_t)(int64_t)rc;
+}
+static uint64_t h_lstat_fn(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    struct stat hs;
+    int rc = lstat((char*)G2H(a->x[0]), &hs);
+    if (rc == 0) write_guest_stat(a->x[1], &hs);
+    return (uint64_t)(int64_t)rc;
+}
+static uint64_t h_fstatat_fn(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    struct stat hs;
+    int rc = fstatat((int)a->x[0], (const char*)G2H(a->x[1]), &hs, (int)a->x[3]);
+    if (rc == 0) write_guest_stat(a->x[2], &hs);
+    return (uint64_t)(int64_t)rc;
+}
 static uint64_t h_access(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)access((char*)G2H(a->x[0]),(int)a->x[1]); }
 static uint64_t h_readlink(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)readlink((char*)G2H(a->x[0]),(char*)G2H(a->x[1]),(size_t)a->x[2]); }
 static uint64_t h_getenv(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return H2G(getenv((char*)G2H(a->x[0]))); }
@@ -924,7 +1164,7 @@ int jet_host_install_bionic(jet_ctx *ctx) {
 
     reg(ctx,"__errno",h___errno);
     reg(ctx,"__android_log_print",h_android_log_print);
-    reg(ctx,"__android_log_vprint",h_android_log_print);
+    reg(ctx,"__android_log_vprint",h_android_log_vprint);
     reg(ctx,"__android_log_write",h_android_log_write);
     reg(ctx,"__android_log_assert",h_android_log_assert);
     reg(ctx,"__system_property_get",h_system_property_get);
@@ -951,7 +1191,7 @@ int jet_host_install_bionic(jet_ctx *ctx) {
     reg(ctx,"abort",h_abort); reg(ctx,"exit",h_exit_fn); reg(ctx,"_exit",h__exit);
     reg(ctx,"snprintf",h_snprintf); reg(ctx,"vsnprintf",h_vsnprintf);
     reg(ctx,"__vsnprintf_chk",h_vsnprintf);
-    reg(ctx,"sprintf",h_sprintf); reg(ctx,"printf",h_printf);
+    reg(ctx,"sprintf",h_sprintf); reg(ctx,"printf",h_printf); reg(ctx,"vfprintf",h_vfprintf);
 
     reg(ctx,"mmap",h_mmap); reg(ctx,"munmap",h_munmap); reg(ctx,"mprotect",h_mprotect);
     reg(ctx,"mremap",h_stub0);
@@ -965,7 +1205,7 @@ int jet_host_install_bionic(jet_ctx *ctx) {
     reg(ctx,"open",h_open); reg(ctx,"__open_2",h_open); reg(ctx,"close",h_close);
     reg(ctx,"read",h_read); reg(ctx,"__read_chk",h_read); reg(ctx,"write",h_write);
     reg(ctx,"lseek",h_lseek); reg(ctx,"lseek64",h_lseek);
-    reg(ctx,"fstat",h_fstat); reg(ctx,"stat",h_stat_fn); reg(ctx,"lstat",h_stat_fn);
+    reg(ctx,"fstat",h_fstat); reg(ctx,"stat",h_stat_fn); reg(ctx,"lstat",h_lstat_fn); reg(ctx,"fstatat",h_fstatat_fn); reg(ctx,"newfstatat",h_fstatat_fn);
     reg(ctx,"access",h_access); reg(ctx,"readlink",h_readlink);
     reg(ctx,"getenv",h_getenv); reg(ctx,"setenv",h_setenv);
 
@@ -1109,13 +1349,13 @@ int jet_host_install_bionic(jet_ctx *ctx) {
     reg(ctx,"signal",h_guest_signal); reg(ctx,"bsd_signal",h_guest_signal);
     reg(ctx,"sigprocmask",h_guest_sigprocmask); reg(ctx,"sigaltstack",h_guest_sigaltstack);
     reg(ctx,"tgkill",h_stub0);
-    reg(ctx,"android_set_abort_message",h_stub0);
+    reg(ctx,"android_set_abort_message",h_android_set_abort_message);
     reg(ctx,"__assert2",h_abort);
 
 
     /* bulk missing imports seen from libtmessages */
     const char *more_stubs[] = {
-        "feof","ferror","eventfd_write","eventfd_read","vfprintf","closelog","openlog","syslog",
+        "feof","ferror","eventfd_write","eventfd_read","closelog","openlog","syslog",
         "strtoull_l","strtoll_l","strtold_l","strtof","strtold","strcoll","strxfrm","strspn","strcspn",
         "strnlen","strerror_r","sscanf","vsscanf","fscanf","vasprintf","perror","utimes","utimensat",
         "wcsnrtombs","wcrtomb","wcslen","wcstoul","wcstoll","wcstod","wcstof","wmemmove","wmemcpy",
@@ -1490,10 +1730,18 @@ int64_t jet_emulate_linux_syscall(jet_ctx *ctx, jet_cpu *cpu,
         /* Linux openat flags differ slightly; pass through best-effort. */
         return (int64_t)openat((int)a0, (const char*)G2H(a1), (int)a2, (mode_t)a3);
     }
-    case JET_NR_fstat:
-        return (int64_t)fstat((int)a0, (struct stat*)G2H(a1));
-    case JET_NR_newfstatat:
-        return (int64_t)fstatat((int)a0, (const char*)G2H(a1), (struct stat*)G2H(a2), (int)a3);
+    case JET_NR_fstat: {
+        struct stat hs;
+        int rc = fstat((int)a0, &hs);
+        if (rc == 0) write_guest_stat(a1, &hs);
+        return (int64_t)rc;
+    }
+    case JET_NR_newfstatat: {
+        struct stat hs;
+        int rc = fstatat((int)a0, (const char*)G2H(a1), &hs, (int)a3);
+        if (rc == 0) write_guest_stat(a2, &hs);
+        return (int64_t)rc;
+    }
     case JET_NR_readlinkat:
         return (int64_t)readlinkat((int)a0, (const char*)G2H(a1), (char*)G2H(a2), (size_t)a3);
     case JET_NR_faccessat:

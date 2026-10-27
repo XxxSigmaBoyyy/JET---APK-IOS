@@ -242,3 +242,105 @@ int guest_throw_catch(int depth) {
     }
     return r; /* expect 99 */
 }
+
+/* ---- v10: trap ABI + guest struct stat size ---- */
+extern int open(const char *path, int flags, ...);
+extern int close(int fd);
+extern int fstat(int fd, void *st);
+extern void *malloc(unsigned long n);
+extern void free(void *p);
+
+/* Known sentinel values in callee-saved regs; call host traps; return 0 if all
+ * preserved, else a bitmask of which x19+i / d8+i failed. */
+int guest_trap_abi_check(void) {
+    unsigned long long want[10];
+    unsigned long long want_d[8];
+    for (int i = 0; i < 10; i++) want[i] = 0xA190000000000000ull + (unsigned long long)i;
+    for (int i = 0; i < 8; i++) want_d[i] = 0xD800000000000000ull + (unsigned long long)i;
+
+    register unsigned long long x19 __asm__("x19") = want[0];
+    register unsigned long long x20 __asm__("x20") = want[1];
+    register unsigned long long x21 __asm__("x21") = want[2];
+    register unsigned long long x22 __asm__("x22") = want[3];
+    register unsigned long long x23 __asm__("x23") = want[4];
+    register unsigned long long x24 __asm__("x24") = want[5];
+    register unsigned long long x25 __asm__("x25") = want[6];
+    register unsigned long long x26 __asm__("x26") = want[7];
+    register unsigned long long x27 __asm__("x27") = want[8];
+    register unsigned long long x28 __asm__("x28") = want[9];
+    /* Keep them live across calls */
+    __asm__ volatile("" : "+r"(x19),"+r"(x20),"+r"(x21),"+r"(x22),"+r"(x23),
+                           "+r"(x24),"+r"(x25),"+r"(x26),"+r"(x27),"+r"(x28));
+
+    __asm__ volatile(
+        "fmov d8, %0\n"
+        "fmov d9, %1\n"
+        "fmov d10, %2\n"
+        "fmov d11, %3\n"
+        "fmov d12, %4\n"
+        "fmov d13, %5\n"
+        "fmov d14, %6\n"
+        "fmov d15, %7\n"
+        :
+        : "r"(want_d[0]),"r"(want_d[1]),"r"(want_d[2]),"r"(want_d[3]),
+          "r"(want_d[4]),"r"(want_d[5]),"r"(want_d[6]),"r"(want_d[7])
+        : "d8","d9","d10","d11","d12","d13","d14","d15"
+    );
+
+    /* Host traps that previously risked clobber / stack smash */
+    unsigned char st[128];
+    for (int i = 0; i < 128; i++) st[i] = 0xCC;
+    int fd = open("/dev/null", 0);
+    if (fd >= 0) {
+        fstat(fd, st);
+        close(fd);
+    }
+    void *p = malloc(64);
+    if (p) free(p);
+
+    __asm__ volatile("" : "+r"(x19),"+r"(x20),"+r"(x21),"+r"(x22),"+r"(x23),
+                           "+r"(x24),"+r"(x25),"+r"(x26),"+r"(x27),"+r"(x28));
+
+    unsigned long long got[10] = {x19,x20,x21,x22,x23,x24,x25,x26,x27,x28};
+    unsigned long long got_d[8];
+    __asm__ volatile(
+        "fmov %0, d8\n"
+        "fmov %1, d9\n"
+        "fmov %2, d10\n"
+        "fmov %3, d11\n"
+        "fmov %4, d12\n"
+        "fmov %5, d13\n"
+        "fmov %6, d14\n"
+        "fmov %7, d15\n"
+        : "=r"(got_d[0]),"=r"(got_d[1]),"=r"(got_d[2]),"=r"(got_d[3]),
+          "=r"(got_d[4]),"=r"(got_d[5]),"=r"(got_d[6]),"=r"(got_d[7])
+        :
+        : 
+    );
+
+    int bad = 0;
+    for (int i = 0; i < 10; i++) if (got[i] != want[i]) bad |= (1 << i);
+    for (int i = 0; i < 8; i++) if (got_d[i] != want_d[i]) bad |= (1 << (16 + i));
+    /* Also verify fstat only wrote 128 bytes (no smash past buffer) —
+     * we can't see past st here; return bad bitmask. */
+    (void)st;
+    return bad;
+}
+
+/* Return sizeof buffer guest expects for struct stat (compile-time 128). */
+int guest_stat_size(void) { return 128; }
+
+/* Fill a 160-byte region with 0xA5, call fstat into offset 0 with 128-byte
+ * expectation; return first byte past 128 that was overwritten (or 0). */
+int guest_fstat_no_smash(void) {
+    unsigned char buf[160];
+    for (int i = 0; i < 160; i++) buf[i] = 0xA5;
+    int fd = open("/dev/null", 0);
+    if (fd < 0) return -1;
+    fstat(fd, buf);
+    close(fd);
+    for (int i = 128; i < 160; i++) {
+        if (buf[i] != 0xA5) return i; /* smashed */
+    }
+    return 0; /* clean */
+}

@@ -2,6 +2,8 @@
 #include "jet_internal.h"
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <stdlib.h>
 
 static jet_ctx *g_active_ctx;
 void jet_tramp_set_active(jet_ctx *ctx) { g_active_ctx = ctx; }
@@ -26,6 +28,18 @@ static inline void tramp_fill_args(jet_args *a,
     a->x8 = tramp_read_x8();
 }
 
+static int stats_wanted(jet_ctx *c) {
+    if (c->stats_enabled) return 1;
+    static int once, en;
+    if (!once) {
+        const char *e = getenv("JET_NATIVE_STATS");
+        en = (e && e[0] == '1');
+        once = 1;
+    }
+    if (en) c->stats_enabled = 1;
+    return en;
+}
+
 static uint64_t tramp_enter(int idx,
         uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
@@ -35,7 +49,31 @@ static uint64_t tramp_enter(int idx,
     jet_args a = {0};
     tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r = 0;
+    int do_stats = stats_wanted(c);
+    uint64_t insn0 = 0;
+    struct timespec t0, t1;
+    if (do_stats) {
+        insn0 = c->insn_count;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+    }
     jet_native_call(c, c->tramps[idx].guest_fn, &a, &r, NULL);
+    if (do_stats) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        uint64_t ns = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull
+                    + (uint64_t)(t1.tv_nsec - t0.tv_nsec);
+        uint64_t di = c->insn_count - insn0;
+        if (!c->native_stats[idx].used) {
+            c->native_stats[idx].used = 1;
+            snprintf(c->native_stats[idx].key, sizeof c->native_stats[idx].key,
+                     "%s.%s%s",
+                     c->tramps[idx].class_name[0] ? c->tramps[idx].class_name : "?",
+                     c->tramps[idx].method_name[0] ? c->tramps[idx].method_name : "?",
+                     c->tramps[idx].method_sig);
+        }
+        c->native_stats[idx].calls++;
+        c->native_stats[idx].insn += di;
+        c->native_stats[idx].wall_ns += ns;
+    }
     jet_loader_pop(c);
     return r;
 }

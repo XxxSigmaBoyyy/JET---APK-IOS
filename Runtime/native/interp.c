@@ -1,5 +1,8 @@
 /* interp.c - AArch64 instruction execution + block cache + run loop. */
 #include "jet_internal.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
 #include <math.h>
 #include <time.h>
 #include <unistd.h>
@@ -1643,6 +1646,83 @@ jet_block *jet_block_get(jet_ctx *ctx, uint64_t pc) {
     return b;
 }
 
+/* AAPCS64 callee-saved snapshot for host traps.
+ * Partner v9 CRITICAL: after fstat, guest x20 was 0. Traps must preserve
+ * x19–x28, FP(x29), SP, and v8–v15 (d8–d15 lower 64). Only x0/x1 (x8 if
+ * IPRIN) and d0–d7 may change for the call's return. Nested host→guest→host
+ * uses stack-local snapshots here plus full save in jet_native_call_ex. */
+typedef struct {
+    uint64_t x19_28[10];
+    uint64_t x29, sp, x30;
+    uint64_t d8_15[8];
+} jet_callee_saved;
+
+static void jet_save_callee(const jet_cpu *c, jet_callee_saved *s) {
+    for (int i = 0; i < 10; i++) s->x19_28[i] = c->x[19 + i];
+    s->x29 = c->x[29];
+    s->sp = c->sp;
+    s->x30 = c->x[30];
+    for (int i = 0; i < 8; i++) s->d8_15[i] = c->v[8 + i][0];
+}
+static void jet_restore_callee(jet_cpu *c, const jet_callee_saved *s) {
+    for (int i = 0; i < 10; i++) c->x[19 + i] = s->x19_28[i];
+    c->x[29] = s->x29;
+    c->sp = s->sp;
+    c->x[30] = s->x30;
+    for (int i = 0; i < 8; i++) {
+        c->v[8 + i][0] = s->d8_15[i];
+        /* leave high 64 of v8–v15 alone (AAPCS64 only requires lower 64) */
+    }
+}
+static int jet_trap_abi_check_enabled(void) {
+    static int once, en;
+    if (!once) {
+        const char *e = getenv("JET_TRAP_ABI_CHECK");
+#if !defined(NDEBUG)
+        en = 1;
+#else
+        en = 0;
+#endif
+        if (e && e[0] == '1') en = 1;
+        if (e && e[0] == '0') en = 0;
+        once = 1;
+    }
+    return en;
+}
+static void jet_check_callee(jet_ctx *ctx, jet_cpu *c, const jet_callee_saved *s,
+                             const char *trap_name) {
+    if (!jet_trap_abi_check_enabled()) return;
+    char diff[512]; size_t n = 0;
+    diff[0] = 0;
+    for (int i = 0; i < 10; i++) {
+        if (c->x[19 + i] != s->x19_28[i]) {
+            n += (size_t)snprintf(diff + n, sizeof diff - n, " x%d:%llx->%llx",
+                    19 + i, (unsigned long long)s->x19_28[i],
+                    (unsigned long long)c->x[19 + i]);
+            if (n >= sizeof diff) break;
+        }
+    }
+    if (c->x[29] != s->x29)
+        n += (size_t)snprintf(diff + n, sizeof diff - n, " x29:%llx->%llx",
+                (unsigned long long)s->x29, (unsigned long long)c->x[29]);
+    if (c->sp != s->sp)
+        n += (size_t)snprintf(diff + n, sizeof diff - n, " sp:%llx->%llx",
+                (unsigned long long)s->sp, (unsigned long long)c->sp);
+    for (int i = 0; i < 8 && n < sizeof diff; i++) {
+        if (c->v[8 + i][0] != s->d8_15[i])
+            n += (size_t)snprintf(diff + n, sizeof diff - n, " d%d:%llx->%llx",
+                    8 + i, (unsigned long long)s->d8_15[i],
+                    (unsigned long long)c->v[8 + i][0]);
+    }
+    if (diff[0]) {
+        jet_log(ctx, 0, "TRAP ABI VIOLATION %s:%s", trap_name ? trap_name : "?", diff);
+        fprintf(stderr, "[jet:E] TRAP ABI VIOLATION %s:%s\n",
+                trap_name ? trap_name : "?", diff);
+        fflush(stderr);
+        abort();
+    }
+}
+
 /* ---- dispatch a stub trap ---- */
 static int dispatch_stub(jet_ctx *ctx, jet_cpu *c, int idx) {
     if (idx == JET_STUB_RETURN) { c->stop = 1; return 1; }
@@ -1673,6 +1753,9 @@ static int dispatch_stub(jet_ctx *ctx, jet_cpu *c, int idx) {
                 (unsigned long long)c->x[8], (unsigned long long)c->sp,
                 (unsigned long long)c->x[30]);
     }
+    /* Snapshot callee-saved BEFORE host trap (nest-safe: locals on C stack). */
+    jet_callee_saved saved;
+    jet_save_callee(c, &saved);
     /* Host trap: clear jet_fault_active so JNIEnv→JVM / bionic / callbacks
      * that raise SIGSEGV (implicit null checks) are not claimed by soft-fault.
      * Nested jet_native_call from host re-enters interp and sets active again;
@@ -1680,6 +1763,21 @@ static int dispatch_stub(jet_ctx *ctx, jet_cpu *c, int idx) {
     int trap_saved_active = jet_fault_host_enter();
     uint64_t ret = t->fn(ctx, &a, t->user);
     jet_fault_host_leave(trap_saved_active);
+    /* longjmp restores the full guest frame itself — do not clobber it. */
+    if (c->jumping) {
+        c->jumping = 0;
+        if (c->stop) return 1;
+        /* h_longjmp already set x0, pc/LR; just continue at restored PC. */
+        if (c->pc == 0) {
+            snprintf(c->err_msg, sizeof c->err_msg, "longjmp to PC=0");
+            c->err_code = 3; c->stop = 1;
+        }
+        return 1;
+    }
+    /* Assert then restore: only x0 (and d0 for FP returns) may take the result.
+     * x8 IPRIN is an input pointer — contents behind it may change, not x8. */
+    jet_check_callee(ctx, c, &saved, t->name);
+    jet_restore_callee(c, &saved);
     if (c->stop) {
         /* Host trap requested stop (abort/stack_chk/etc.) — do not resume at LR. */
         return 1;
@@ -1691,7 +1789,7 @@ static int dispatch_stub(jet_ctx *ctx, jet_cpu *c, int idx) {
     } else {
         c->x[0] = ret;
     }
-    /* return to LR */
+    /* return to LR (restored) */
     c->pc = c->x[30];
     if (c->pc == 0) {
         snprintf(c->err_msg, sizeof c->err_msg,

@@ -222,6 +222,32 @@ static void **host_fns(jet_ctx *ctx) {
 }
 static void *host_env(jet_ctx *ctx) { return ctx->host_jnienv; }
 
+/* Promote a local (or any) jobject to a NewGlobalRef for long-lived storage.
+ * Deletes the local when host JNI is available. Fake JNI: identity + count. */
+void *jet_jni_new_global_ref(jet_ctx *ctx, void *local) {
+    if (!ctx || !local) return NULL;
+    if (host_fns(ctx) && host_env(ctx)) {
+        void **f = host_fns(ctx); void *e = host_env(ctx);
+        typedef void *(*fn_ngr)(void *, void *);
+        typedef void (*fn_dlr)(void *, void *);
+        void *g = ((fn_ngr)f[21])(e, local); /* NewGlobalRef */
+        ((fn_dlr)f[23])(e, local);           /* DeleteLocalRef */
+        ctx->n_global_refs++;
+        return g ? g : local;
+    }
+    ctx->n_global_refs++;
+    return local;
+}
+void jet_jni_delete_global_ref(jet_ctx *ctx, void *global) {
+    if (!ctx || !global) return;
+    if (host_fns(ctx) && host_env(ctx)) {
+        void **f = host_fns(ctx); void *e = host_env(ctx);
+        typedef void (*fn_dgr)(void *, void *);
+        ((fn_dgr)f[22])(e, global); /* DeleteGlobalRef */
+    }
+}
+
+
 static void jni_abort_unimplemented(jet_ctx *ctx, int idx, int is_vm) {
     const char *name = is_vm
         ? (idx >= 0 && idx < 8 ? jni_vm_names[idx] : "?")
@@ -674,7 +700,10 @@ static uint64_t host_register_natives(jet_ctx *ctx, const jet_args *a) {
                                             "()Ljava/lang/ClassLoader;");
             if (mid) {
                 jobject ldr = ((fn_callA)f[36])(e, jcls, mid, NULL);
-                if (ldr) loader = ldr;
+                if (ldr) {
+                    /* Local → GlobalRef; DeleteLocalRef the temporary. */
+                    loader = jet_jni_new_global_ref(ctx, ldr);
+                }
             }
         }
     }
@@ -686,6 +715,16 @@ static uint64_t host_register_natives(jet_ctx *ctx, const jet_args *a) {
         uint64_t fn = gm[i].fnPtr;
         /* Host trampoline that re-enters the guest (for optional host wiring). */
         jet_native_trampoline_ex(ctx, fn, loader, cname);
+        /* Stamp method name/sig onto the tramp slot for JET_NATIVE_STATS. */
+        for (int ti = 0; ti < 64; ti++) {
+            if (ctx->tramps[ti].used && ctx->tramps[ti].guest_fn == fn) {
+                snprintf(ctx->tramps[ti].method_name, sizeof ctx->tramps[ti].method_name,
+                         "%s", name ? name : "");
+                snprintf(ctx->tramps[ti].method_sig, sizeof ctx->tramps[ti].method_sig,
+                         "%s", sig ? sig : "");
+                break;
+            }
+        }
         if (ctx->nreg_log < 1024) {
             int k = ctx->nreg_log++;
             snprintf(ctx->reg_log[k].cls, sizeof ctx->reg_log[k].cls, "%s", cname);
