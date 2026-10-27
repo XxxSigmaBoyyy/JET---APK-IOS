@@ -115,6 +115,7 @@ int32_t jet_jvm_boot(const char *java_home, const char *classpath, const char *e
     pthread_mutex_lock(&g_lock);
     if (g_vm) { pthread_mutex_unlock(&g_lock); return 0; }
     if (log_path && !g_log) g_log = fopen(log_path, "a");
+    setenv("JAVA_HOME", java_home, 1);   // iOS port's AWT font fallback looks in $JAVA_HOME/lib/fonts
     struct boot_args a = { java_home, classpath, extra_opts, err, errlen, -1 };
     if (err && errlen) err[0] = 0;
     if (run_big(boot_thread, &a) != 0) { snprintf(err, errlen, "pthread_create failed"); a.rc = -1; }

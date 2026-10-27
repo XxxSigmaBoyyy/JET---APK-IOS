@@ -105,7 +105,7 @@ mv src/java.desktop/macosx_NOTIOS/native/libjsound src/java.desktop/macosx/nativ
 # JET local patches (if any)
 for p in "$ROOT"/scripts/jre/patches/*.diff; do [ -f "$p" ] && { log "apply $(basename "$p")"; git apply --whitespace=nowarn "$p"; }; done
 
-FLAGS="-DJET_IOS=1 -DHEADLESS=1 -I$INC -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-function-pointer-types -DTARGET_OS_OSX -DLE_STANDALONE -O2"
+FLAGS="-DJET_IOS=1 -DHEADLESS=1 -I$INC -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-function-pointer-types -DLE_STANDALONE -O2"
 export BUILD_SYSROOT_CFLAGS="-isysroot $MACSYSROOT"
 export HOTSPOT_DISABLE_DTRACE_PROBES=1
 log "configure ($SDK, zero)"
@@ -115,7 +115,7 @@ bash ./configure \
   --with-boot-jdk="$BOOT_JDK" --with-build-jdk="$BOOT_JDK" \
   --with-jvm-variants=zero --with-jvm-features=-dtrace \
   --with-libffi-include="$W/ffi/include" --with-libffi-lib="$W/ffi/lib" \
-  --enable-headless-only=yes --with-freetype=bundled \
+  --enable-headless-only=yes --with-freetype=bundled --with-zlib=system \
   --with-cups-include="$W/cups-$CUPS_VER" --with-fontconfig-include="$INC" \
   --x-includes="$XINC" --x-libraries=/usr/lib \
   --with-extra-cflags="$FLAGS" --with-extra-cxxflags="$FLAGS" --with-extra-ldflags="" \
