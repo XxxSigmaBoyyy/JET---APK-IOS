@@ -17,6 +17,22 @@
 
 int32_t jet_jvm_compiled(void) { return JET_HAVE_JNI; }
 
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#include <sys/time.h>
+#include <unistd.h>
+double jet_process_age_ms(void) {
+    struct kinfo_proc kp; size_t len = sizeof kp;
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+    if (sysctl(mib, 4, &kp, &len, NULL, 0) != 0 || len == 0) return -1;
+    struct timeval now; gettimeofday(&now, NULL);
+    struct timeval st = kp.kp_proc.p_starttime;
+    return (double)(now.tv_sec - st.tv_sec) * 1e3 + (double)(now.tv_usec - st.tv_usec) / 1e3;
+}
+#else
+double jet_process_age_ms(void) { return -1; }
+#endif
+
 static double g_boot_ms = -1;
 double jet_jvm_boot_ms(void) { return g_boot_ms; }
 
@@ -164,7 +180,65 @@ int32_t jet_jvm_call_string(const char *cls, const char *method, const char *arg
     return a.rc;
 }
 
+// ---- frame / touch (persistent daemon attachment of the caller thread) ----
+static jclass g_host; static jfieldID g_fb, g_fbw, g_fbh, g_seq; static jmethodID g_touch;
+
+static JNIEnv *attached_env(void) {
+    if (!g_vm) return NULL;
+    JNIEnv *env = NULL;
+    if ((*g_vm)->GetEnv(g_vm, (void **)&env, JNI_VERSION_10) == JNI_OK) return env;
+    if ((*g_vm)->AttachCurrentThreadAsDaemon(g_vm, (void **)&env, NULL) != JNI_OK) return NULL;
+    return env;
+}
+static int host_ids(JNIEnv *env) {
+    if (g_host) return 0;
+    jclass c = (*env)->FindClass(env, "jet/ios/JetIosHost");   // app class loader: system loader (jvm-app jars)
+    if (!c) { (*env)->ExceptionClear(env); return -2; }
+    g_fb = (*env)->GetStaticFieldID(env, c, "fb", "[I");
+    g_fbw = (*env)->GetStaticFieldID(env, c, "fbW", "I");
+    g_fbh = (*env)->GetStaticFieldID(env, c, "fbH", "I");
+    g_seq = (*env)->GetStaticFieldID(env, c, "fbSeq", "I");
+    g_touch = (*env)->GetStaticMethodID(env, c, "touch", "(Ljava/lang/String;)Ljava/lang/String;");
+    if ((*env)->ExceptionCheck(env) || !g_fb || !g_fbw || !g_fbh || !g_seq || !g_touch) { (*env)->ExceptionClear(env); return -3; }
+    g_host = (jclass)(*env)->NewGlobalRef(env, c);
+    return 0;
+}
+
+int32_t jet_jvm_frame(uint32_t *dst, int32_t cap, int32_t *w, int32_t *h, int32_t *seq) {
+    JNIEnv *env = attached_env();
+    if (!env) return -1;
+    if (host_ids(env)) return -2;
+    jint s = (*env)->GetStaticIntField(env, g_host, g_seq);
+    if (s == *seq) return 0;
+    jintArray a = (jintArray)(*env)->GetStaticObjectField(env, g_host, g_fb);
+    if (!a) return -4;
+    jint fw = (*env)->GetStaticIntField(env, g_host, g_fbw), fh = (*env)->GetStaticIntField(env, g_host, g_fbh);
+    jsize n = (*env)->GetArrayLength(env, a);
+    if (fw <= 0 || fh <= 0 || (jlong)fw * fh > n) { (*env)->DeleteLocalRef(env, a); return -5; }
+    if ((jlong)fw * fh > cap) { (*env)->DeleteLocalRef(env, a); *w = fw; *h = fh; return -7; }   // caller grows dst
+    (*env)->GetIntArrayRegion(env, a, 0, fw * fh, (jint *)dst);
+    (*env)->DeleteLocalRef(env, a);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return -6; }
+    *w = fw; *h = fh; *seq = s;
+    return 1;
+}
+
+int32_t jet_jvm_touch(int32_t action, float x, float y) {
+    JNIEnv *env = attached_env();
+    if (!env) return -1;
+    if (host_ids(env)) return -2;
+    char buf[96]; snprintf(buf, sizeof buf, "%d\n%.1f\n%.1f", (int)action, x, y);
+    jstring in = (*env)->NewStringUTF(env, buf);
+    jobject r = (*env)->CallStaticObjectMethod(env, g_host, g_touch, in);
+    (*env)->DeleteLocalRef(env, in);
+    if (r) (*env)->DeleteLocalRef(env, r);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return -3; }
+    return 0;
+}
+
 #else  // no jni.h at build time
+int32_t jet_jvm_frame(uint32_t *d, int32_t c, int32_t *w, int32_t *h, int32_t *s) { (void)d; (void)c; (void)w; (void)h; (void)s; return -10; }
+int32_t jet_jvm_touch(int32_t a, float x, float y) { (void)a; (void)x; (void)y; return -10; }
 void *jet_jvm_vm(void) { return NULL; }
 int32_t jet_jvm_boot(const char *h, const char *cp, const char *x, const char *l, char *err, int32_t errlen) {
     (void)h; (void)cp; (void)x; (void)l;

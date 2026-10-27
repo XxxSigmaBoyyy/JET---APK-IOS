@@ -8,6 +8,9 @@ import UIKit
 ///   -JETSmokeTaps "1,2,0,~TC"    labels to tap in order; "~label" = long press (700 ms)
 ///
 ///   -JETSmokeJVM hello           boot the embedded no-JIT JVM and run dev.jet.Hello (M2 step 1); no APK needed
+///   -JETSmokeJVM apk             stock APK on the JVM: boot, import -JETSmokeAPK at run time (DEX translated per class,
+///                                no built-in module), launch, draw the shim frame in JvmAppSurface, capture it;
+///   -JETSmokeTapPx "x,y"         optional tap in frame pixels, sent through the surface's touch queue, captured after
 ///
 /// Writes Documents/jet-smoke/{NN_<label>.png, log.txt, result.txt}. Inactive without -JETSmokeAPK / -JETSmokeJVM.
 @MainActor
@@ -17,6 +20,7 @@ final class SmokeTest {
     let apk: URL?
     let taps: [String]
     let jvmMode: String?
+    let tapPx: CGPoint?
     let outDir: URL
     private var started = false
     private var attached = false
@@ -30,6 +34,8 @@ final class SmokeTest {
             apk = nil
         }
         jvmMode = args.string(forKey: "JETSmokeJVM").flatMap { $0.isEmpty ? nil : $0 }
+        let tp = (args.string(forKey: "JETSmokeTapPx") ?? "").split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+        tapPx = tp.count == 2 ? CGPoint(x: tp[0], y: tp[1]) : nil
         taps = (args.string(forKey: "JETSmokeTaps") ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         outDir = docs.appendingPathComponent("jet-smoke", isDirectory: true)
@@ -39,8 +45,9 @@ final class SmokeTest {
     var isJVMActive: Bool { jvmMode != nil }
 
     /// JVM smoke: boot the bundled JRE, run dev.jet.Hello, show the output full screen and capture it.
-    func runJVM(show: @escaping (String, String) -> Void) async {
+    func runJVM(show: @escaping (String, String) -> Void, present: @escaping (JvmAppSurface) -> Void) async {
         guard let mode = jvmMode, !started else { return }
+        if mode == "apk" { await runJVMApp(show: show, present: present); return }
         started = true
         try? FileManager.default.removeItem(at: outDir)
         try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
@@ -70,6 +77,78 @@ final class SmokeTest {
         try? await Task.sleep(nanoseconds: 1_200_000_000)
         captureKeyWindow("00_jvm_hello")
         finish(r.ok && r.out.contains("Hello from Java") ? "PASS" : "FAIL \(r.out.prefix(200))")
+    }
+
+
+    /// Stock APK on the JVM (see -JETSmokeJVM apk). Timings are cold: fresh process, empty dex cache, empty app dir.
+    private func runJVMApp(show: @escaping (String, String) -> Void, present: @escaping (JvmAppSurface) -> Void) async {
+        guard let apk, !started else { finish("FAIL -JETSmokeJVM apk needs -JETSmokeAPK"); return }
+        started = true
+        try? FileManager.default.removeItem(at: outDir)
+        try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+        let age0 = jet_process_age_ms()
+        var timing: [String] = [String(format: "process_age_at_smoke_start_ms=%.0f", age0)]
+        let jvmLog = outDir.appendingPathComponent("jvm.log")
+        note("jvm-apk \(apk.lastPathComponent) exists=\(FileManager.default.fileExists(atPath: apk.path)) bundled=\(JetJVM.isBundled) opts=\(JvmApp.options)")
+        let boot = await Task.detached { JvmApp.boot(log: jvmLog) }.value
+        note(String(format: "boot ok=%@ JNI_CreateJavaVM=%.1f ms err=%@", boot.ok ? "yes" : "no", boot.ms, boot.error))
+        timing.append(String(format: "jvm_boot_ms=%.0f", boot.ms))
+        guard boot.ok else {
+            show("JVM boot FAILED", boot.error + "\n\n" + ((try? String(contentsOf: jvmLog)) ?? ""))
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            captureKeyWindow("00_jvm"); finish("FAIL boot: \(boot.error)"); return
+        }
+        var berr = [CChar](repeating: 0, count: 256)
+        note("jni_bridge_init rc=\(jet_jni_bridge_init(&berr, 256)) \(String(cString: berr))")
+
+        let appDir = JvmApp.appsRoot.appendingPathComponent(apk.deletingPathExtension().lastPathComponent, isDirectory: true)
+        try? FileManager.default.removeItem(at: appDir)
+        let ti = ProcessInfo.processInfo.systemUptime
+        let imp = await Task.detached { JvmApp.importAPK(apk, into: appDir) }.value
+        timing.append(String(format: "import_ms=%.0f", (ProcessInfo.processInfo.systemUptime - ti) * 1000))
+        for line in imp.out.split(separator: "\n") { note("import> \(line)") }
+        guard imp.ok else {
+            show("Import FAILED", imp.out); try? await Task.sleep(nanoseconds: 1_000_000_000)
+            captureKeyWindow("00_import"); finish("FAIL import: \(imp.out.prefix(300))"); return
+        }
+
+        let surface = JvmAppSurface(frame: UIScreen.main.bounds)
+        var firstShown: Double = -1
+        surface.onFrame = { [weak self] s in
+            if firstShown < 0 { firstShown = jet_process_age_ms(); self?.note(String(format: "first frame on screen seq=%d process_age=%.0f ms", s, firstShown)) }
+        }
+        present(surface)
+        let w = 750, h = 1334   // fixed frame for reproducible tap coordinates; the surface letterboxes (aspect fit)
+        let tl = ProcessInfo.processInfo.systemUptime
+        let run = await Task.detached { JvmApp.launch(appDir, width: w, height: h) }.value
+        let launchMs = (ProcessInfo.processInfo.systemUptime - tl) * 1000
+        for line in run.out.split(separator: "\n") { note("launch> \(line)") }
+        try? run.out.write(to: outDir.appendingPathComponent("launch_report.txt"), atomically: true, encoding: .utf8)
+        timing.append(String(format: "launch_call_ms=%.0f", launchMs))
+        if let f = JvmApp.value("first_frame_ms", in: run.out) { timing.append("host_first_frame_ms=\(f.split(separator: " ").first ?? "")") }
+        for _ in 0..<100 where firstShown < 0 { try? await Task.sleep(nanoseconds: 50_000_000) }
+        timing.append(String(format: "cold_start_process_to_first_frame_on_screen_ms=%.0f", firstShown))
+        try? (timing.joined(separator: "\n") + "\n").write(to: outDir.appendingPathComponent("timing.txt"), atomically: true, encoding: .utf8)
+        note("timing \(timing.joined(separator: " "))")
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        captureKeyWindow("00_first_frame")
+        let fbShot = outDir.appendingPathComponent("00_first_frame_fb.png")
+        let fbRes = await Task.detached { JvmApp.screenshot(fbShot) }.value
+        note("fb screenshot: \(fbRes)")
+        guard run.ok, firstShown >= 0 else { finish("FAIL launch: \(JvmApp.value("error", in: run.out) ?? JvmApp.value("state", in: run.out) ?? run.out.prefix(200).description) shown=\(firstShown >= 0)"); return }
+
+        if let p = tapPx {
+            let before = surface.seq
+            surface.tap(framePixel: p)
+            for _ in 0..<100 where surface.seq == before { try? await Task.sleep(nanoseconds: 50_000_000) }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            note("tap px \(Int(p.x)),\(Int(p.y)) seq \(before) -> \(surface.seq)")
+            captureKeyWindow("01_tap")
+            let tapShot = outDir.appendingPathComponent("01_tap_fb.png")
+            _ = await Task.detached { JvmApp.screenshot(tapShot) }.value
+            if surface.seq == before { finish("FAIL tap produced no new frame"); return }
+        }
+        finish("PASS first_frame_on_screen_ms=\(Int(firstShown)) launch_call_ms=\(Int(launchMs))")
     }
 
     private func captureKeyWindow(_ name: String) {

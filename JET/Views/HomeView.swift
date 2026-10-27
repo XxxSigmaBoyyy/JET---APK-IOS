@@ -13,6 +13,7 @@ struct HomeView: View {
     @State private var renameText = ""
     @State private var pickerError: String?
     @State private var console: ConsoleText?
+    @State private var jvmApp: JvmAppPresentation?
 
     private let columns = [GridItem(.adaptive(minimum: 86, maximum: 110), spacing: 18, alignment: .top)]
 
@@ -65,6 +66,7 @@ struct HomeView: View {
             AppHostScreen(shortcut: s, icon: store.icon(for: s), bundle: store.bundleURL(for: s.id))
         }
         .fullScreenCover(item: $console) { c in JVMConsoleView(title: c.title, text: c.text) }
+        .fullScreenCover(item: $jvmApp) { a in JvmAppScreen(surface: a.surface).ignoresSafeArea() }
         .alert("Rename", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
             TextField("Name", text: $renameText)
             Button("Save") { if let r = renaming { store.rename(r.id, to: renameText) }; renaming = nil }
@@ -78,7 +80,8 @@ struct HomeView: View {
         .onOpenURL { url in handle(url) }
         .task {
             if SmokeTest.shared.isJVMActive {
-                await SmokeTest.shared.runJVM { console = ConsoleText(title: $0, text: $1) }
+                await SmokeTest.shared.runJVM(show: { console = ConsoleText(title: $0, text: $1) },
+                                              present: { jvmApp = JvmAppPresentation(surface: $0) })
             } else if SmokeTest.shared.isActive {
                 await SmokeTest.shared.start(store: store, importer: importer) { launching = $0 }
             }

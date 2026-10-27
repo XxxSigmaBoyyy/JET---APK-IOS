@@ -160,7 +160,7 @@ jobs:
     name: Simulator smoke (import -> first screen -> taps; JVM hello)
     needs: [guard, jre]
     runs-on: macos-latest
-    timeout-minutes: 40
+    timeout-minutes: 120
     env:
       DERIVED: build/DerivedSim
       BUNDLE_ID: dev.jet.app
@@ -240,6 +240,37 @@ jobs:
           RESULT=$(cat build/smoke-jvm/result.txt 2>/dev/null || echo "FAIL no result (timeout)")
           echo "jvm smoke: $RESULT"
           case "$RESULT" in PASS*) ;; *) echo "::error::JVM smoke failed: $RESULT"; exit 1 ;; esac
+      - name: Stock APKs imported at run time on the JVM (Heading Calculator + 2 F-Droid apps)
+        if: always()
+        run: |
+          mkdir -p build/smoke-apk; FAIL=0
+          while read -r NAME URL SHA TAP <&3; do
+            case "$NAME" in ''|'#'*) continue ;; esac
+            curl -fsSL --retry 3 -o "build/$NAME.apk" "$URL"
+            echo "$SHA  build/$NAME.apk" | shasum -a 256 -c - || { FAIL=1; continue; }
+            xcrun simctl terminate "$UDID" "$BUNDLE_ID" || true
+            DATA=$(xcrun simctl get_app_container "$UDID" "$BUNDLE_ID" data)
+            OUT="$DATA/Documents/jet-smoke"; rm -rf "$OUT" "$DATA/Library/jet-apps"
+            mkdir -p "$DATA/Documents"; cp "build/$NAME.apk" "$DATA/Documents/$NAME.apk"
+            ARGS=(-JETSmokeJVM apk -JETSmokeAPK "Documents/$NAME.apk"); [ "$TAP" != "-" ] && ARGS+=(-JETSmokeTapPx "$TAP")
+            T0=$(python3 -c 'import time;print(time.time())')
+            xcrun simctl launch "$UDID" "$BUNDLE_ID" "${ARGS[@]}"
+            for i in $(seq 1 900); do [ -f "$OUT/result.txt" ] && break; sleep 1; done
+            T1=$(python3 -c 'import time;print(time.time())')
+            D=build/smoke-apk/$NAME; mkdir -p "$D"
+            xcrun simctl io "$UDID" screenshot "$D/simulator_screen.png" || true
+            cp -R "$OUT/." "$D/" 2>/dev/null || true
+            python3 -c "print('simctl_launch_to_result_wall_s=%.1f' % ($T1-$T0))" | tee -a "$D/timing.txt"
+            echo "---- $NAME log"; cat "$D/log.txt" || true
+            echo "---- $NAME jvm.log (tail)"; tail -n 60 "$D/jvm.log" || true
+            RESULT=$(cat "$D/result.txt" 2>/dev/null || echo "FAIL no result (timeout)")
+            echo "$NAME: $RESULT" | tee -a build/smoke-apk/summary.txt
+            case "$RESULT" in PASS*) ;; *) echo "::error::$NAME on the JVM failed: $RESULT"; FAIL=1 ;; esac
+          done 3< scripts/smoke_apks.txt
+          python3 -m pip install --quiet pillow 2>/dev/null || python3 -m pip install --quiet --break-system-packages pillow || true
+          python3 scripts/smoke_collage.py build/smoke-apk build/smoke-apk/collage.png || true
+          cat build/smoke-apk/summary.txt
+          exit $FAIL
       - name: Simulator log excerpt
         if: failure()
         run: xcrun simctl spawn "$UDID" log show --last 5m --style compact --predicate 'process == "JET"' | tail -n 200 || true
@@ -251,5 +282,6 @@ jobs:
           path: |
             build/smoke
             build/smoke-jvm
+            build/smoke-apk
             build/xcodebuild-sim.log
           if-no-files-found: ignore

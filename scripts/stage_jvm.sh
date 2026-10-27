@@ -10,6 +10,17 @@ tar -C "$V/jre-$SDK" -xJf "$TAR"
 cp "$JAVA_HOME/include/jni.h" "$JAVA_HOME/include/darwin/jni_md.h" "$V/jni/"
 
 ASM="$ROOT/tools/asm/asm-9.7.jar:$ROOT/tools/asm/asm-tree-9.7.jar"
+# dex2jar v2.4 (Apache-2.0) runtime pieces for the per-class DEX->JVM loader (jet.dex.DexClassLoader); never committed.
+D2J_SHA=ee7c45eb3c1d2474a6145d8d447e651a736a22d9664b6d3d3be5a5a817dda23a
+D2J_JARS="dex-reader-v2.4.jar dex-reader-api-v2.4.jar dex-ir-v2.4.jar dex-translator-v2.4.jar asm-commons-9.5.jar asm-analysis-9.5.jar"
+D2JZ="$ROOT/Vendor/dex-tools-v2.4.zip"; mkdir -p "$ROOT/Vendor/d2j"
+if [[ ! -f "$D2JZ" ]]; then
+  if [[ -f /workspace/jet/proto/tools/dex2jar.zip ]]; then cp /workspace/jet/proto/tools/dex2jar.zip "$D2JZ"
+  else echo "fetching dex-tools-v2.4..."; curl -fsSL -o "$D2JZ" "https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip"; fi
+fi
+echo "$D2J_SHA  $D2JZ" | shasum -a 256 -c - >/dev/null || { echo "dex-tools-v2.4.zip sha256 mismatch"; exit 1; }
+for j in $D2J_JARS; do unzip -qjo "$D2JZ" "dex-tools-v2.4/lib/$j" -d "$ROOT/Vendor/d2j"; done
+D2J=""; for j in $D2J_JARS; do D2J="$D2J:$ROOT/Vendor/d2j/$j"; done; D2J=${D2J#:}
 W=$(mktemp -d)
 # 1) nativeapi (+ ASM for JetAppClassLoader) and hello
 mkdir -p "$W/api"
@@ -61,7 +72,7 @@ if [[ -d "$SHIM_SRC" ]]; then
     curl -fsSL -o "$ROOT/Vendor/sqlite-jdbc.jar"       "https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/3.45.3.0/sqlite-jdbc-3.45.3.0.jar"
     SQLITE="$ROOT/Vendor/sqlite-jdbc.jar"
   fi
-  CP="$ASM"
+  CP="$ASM:$D2J"
   [[ -n "$AJAR" ]] && CP="$AJAR:$CP"
   [[ -n "$SQLITE" ]] && CP="$SQLITE:$CP"
   set +e
@@ -70,9 +81,21 @@ if [[ -d "$SHIM_SRC" ]]; then
   RC=$?
   set -e
   if [[ $RC -eq 0 ]]; then
+    # non-Java resources of the shim (e.g. jet/apk/fwattrs.properties) go into the jar next to the classes
+    (cd "$SHIM_SRC" && find . -type f ! -name '*.java' -exec sh -c 'mkdir -p "$0/$(dirname "$1")" && cp "$1" "$0/$1"' "$W/shim" {} \;)
     "$JAVA_HOME/bin/jar" cf "$V/jvm-app/jetshim.jar" -C "$W/shim" .
+    for j in $D2J_JARS; do cp "$ROOT/Vendor/d2j/$j" "$V/jvm-app/"; done
     [[ -n "$SQLITE" ]] && cp "$SQLITE" "$V/jvm-app/"
     echo "shim: OK ($(find "$W/shim" -name '*.class' | wc -l) classes)"
+    # Runtime data for stock-APK import (jvm-app/data, not on the classpath):
+    #  - android-model.jar: android.jar with code stripped, source for SDK stubs of framework classes the shim lacks
+    #  - fw/: framework-res (values/colors/drawables) converted from android.jar, linked into every imported bundle
+    if [[ -n "$AJAR" ]]; then
+      mkdir -p "$V/jvm-app/data"
+      "$JAVA_HOME/bin/java" -cp "$W/shim:$CP" jet.dex.SdkStubs "$AJAR" "$V/jvm-app/data/android-model.jar"
+      "$JAVA_HOME/bin/java" -Djava.awt.headless=true -Djet.fw.sdk=28 -cp "$W/shim:$CP" jet.apk.ApkBundler --framework "$AJAR" "$V/jvm-app/data/fw"
+      echo "data: model $(du -sh "$V/jvm-app/data/android-model.jar" | cut -f1), fw $(du -sh "$V/jvm-app/data/fw" | cut -f1)"
+    fi
   else
     echo "shim: javac failed (non-fatal for hello smoke); see Vendor leftover log"
     mkdir -p "$V/jvm-app"

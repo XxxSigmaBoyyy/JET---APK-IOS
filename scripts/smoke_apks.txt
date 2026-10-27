@@ -1,0 +1,5 @@
+# Stock F-Droid APKs imported at run time by the simulator smoke (-JETSmokeJVM apk). Fetched in CI, sha256-checked,
+# never committed. Columns: name  url  sha256  tap-in-frame-pixels(750x1334 frame, "-" = none)
+heading   https://f-droid.org/repo/org.debian.eugen.headingcalculator_4.apk     dbcfc1903051b66e7f6d3bd65a49d79527d2c143dfd870e9384bb2c9c1b8b383  91,423
+eggtimer  https://f-droid.org/repo/org.woheller69.eggtimer_32.apk               846f8bf2edffcd999bdc8f7312dd62c19139c6c207cdd1356d6713d2e45d05c8  -
+pf2048    https://f-droid.org/repo/org.secuso.privacyfriendly2048_100.apk       02c799d3d582669daf2acf920093c68d2933f60aa937bb72fa2a805557233fe8  644,1286
