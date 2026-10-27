@@ -39,7 +39,7 @@ public final class JetIosHost {
     public static String importApk(String arg) {
         String[] a = arg.split("\n");
         try {
-            File apk = new File(a[0]), dir = new File(a[1]); File fw = a.length > 2 && !a[2].isEmpty() ? new File(a[2]) : null;
+            File apk = new File(a[0]).getAbsoluteFile(), dir = new File(a[1]).getAbsoluteFile(); File fw = a.length > 2 && !a[2].isEmpty() ? new File(a[2]) : null;
             long t0 = System.nanoTime();
             dir.mkdirs();
             File base = new File(dir, "base.apk");
@@ -104,7 +104,7 @@ public final class JetIosHost {
     /** launch("appDir\nwidth\nheight\ntimeoutMs") -> report text (first_frame_ms= ...) after the first frame or a failure. */
     public static String launch(String arg) {
         String[] a = arg.split("\n");
-        final File dir = new File(a[0]);
+        final File dir = new File(a[0]).getAbsoluteFile();
         int w = a.length > 1 ? Integer.parseInt(a[1].trim()) : 750, h = a.length > 2 ? Integer.parseInt(a[2].trim()) : 1334;
         long timeout = a.length > 3 ? Long.parseLong(a[3].trim()) : 600_000;
         if (ui != null) return "error already launched";

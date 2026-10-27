@@ -166,6 +166,11 @@ static int guest_jni_call(JNIEnv *env, jlong fn, jobject recv, jstring jdesc, jl
     jet_args a; memset(&a, 0, sizeof a);
     uint64_t stack[64]; uint32_t ns = 0;
     int nx = 0, nd = 0, pi = 0, fi = 0, ri = 0;
+    /* The partner's guest JNIEnv (Runtime/native/jni_bridge.c) treats a jstring as a plain char* (UTF-8, guest==host
+     * addresses) and does not forward to the real JNIEnv. Passing a HotSpot local ref made GetStringUTFChars hand
+     * the guest the handle's bytes as a "path" (Telegram opendb -> relative garbage -> getcwd -> CANTOPEN). Until the
+     * guest env forwards, marshal String args as owned UTF-8 copies freed after the call. */
+    char *owned[16]; int nowned = 0;
     a.x[nx++] = jet_jni_guest_env(g_ctx);
     a.x[nx++] = (uint64_t)(uintptr_t)recv;
     const char *d = strchr(desc, '(');
@@ -175,6 +180,12 @@ static int guest_jni_call(JNIEnv *env, jlong fn, jobject recv, jstring jdesc, jl
         else if (*d == 'L' || *d == '[') {
             jobject o = (*env)->GetObjectArrayElement(env, jr, ri++);   /* local ref, alive until we return to Java */
             v = (uint64_t)(uintptr_t)o;
+            if (o && *d == 'L' && strncmp(d, "Ljava/lang/String;", 18) == 0 && nowned < 16) {
+                const char *u = (*env)->GetStringUTFChars(env, (jstring)o, NULL);
+                char *c = u ? strdup(u) : NULL;
+                if (u) (*env)->ReleaseStringUTFChars(env, (jstring)o, u);
+                if (c) { owned[nowned++] = c; v = (uint64_t)(uintptr_t)c; }
+            }
             while (*d == '[') d++;
             if (*d == 'L') { const char *e = strchr(d, ';'); d = e ? e + 1 : d + strlen(d); } else d++;
         } else { v = (uint64_t)(pi < np ? p[pi] : 0); pi++; d++; }
@@ -191,6 +202,7 @@ static int guest_jni_call(JNIEnv *env, jlong fn, jobject recv, jstring jdesc, jl
     uint64_t x0 = 0; double d0 = 0;
     int rc = jet_native_call_ex(g_ctx, (uint64_t)fn, &a, ns, &x0, &d0);
     pthread_mutex_unlock(&g_call_mu);
+    while (nowned) free(owned[--nowned]);
     *rx = x0; memcpy(rdbits, &d0, 8);
     return rc;
 }

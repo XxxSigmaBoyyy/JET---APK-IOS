@@ -105,10 +105,11 @@ typedef enum {
     OP_DMB, OP_DSB, OP_ISB, OP_CLREX,
     /* FP / ASIMD (scalar + common vector) */
     OP_FMOV_I, OP_FMOV_G, OP_FMOV_F,
-    OP_FADD, OP_FSUB, OP_FMUL, OP_FDIV, OP_FABS, OP_FNEG, OP_FSQRT,
+    OP_FADD, OP_FSUB, OP_FMUL, OP_FDIV, OP_FABS, OP_FNEG, OP_FSQRT, OP_FRINT,
     OP_FCMP, OP_FCCMP, OP_FCSEL,
     OP_FCVT, OP_FCVTZS, OP_FCVTZU, OP_SCVTF, OP_UCVTF,
     OP_FMADD, OP_FMSUB, OP_FNMADD, OP_FNMSUB,
+    OP_FNMUL,
     OP_FMIN, OP_FMAX, OP_FMINNM, OP_FMAXNM,
     OP_LDR_FP, OP_STR_FP, OP_LDP_FP, OP_STP_FP,
     /* ASIMD memory & simple ALU used by memcpy/strlen */
@@ -124,6 +125,17 @@ typedef enum {
     OP_MOVI_V, OP_MVNI_V, OP_FMOV_V,
     OP_ADDP_V, OP_ADDV, OP_UADDLV,
     OP_BIC_IMM_V, OP_ORR_IMM_V,
+    /* ASIMD encoding-group catch-alls (opc/N carry opcode & U). */
+    OP_ASIMD_3SAME,   /* opc=opcode[15:10], N=U, size, Q=regsize */
+    OP_ASIMD_3DIFF,   /* opc=opcode[15:12], N=U */
+    OP_ASIMD_2MISC,   /* opc=opcode[16:12], N=U  (incl. narrow/long/xtn/cnt/…) */
+    OP_ASIMD_ACROSS,  /* opc=opcode[16:12], N=U */
+    OP_ASIMD_SHIFT,   /* opc=opcode[15:11], N=U, imm=immh:immb */
+    OP_ASIMD_BYELEM,  /* opc=opcode[15:12], N=U, imm=H:L:M index bits */
+    OP_ASIMD_PAIRWISE,
+    OP_UDOT, OP_SDOT, OP_USDOT, OP_CRC32,/* vector pairwise (addp/smaxp/…); opc like 3same */
+    OP_LD1R,          /* LD1R..LD4R; opc=nregs-1, size, Q */
+    OP_LD1_LANE, OP_ST1_LANE, /* single-structure lane; opc=nregs-1 */
     OP_LAST
 } jet_op;
 
@@ -307,6 +319,7 @@ int jet_interp_run(jet_ctx *ctx, jet_cpu *cpu);
 
 /* Decode one instruction. Returns 0 on success, -1 on undef. */
 int jet_decode(uint32_t raw, jet_insn *out);
+int jet_asimd_exec(jet_cpu *c, jet_ctx *ctx, const jet_insn *i);
 
 /* Block cache lookup / build. */
 jet_block *jet_block_get(jet_ctx *ctx, uint64_t pc);

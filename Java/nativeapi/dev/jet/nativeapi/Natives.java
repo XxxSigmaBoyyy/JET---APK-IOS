@@ -79,7 +79,7 @@ public final class Natives {
         Long fn = FN.get(key);
         if (fn == null) { fn = lookup(cls, name, desc); FN.put(key, fn); }
         if (SEEN.putIfAbsent(key, Boolean.TRUE) == null)
-            System.err.println("[jet.natives] first call " + key + " -> " + (fn == 0 ? "UNBOUND" : "guest 0x" + Long.toHexString(fn)));
+            System.err.println("[jet.natives] first call " + key + " -> " + (fn == 0 ? "UNBOUND" : "guest 0x" + Long.toHexString(fn)) + strArgs(args));
         if (fn == 0) throw new UnsatisfiedLinkError("'" + key + "' (no guest JNI function registered or exported)");
         int n = args.length, pi = 0, fi = 0, ri = 0;
         long[] prims = new long[n]; long[] fbits = new long[n]; Object[] refs = new Object[n];
@@ -148,5 +148,15 @@ public final class Natives {
 
     public static String javaSym(String classBinaryName, String method) {
         return "Java_" + classBinaryName.replace('.', '_').replace('/', '_') + "_" + method;
+    }
+
+    /** String arguments of a first call (paths, keys), for diagnostics. */
+    static String strArgs(Object[] args) {
+        StringBuilder b = new StringBuilder();
+        for (Object o : args) if (o instanceof String) {
+            String v = (String) o;
+            b.append(b.length() == 0 ? " args=[" : ", ").append('"').append(v.length() > 160 ? v.substring(0, 160) + "..." : v).append('"');
+        }
+        return b.length() == 0 ? "" : b.append(']').toString();
     }
 }

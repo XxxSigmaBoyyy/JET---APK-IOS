@@ -222,6 +222,24 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
     uint64_t pc = c->pc;
 
     switch (i->op) {
+
+    case OP_CRC32: {
+        /* Poly: CRC32 = 0x04C11DB7 (reflected 0xEDB88320), CRC32C = 0x1EDC6F41 (reflected 0x82F63B78) */
+        static const uint32_t poly_crc = 0xEDB88320u, poly_c = 0x82F63B78u;
+        uint32_t poly = i->N ? poly_c : poly_crc;
+        uint32_t crc = (uint32_t)jet_x(c, i->rn);
+        uint64_t data = jet_x(c, i->rm);
+        int nbytes = 1 << i->size; /* 1,2,4,8 */
+        if (i->size == 3 && !i->sf) nbytes = 4; /* W form */
+        for (int b = 0; b < nbytes; b++) {
+            crc ^= (uint32_t)((data >> (8*b)) & 0xff);
+            for (int k = 0; k < 8; k++)
+                crc = (crc >> 1) ^ (poly & (uint32_t)-(int32_t)(crc & 1u));
+        }
+        jet_set_x(c, i->rd, crc);
+        return 0;
+    }
+
     case OP_NOP: case OP_HINT: case OP_PRFM_LIT:
         return 0;
 
@@ -979,14 +997,14 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
         if (!i->regsize) c->v[i->rd][1] = 0;
         return 0;
     }
-    case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV:
+    case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FNMUL: case OP_FDIV:
     case OP_FMAX: case OP_FMIN: case OP_FMAXNM: case OP_FMINNM: {
         if (i->size == 0) {
             float a, b, r;
             memcpy(&a, &c->v[i->rn][0], 4); memcpy(&b, &c->v[i->rm][0], 4);
             switch (i->op) {
             case OP_FADD: r=a+b; break; case OP_FSUB: r=a-b; break;
-            case OP_FMUL: r=a*b; break; case OP_FDIV: r=a/b; break;
+            case OP_FMUL: r=a*b; break; case OP_FNMUL: r=-(a*b); break; case OP_FDIV: r=a/b; break;
             case OP_FMAX: case OP_FMAXNM: r=fmaxf(a,b); break;
             default: r=fminf(a,b); break;
             }
@@ -997,7 +1015,7 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
             memcpy(&a, &c->v[i->rn][0], 8); memcpy(&b, &c->v[i->rm][0], 8);
             switch (i->op) {
             case OP_FADD: r=a+b; break; case OP_FSUB: r=a-b; break;
-            case OP_FMUL: r=a*b; break; case OP_FDIV: r=a/b; break;
+            case OP_FMUL: r=a*b; break; case OP_FNMUL: r=-(a*b); break; case OP_FDIV: r=a/b; break;
             case OP_FMAX: case OP_FMAXNM: r=fmax(a,b); break;
             default: r=fmin(a,b); break;
             }
@@ -1018,6 +1036,33 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
         }
         return 0;
     }
+    case OP_FRINT: {
+        if (i->size == 0) {
+            float a; uint32_t u=(uint32_t)c->v[i->rn][0]; memcpy(&a,&u,4); float r=a;
+            switch (i->opc) {
+            case 8: r=roundf(a); break; /* nearest ties even approx roundf */
+            case 9: r=ceilf(a); break;
+            case 10: r=floorf(a); break;
+            case 11: r=truncf(a); break;
+            case 12: r=roundf(a); break;
+            case 14: case 15: r=nearbyintf(a); break;
+            }
+            memcpy(&u,&r,4); c->v[i->rd][0]=u; c->v[i->rd][1]=0;
+        } else {
+            double a; memcpy(&a,&c->v[i->rn][0],8); double r=a;
+            switch (i->opc) {
+            case 8: r=round(a); break;
+            case 9: r=ceil(a); break;
+            case 10: r=floor(a); break;
+            case 11: r=trunc(a); break;
+            case 12: r=round(a); break;
+            case 14: case 15: r=nearbyint(a); break;
+            }
+            memcpy(&c->v[i->rd][0],&r,8); c->v[i->rd][1]=0;
+        }
+        return 0;
+    }
+
     case OP_FCMP: {
         int with_zero = (i->opc == 16 || i->opc == 24);
         if (i->size == 0) {
@@ -1036,6 +1081,44 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
             else set_nzcv(c, 0,1,1,0);
         }
         return 0;
+
+    case OP_FCCMP: {
+        /* if cond then FCMP Rn,Rm else NZCV = uimm */
+        int ok = 0;
+        unsigned nz = c->nzcv;
+        unsigned n=(nz>>31)&1, z=(nz>>30)&1, cflg=(nz>>29)&1, v=(nz>>28)&1;
+        switch (i->cond) {
+        case 0x0: ok = (z==1); break; case 0x1: ok = (z==0); break;
+        case 0x2: ok = (cflg==1); break; case 0x3: ok = (cflg==0); break;
+        case 0x4: ok = (n==1); break; case 0x5: ok = (n==0); break;
+        case 0x6: ok = (v==1); break; case 0x7: ok = (v==0); break;
+        case 0x8: ok = (cflg==1 && z==0); break; case 0x9: ok = (!(cflg==1 && z==0)); break;
+        case 0xA: ok = (n==v); break; case 0xB: ok = (n!=v); break;
+        case 0xC: ok = (z==0 && n==v); break; case 0xD: ok = (!(z==0 && n==v)); break;
+        case 0xE: ok = 1; break; case 0xF: ok = 1; break;
+        }
+        if (!ok) {
+            unsigned imm = i->uimm & 15;
+            c->nzcv = ((imm&8)<<28) | ((imm&4)<<29) | ((imm&2)<<28) | ((imm&1)<<28);
+            /* fix packing: N Z C V = imm[3:0] in bits 31:28 */
+            c->nzcv = (imm << 28);
+            return 0;
+        }
+        /* fall through into FCMP body by duplicating briefly */
+        jet_insn t = *i; t.op = OP_FCMP; t.opc = (i->opc & 0x10) ? 8 : 0; /* E bit */
+        /* reuse: compare rn vs rm */
+        if (i->size == 0) {
+            float a, b; uint32_t aa=(uint32_t)(c->v[i->rn][0]), bb=(uint32_t)(c->v[i->rm][0]);
+            memcpy(&a,&aa,4); memcpy(&b,&bb,4);
+            if (a<b) c->nzcv = 0x80000000u; else if (a>b) c->nzcv = 0x20000000u;
+            else if (a==b) c->nzcv = 0x60000000u; else c->nzcv = 0x30000000u;
+        } else {
+            double a, b; memcpy(&a,&c->v[i->rn][0],8); memcpy(&b,&c->v[i->rm][0],8);
+            if (a<b) c->nzcv = 0x80000000u; else if (a>b) c->nzcv = 0x20000000u;
+            else if (a==b) c->nzcv = 0x60000000u; else c->nzcv = 0x30000000u;
+        }
+        return 0;
+    }
     }
     case OP_FCSEL: {
         if (cond_holds(c, i->cond)) {
@@ -1060,12 +1143,17 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
         return 0;
     }
     case OP_FCVTZS: case OP_FCVTZU: {
+        int fbits = 0;
+        if (i->imm > 0) fbits = 64 - (int)i->imm; /* fixed-point scale encoding */
+        if (fbits < 0) fbits = 0;
         if (i->size == 0) {
-            float a; memcpy(&a, &c->v[i->rn][0], 4);
-            uint64_t r = (i->op == OP_FCVTZS) ? (uint64_t)(int64_t)a : (uint64_t)(uint64_t)a;
+            float a; uint32_t u=(uint32_t)c->v[i->rn][0]; memcpy(&a,&u,4);
+            if (fbits) a = a * (float)(1ull << fbits);
+            uint64_t r = (i->op == OP_FCVTZS) ? (uint64_t)(int64_t)a : (uint64_t)(unsigned long long)a;
             jet_set_x(c, i->rd, mask_sf(i->sf, r));
         } else {
             double a; memcpy(&a, &c->v[i->rn][0], 8);
+            if (fbits) a = a * (double)(1ull << fbits);
             uint64_t r = (i->op == OP_FCVTZS) ? (uint64_t)(int64_t)a : (uint64_t)a;
             jet_set_x(c, i->rd, mask_sf(i->sf, r));
         }
@@ -1484,6 +1572,19 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
         c->v[i->rd][1] = i->regsize ? *(uint64_t*)(out+8) : 0;
         return 0;
     }
+
+    case OP_ZIP1: case OP_ZIP2: case OP_UZP1: case OP_UZP2:
+    case OP_TRN1: case OP_TRN2:
+    case OP_ASIMD_3SAME: case OP_ASIMD_3DIFF: case OP_ASIMD_2MISC:
+    case OP_ASIMD_ACROSS: case OP_ASIMD_SHIFT: case OP_ASIMD_BYELEM:
+    case OP_ASIMD_PAIRWISE:
+    case OP_UDOT: case OP_SDOT: case OP_USDOT:
+    case OP_LD1R: case OP_LD1_LANE: case OP_ST1_LANE:
+    case OP_SSHLL: case OP_USHLL: case OP_XTN: case OP_CNT:
+    case OP_ADDV: case OP_UADDLV: case OP_ADDP_V: case OP_MUL_V:
+    case OP_CMEQ: case OP_CMGT: case OP_CMGE: case OP_CMHI: case OP_CMHS: case OP_CMTST:
+    case OP_REV64_V: case OP_REV32_V: case OP_REV16_V:
+        return jet_asimd_exec(c, ctx, i);
 
     default:
         snprintf(c->err_msg, sizeof c->err_msg,

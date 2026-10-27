@@ -16,8 +16,20 @@ enum JetJVM {
     static func boot(classpath: [URL], options: [String] = [], log: URL?) -> (ok: Bool, ms: Double, error: String) {
         var err = [CChar](repeating: 0, count: 1024)
         let rc = jet_jvm_boot(javaHome.path, classpath.map(\.path).joined(separator: ":"),
-                              (fontOptions() + options).joined(separator: "\n"), log?.path, &err, Int32(err.count))
+                              (workDirOptions() + fontOptions() + options).joined(separator: "\n"), log?.path, &err, Int32(err.count))
         return (rc == 0, jet_jvm_boot_ms(), String(cString: err))
+    }
+
+    /// An iOS process starts with cwd "/" (read-only). Guest native code (sqlite's unixFullPathname, getcwd) and
+    /// relative java.io paths need a real writable directory: chdir to Application Support/JET and set user.dir.
+    static func workDirOptions() -> [String] {
+        let fm = FileManager.default
+        guard let support = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        else { return [] }
+        let dir = support.appendingPathComponent("JET", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        guard fm.changeCurrentDirectoryPath(dir.path) else { return [] }
+        return ["-Duser.dir=\(dir.path)"]
     }
 
     /// Java2D text needs a logical-font config. stage_jvm.sh bundles DejaVu in jre/lib/fonts plus

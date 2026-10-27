@@ -12,12 +12,13 @@ public final class JetImageIOCodec {
             return new int[]{ im.getWidth(), im.getHeight() };
         } catch (Throwable t) { return null; }
     }
-    /** returns {int[] argb, Integer w, Integer h} or null */
+    /** returns {int[] argb (sw x sh), Boolean hasAlpha} or null; BitmapFactory.decode reads r[1] as hasAlpha. */
     public static Object[] decode(byte[] data, int sw, int sh) {
         try {
             BufferedImage im = ImageIO.read(new ByteArrayInputStream(data));
             if (im == null) return null;
             int w = im.getWidth(), h = im.getHeight();
+            boolean alpha = im.getColorModel().hasAlpha();
             if (sw > 0 && sh > 0 && (sw != w || sh != h)) {
                 BufferedImage scaled = new BufferedImage(sw, sh, BufferedImage.TYPE_INT_ARGB);
                 java.awt.Graphics2D g = scaled.createGraphics();
@@ -26,7 +27,7 @@ public final class JetImageIOCodec {
             }
             int[] px = new int[w * h];
             im.getRGB(0, 0, w, h, px, 0, w);
-            return new Object[]{ px, w, h };
+            return new Object[]{ px, Boolean.valueOf(alpha) };
         } catch (Throwable t) { return null; }
     }
     public static byte[] encode(jet.gfx.PixelBuffer pb, String format, int quality) {

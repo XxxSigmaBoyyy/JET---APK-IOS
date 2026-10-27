@@ -82,7 +82,19 @@ public Resources(ResTable t) {
         String ty = defType; int sl = n.indexOf('/'); if (sl >= 0) { ty = n.substring(0, sl); n = n.substring(sl + 1); }
         Integer id = ty == null ? null : t.idByName(ty, n, "android".equals(pk)); return id == null ? 0 : id;
     }
-    public android.graphics.drawable.Drawable getDrawable(int id) { try { return t.drawable("@" + Integer.toHexString(id)); } catch (Throwable e) { return null; } }
+    public android.graphics.drawable.Drawable getDrawable(int id) {
+        try {
+            android.graphics.drawable.Drawable d = t.drawable("@" + Integer.toHexString(id));
+            if (d == null) drawableMiss(id, null);
+            return d;
+        } catch (Throwable e) { drawableMiss(id, e); return null; }
+    }
+    private static final java.util.Set<Integer> DRAWABLE_MISSES = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private void drawableMiss(int id, Throwable e) {
+        if (!DRAWABLE_MISSES.add(id)) return;
+        String name; try { name = getResourceName(id); } catch (Throwable x) { name = "?"; }
+        System.err.println("[jet-res] getDrawable(0x" + Integer.toHexString(id) + " " + name + ") -> null" + (e == null ? "" : " : " + e));
+    }
     public android.graphics.drawable.Drawable getDrawable(int id, Theme th) { return getDrawable(id); }
     public android.graphics.drawable.Drawable getDrawableForDensity(int id, int d, Theme th) { return getDrawable(id); }
     public int getColor(int id, Theme th) { if (t.hasXmlFile(id)) { ColorStateList c = getColorStateList(id, th); if (c != null) return c.getDefaultColor(); } return getColor(id); }

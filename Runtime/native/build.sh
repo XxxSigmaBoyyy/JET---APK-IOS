@@ -6,7 +6,7 @@ CFLAGS="-O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function
 LDFLAGS="-lpthread -ldl -lm -Lthird_party -lz"
 mkdir -p build
 
-SRCS="ctx.c decode.c elf_loader.c interp.c host_bionic.c jni_bridge.c trampoline.c setjmp_guest.c"
+SRCS="ctx.c decode.c asimd.c elf_loader.c interp.c host_bionic.c jni_bridge.c trampoline.c setjmp_guest.c"
 OBJS=""
 for s in $SRCS; do
   o="build/${s%.c}.o"

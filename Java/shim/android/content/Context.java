@@ -101,8 +101,11 @@ public class Context {
 
     public File getFilesDir() { File f = new File(dataDir(), "files"); f.mkdirs(); return f; }
     public File getCacheDir() { File f = new File(dataDir(), "cache"); f.mkdirs(); return f; }
-    public File getDir(String name, int mode) { File f = new File(dataDir(), name); f.mkdirs(); return f; }
-    public File getDatabasePath(String name) { File f = new File(dataDir(), "databases"); f.mkdirs(); return new File(f, name); }
+    public File getDir(String name, int mode) { File f = new File(dataDir(), "app_" + name); f.mkdirs(); return f; } // Android: <dataDir>/app_<name>
+    public File getDatabasePath(String name) {
+        if (name != null && name.startsWith("/")) { File a = new File(name); File p = a.getParentFile(); if (p != null) p.mkdirs(); return a; } // absolute names are used as-is (Android)
+        File f = new File(dataDir(), "databases"); f.mkdirs(); return new File(f, name);
+    }
     public SharedPreferences getSharedPreferences(String name, int mode) {
         synchronized (prefs) {
             SharedPreferences p = prefs.get(name);
@@ -138,7 +141,8 @@ public class Context {
     public int checkSelfPermission(String p) { return 0; /* PERMISSION_GRANTED */ }
     public final File dataDir() {
         if (mDataDir == null) {
-            mDataDir = new File(System.getProperty("jet.data.dir", System.getProperty("java.io.tmpdir") + "/jet-data"), getPackageName());
+            // always absolute: native code (sqlite, tgnet) gets these paths and must not depend on the process cwd
+            mDataDir = new File(System.getProperty("jet.data.dir", System.getProperty("java.io.tmpdir") + "/jet-data"), getPackageName()).getAbsoluteFile();
             mDataDir.mkdirs();
         }
         return mDataDir;

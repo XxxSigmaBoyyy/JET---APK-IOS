@@ -28,7 +28,7 @@ public class Environment {
     public static final java.lang.String MEDIA_UNMOUNTABLE = "unmountable";
     public static final java.lang.String MEDIA_UNMOUNTED = "unmounted";
 
-    private static File base() { File b = new File(System.getProperty("jet.data.dir", System.getProperty("java.io.tmpdir") + "/jet-data")); b.mkdirs(); return b; }
+    private static File base() { File b = new File(System.getProperty("jet.data.dir", System.getProperty("java.io.tmpdir") + "/jet-data")).getAbsoluteFile(); b.mkdirs(); return b; }
     private static File d(File f) { f.mkdirs(); return f; }
     public static File getExternalStorageDirectory() { return d(new File(base(), "sdcard")); }
     public static File getExternalStoragePublicDirectory(String type) { return d(new File(getExternalStorageDirectory(), type == null ? "" : type)); }

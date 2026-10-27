@@ -4,7 +4,7 @@ CFLAGS ?= -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-unused-functi
 CFLAGS += -fno-strict-aliasing -D_GNU_SOURCE -Ithird_party
 LDFLAGS ?= -lpthread -ldl -lm -Lthird_party -lz
 
-SRCS = ctx.c decode.c elf_loader.c interp.c host_bionic.c jni_bridge.c trampoline.c setjmp_guest.c
+SRCS = ctx.c decode.c asimd.c elf_loader.c interp.c host_bionic.c jni_bridge.c trampoline.c setjmp_guest.c
 OBJS = $(SRCS:%.c=build/%.o)
 
 .PHONY: all clean test test-unit test-tg ios-syntax check

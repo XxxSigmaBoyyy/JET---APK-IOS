@@ -16,6 +16,8 @@
 #include <unistd.h>
 #include <dirent.h>
 
+static int g_dump; /* --dump: print "va raw" for every undef */
+
 typedef struct {
     uint32_t raw;
     uint64_t count;
@@ -204,7 +206,8 @@ static int sweep_one(const char *path, sweep_stats *st, int do_mnem) {
             jet_insn ins; memset(&ins, 0, sizeof ins);
             if (jet_decode(raw, &ins) == 0 && ins.op != OP_UNDEF) continue;
             st->undef_insns++;
-            find_or_add(st, raw, vaddr + off);
+            if (g_dump) printf("U %llx %08x\n", (unsigned long long)(vaddr + off), raw);
+            else find_or_add(st, raw, vaddr + off);
         }
     }
     munmap(map, (size_t)stbuf.st_size);
@@ -293,6 +296,7 @@ static int path_cmp(const void *a, const void *b) {
 int main(int argc, char **argv) {
     char **files = NULL; int nfiles = 0, do_mnem = 1, argi = 1;
     if (argi < argc && !strcmp(argv[argi], "--no-mnem")) { do_mnem = 0; argi++; }
+    if (argi < argc && !strcmp(argv[argi], "--dump")) { g_dump = 1; do_mnem = 0; argi++; }
     if (argi < argc && !strcmp(argv[argi], "--corpus")) {
         if (argi + 1 >= argc) { fprintf(stderr, "need --corpus dir\n"); return 2; }
         add_sos_walk(argv[argi + 1], &files, &nfiles);
@@ -313,6 +317,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nfiles; i++) {
         sweep_stats st; memset(&st, 0, sizeof st);
         fprintf(stderr, "sweep %s ...\n", files[i]);
+        if (g_dump) { printf("F %s\n", files[i]); sweep_one(files[i], &st, 0); free(st.v); free(files[i]); continue; }
         if (sweep_one(files[i], &st, do_mnem) == 0) {
             print_report(files[i], &st);
             ga += st.undef_other; gb += st.undef_crypto;
