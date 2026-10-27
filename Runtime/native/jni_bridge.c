@@ -261,6 +261,10 @@ static uint64_t jni_trap(jet_ctx *ctx, const jet_args *a, void *user) {
     }
 }
 
+uint64_t jet_jni_guest_env(jet_ctx *ctx) {
+    return ctx && ctx->guest_jnienv ? (uint64_t)(uintptr_t)ctx->guest_jnienv : 0;
+}
+
 int jet_jni_onload(jet_ctx *ctx, jet_lib *lib, int32_t *version_out) {
     uint64_t sym = jet_native_sym(lib, "JNI_OnLoad");
     if (!sym) {

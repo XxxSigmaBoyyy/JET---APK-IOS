@@ -96,6 +96,9 @@ int jet_jni_bind(jet_ctx *ctx, void *host_javavm, void *host_jnienv);
 /* Call the library's JNI_OnLoad(JavaVM*, void*). *version_out gets the result. */
 int jet_jni_onload(jet_ctx *ctx, jet_lib *lib, int32_t *version_out);
 
+/* Guest-visible JNIEnv* (identity-mapped pointer) for calling natives. */
+uint64_t jet_jni_guest_env(jet_ctx *ctx);
+
 /* Callback invoked for each RegisterNatives entry the guest registers. */
 typedef void (*jet_register_cb)(void *user, const char *cls, const char *name,
                                 const char *sig, uint64_t guest_fn);

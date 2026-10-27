@@ -25,6 +25,15 @@ for spec in "iphoneos:arm64-apple-ios17.0" "iphonesimulator:arm64-apple-ios17.0-
     if [ $r -ne 0 ]; then nfail=$((nfail+1)); rc=1; else objs+=("$o"); fi
   done
   [ $nfail -eq 0 ] && xcrun --sdk "$sdk" libtool -static -o "$od/libjet_native.a" "${objs[@]}" >> "$LOG" 2>&1
+  # Link check with -lz (as the app links it): undefined symbols other than JNI/app-provided ones are reported.
+  lnk="n/a"
+  if [ -f "$od/libjet_native.a" ]; then
+    msg=$("$CC" -target "$tgt" -isysroot "$SYSROOT" -dynamiclib -o "$od/libjet_native_linkcheck.dylib" -Wl,-all_load "$od/libjet_native.a" -lz -Wl,-undefined,dynamic_lookup 2>&1); r=$?
+    echo "----- $sdk link check (-dynamiclib -all_load libjet_native.a -lz) exit $r" >> "$LOG"; printf '%s\n' "${msg:-(clean)}" >> "$LOG"
+    und=$(nm -u "$od/libjet_native_linkcheck.dylib" 2>/dev/null | grep -v -E '^_(JNI_|jet_jvm_)' | grep -c . || true)
+    echo "$sdk undefined after -lz (resolved at app link by libSystem/app):" >> "$LOG"; nm -u "$od/libjet_native_linkcheck.dylib" 2>/dev/null | tr '\n' ' ' >> "$LOG"; echo >> "$LOG"
+    lnk="exit=$r undefined=$und"; [ $r -ne 0 ] && rc=1
+  fi
   # Probe (info only, never fatal): files that failed only on a missing Linux-only header are re-checked with
   # empty stand-ins for those headers, so the diagnostics hidden behind the fatal error are visible too.
   PI="$OUT/probe-include"; mkdir -p "$PI/sys"
@@ -40,7 +49,7 @@ for spec in "iphoneos:arm64-apple-ios17.0" "iphonesimulator:arm64-apple-ios17.0-
     msg=$("$CC" -target "$tgt" -isysroot "$SYSROOT" "${CFLAGS[@]}" -IRuntime/native -fsyntax-only "$f" 2>&1)
     [ -n "$msg" ] && { echo "----- (info, host test driver) $sdk $f" >> "$LOG"; printf '%s\n' "$msg" >> "$LOG"; tw=$((tw+1)); }
   done
-  echo "$sdk: files_failed=$nfail errors=$nerr warnings=$nwarn tests_with_diagnostics=$tw lib=$([ -f "$od/libjet_native.a" ] && echo built || echo none)" | tee -a "$SUM"
+  echo "$sdk: files_failed=$nfail errors=$nerr warnings=$nwarn tests_with_diagnostics=$tw lib=$([ -f "$od/libjet_native.a" ] && echo built || echo none) link_lz=$lnk" | tee -a "$SUM"
 done
 cat "$SUM" >> "$LOG"
 echo "::group::native_ios_build_errors.txt"; cat "$LOG"; echo "::endgroup::"

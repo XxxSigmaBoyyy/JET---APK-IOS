@@ -2,8 +2,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 CC="${CC:-clang}"
-CFLAGS="-O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -fno-strict-aliasing -D_GNU_SOURCE"
-LDFLAGS="-lpthread -ldl -lm"
+CFLAGS="-O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -fno-strict-aliasing -D_GNU_SOURCE -I. -Ithird_party"
+LDFLAGS="-lpthread -ldl -lm -Lthird_party -lz"
 mkdir -p build
 
 SRCS="ctx.c decode.c elf_loader.c interp.c host_bionic.c jni_bridge.c trampoline.c setjmp_guest.c"

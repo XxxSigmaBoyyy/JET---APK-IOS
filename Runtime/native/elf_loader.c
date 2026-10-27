@@ -225,12 +225,18 @@ static int apply_rela(jet_ctx *ctx, jet_lib *lib, const Elf64_Rela *r,
             v = resolve_sym(ctx, lib, sname, &is_data);
             if (!v && sname[0]) {
                 if (ELF64_ST_BIND(sym->st_info) != STB_WEAK) {
-                    /* Auto-bind to a generic stub so BLR doesn't jump to NULL. */
                     extern uint64_t jet_host_stub0(jet_ctx *, const jet_args *, void *);
+                    /* Log once per name; still bind stub0 so BLR is safe. */
+                    static char seen[64][128]; static int nseen;
+                    int already = 0;
+                    for (int si = 0; si < nseen; si++)
+                        if (strcmp(seen[si], sname) == 0) { already = 1; break; }
+                    if (!already && nseen < 64) {
+                        snprintf(seen[nseen++], sizeof seen[0], "%s", sname);
+                        jet_log(ctx, 1, "UNRESOLVED_IMPORT %s (reloc_type=%u)", sname, type);
+                    }
                     jet_native_register_host(ctx, sname, jet_host_stub0, NULL);
                     v = resolve_sym(ctx, lib, sname, &is_data);
-                    jet_log(ctx, 1, "unresolved %s -> stub0 (type %u) at off 0x%llx",
-                            sname, type, (unsigned long long)r->r_offset);
                 }
             } else if (!is_data)
                 v += (uint64_t)r->r_addend; /* usually 0 for JUMP_SLOT */
@@ -583,15 +589,31 @@ int jet_elf_run_init(jet_ctx *ctx, jet_lib *lib) {
             return -1;
         }
     }
+    int any_fail = 0;
+    char first_err[256] = {0};
     for (size_t i = 0; i < lib->init_count; i++) {
         uint64_t fn = lib->init_array[i];
         if (!fn || fn == (uint64_t)-1) continue;
         uint64_t r;
+        jet_log(ctx, 2, "init_array[%zu] enter 0x%llx", i, (unsigned long long)fn);
+        ctx->last_trap_name[0] = 0;
         if (jet_native_call(ctx, fn, &a, &r, NULL) != 0) {
-            jet_set_error(ctx, "init_array[%zu] (0x%llx) failed: %s",
-                          i, (unsigned long long)fn, ctx->last_error);
-            return -1;
+            jet_log(ctx, 0, "init_array[%zu] FAIL: %s", i, ctx->last_error);
+            if (!any_fail) {
+                snprintf(first_err, sizeof first_err, "init_array[%zu]: %s",
+                         i, ctx->last_error);
+            }
+            any_fail = 1;
+            /* continue remaining ctors */
+            continue;
         }
+        jet_log(ctx, 2, "init_array[%zu] OK", i);
+    }
+    if (any_fail) {
+        jet_set_error(ctx, "%s", first_err);
+        /* still mark initialized so fini can run; callers see last_error */
+        lib->initialized = 1;
+        return -1;
     }
     lib->initialized = 1;
     return 0;

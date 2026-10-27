@@ -1,8 +1,8 @@
 # JET native AArch64 interpreter
 CC ?= clang
 CFLAGS ?= -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function
-CFLAGS += -fno-strict-aliasing -D_GNU_SOURCE
-LDFLAGS ?= -lpthread -ldl -lm -lz
+CFLAGS += -fno-strict-aliasing -D_GNU_SOURCE -Ithird_party
+LDFLAGS ?= -lpthread -ldl -lm -Lthird_party -lz
 
 SRCS = ctx.c decode.c elf_loader.c interp.c host_bionic.c jni_bridge.c trampoline.c setjmp_guest.c
 OBJS = $(SRCS:%.c=build/%.o)
@@ -43,13 +43,13 @@ test: test-unit test-tg
 
 # Ensure core sources are free of Linux-only headers in the public path.
 ios-syntax:
-	@echo "Checking iOS portability (syntax-only, no sysroot)..."
-	$(CC) -std=c11 -fsyntax-only -DTARGET_OS_IPHONE=1 -DJET_IOS_SYNTAX_CHECK=1 \
-		-I. decode.c 2>&1 | head -20 || true
-	@# Full check with apple target if possible
-	$(CC) -std=c11 -target arm64-apple-ios15.0 -fsyntax-only -I. \
-		-D_GNU_SOURCE=0 -DJET_IOS_SYNTAX_CHECK=1 \
-		decode.c ctx.c trampoline.c setjmp_guest.c 2>&1 | head -40 || true
+	@echo "Checking iOS portability (syntax-only)..."
+	@for f in $(SRCS); do \
+	  echo "---- $$f"; \
+	  $(CC) -std=c11 -Wall -Wextra -Wno-unused-parameter -target arm64-apple-ios15.0 \
+	    -fsyntax-only -I. -Ithird_party -DJET_IOS_SYNTAX_CHECK=1 \
+	    -DTARGET_OS_IPHONE=1 -D__APPLE__=1 $$f 2>&1 | head -30 || true; \
+	done
 
 clean:
 	rm -rf build tests/guest_lib.so

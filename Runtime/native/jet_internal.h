@@ -242,6 +242,10 @@ struct jet_ctx {
 
     char last_error[512];
     uint64_t insn_count;
+    char     last_trap_name[128];
+    uint64_t last_trap_pc;
+    uint64_t fault_x[8];
+    uint64_t fault_sp, fault_lr, fault_pc;
 };
 
 /* ---- helpers ---- */
@@ -315,3 +319,9 @@ static inline void st4(uint64_t a, uint32_t v){ *(volatile uint32_t*)G2H(a)=v; }
 static inline void st8(uint64_t a, uint64_t v){ *(volatile uint64_t*)G2H(a)=v; }
 
 #endif /* JET_INTERNAL_H */
+
+/* Linux SVC emulation (host_bionic.c) — portable, no raw syscall() on Darwin. */
+int64_t jet_emulate_linux_syscall(jet_ctx *ctx, jet_cpu *cpu,
+                                  uint64_t nr, uint64_t a0, uint64_t a1,
+                                  uint64_t a2, uint64_t a3, uint64_t a4,
+                                  uint64_t a5);

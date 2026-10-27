@@ -694,11 +694,15 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
     }
 
     case OP_SVC: {
-        /* Treat as Linux AArch64 syscall: x8=nr, x0..x5 args. */
-        uint64_t nr = c->x[8];
-        /* Forward a subset via host syscall() */
-        long r = syscall((long)nr, (long)c->x[0], (long)c->x[1], (long)c->x[2],
-                         (long)c->x[3], (long)c->x[4], (long)c->x[5]);
+        /* Linux AArch64 syscall ABI: x8=nr, x0..x5 args. Emulate via libc;
+         * never pass Linux numbers to host syscall() (wrong on Darwin). */
+        extern int64_t jet_emulate_linux_syscall(jet_ctx *ctx, jet_cpu *cpu,
+                                                 uint64_t nr, uint64_t a0, uint64_t a1,
+                                                 uint64_t a2, uint64_t a3, uint64_t a4,
+                                                 uint64_t a5);
+        int64_t r = jet_emulate_linux_syscall(ctx, c, c->x[8],
+                                              c->x[0], c->x[1], c->x[2],
+                                              c->x[3], c->x[4], c->x[5]);
         c->x[0] = (uint64_t)r;
         return 0;
     }
@@ -887,7 +891,8 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
         /* literal form: opc marker was 1 and rn unused */
         uint64_t addr;
         int wb = 0;
-        if ((i->raw & 0x3B000000u) == 0x1C000000u) {
+        if ((i->raw & 0x3F000000u) == 0x1C000000u || i->opc == 1) {
+            /* FP load-literal (opc==1 set by decode) */
             addr = pc + (int64_t)i->imm;
         } else if (i->op == OP_LDUR_FP) {
             addr = ((i->rn==31)?c->sp:jet_x(c,i->rn)) + (int64_t)i->imm;
@@ -1111,12 +1116,11 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
                 if (bytes==16) st8(base + (uint64_t)r*bytes + 8, c->v[vt][1]);
             }
         }
-        /* post-index if Rm != 31 or Rm encoding indicates immediate */
-        if (i->rm != 31) {
-            uint64_t off = (i->rm == 31) ? (uint64_t)nregs*bytes : jet_x(c, i->rm);
-            /* In encoding, Rm=11111 means immediate offset = nregs*bytes */
-            if (((i->raw >> 16) & 0x1f) == 0x1f) off = (uint64_t)nregs * bytes;
-            else off = jet_x(c, i->rm);
+        /* Post-index (LD1/ST1): bit23=1. Rm=31 → imm = nregs*bytes; else offset=Xm. */
+        if ((i->raw & (1u << 23)) != 0) {
+            uint64_t off = (i->rm == 31)
+                ? (uint64_t)nregs * (uint64_t)bytes
+                : jet_x(c, i->rm);
             if (i->rn == 31) c->sp = base + off; else jet_set_x(c, i->rn, base + off);
         }
         return 0;
@@ -1183,6 +1187,15 @@ static int dispatch_stub(jet_ctx *ctx, jet_cpu *c, int idx) {
     for (int i = 0; i < 8; i++) a.x[i] = c->x[i];
     for (int i = 0; i < 8; i++) memcpy(&a.d[i], &c->v[i][0], 8);
     a.stack = (const uint64_t *)G2H(c->sp);
+    if (t->name) {
+        snprintf(ctx->last_trap_name, sizeof ctx->last_trap_name, "%s", t->name);
+        ctx->last_trap_pc = c->pc;
+        jet_log(ctx, 3, "trap %s pc=%llx x0=%llx x1=%llx x8=%llx sp=%llx lr=%llx",
+                t->name, (unsigned long long)c->pc,
+                (unsigned long long)c->x[0], (unsigned long long)c->x[1],
+                (unsigned long long)c->x[8], (unsigned long long)c->sp,
+                (unsigned long long)c->x[30]);
+    }
     uint64_t ret = t->fn(ctx, &a, t->user);
     if (t->flags & JET_HOST_RET_F64) {
         c->v[0][0] = ret; c->v[0][1] = 0;
@@ -1215,10 +1228,22 @@ static void jet_fault_handler(int sig, siginfo_t *si, void *uctx) {
         raise(sig);
         return;
     }
+    if (jet_fault_ctx) {
+        for (int i = 0; i < 8; i++) jet_fault_ctx->fault_x[i] = jet_fault_cpu->x[i];
+        jet_fault_ctx->fault_sp = jet_fault_cpu->sp;
+        jet_fault_ctx->fault_lr = jet_fault_cpu->x[30];
+        jet_fault_ctx->fault_pc = jet_fault_cpu->pc;
+    }
     snprintf(jet_fault_cpu->err_msg, sizeof jet_fault_cpu->err_msg,
-             "guest fault sig=%d addr=%p pc=%llx",
+             "guest fault sig=%d addr=%p pc=%llx lr=%llx sp=%llx x0=%llx x1=%llx last_trap=%s",
              sig, si ? si->si_addr : NULL,
-             (unsigned long long)jet_fault_cpu->pc);
+             (unsigned long long)jet_fault_cpu->pc,
+             (unsigned long long)jet_fault_cpu->x[30],
+             (unsigned long long)jet_fault_cpu->sp,
+             (unsigned long long)jet_fault_cpu->x[0],
+             (unsigned long long)jet_fault_cpu->x[1],
+             (jet_fault_ctx && jet_fault_ctx->last_trap_name[0])
+                ? jet_fault_ctx->last_trap_name : "-");
     if (jet_fault_ctx)
         jet_set_error(jet_fault_ctx, "%s", jet_fault_cpu->err_msg);
     jet_fault_cpu->err_code = 2;

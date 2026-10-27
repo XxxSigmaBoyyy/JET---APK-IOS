@@ -199,13 +199,14 @@ int jet_decode(uint32_t w, jet_insn *o) {
         else { o->op = OP_PRFM_LIT; }
         return 0;
     }
-    /* FP literal */
-    if ((w & 0x3B000000u) == 0x1C000000u) {
+    /* FP literal: opc:2 011 100 imm19 Rt  (bits[29:24]=011100) */
+    if ((w & 0x3F000000u) == 0x1C000000u) {
         o->op = OP_LDR_FP;
         o->rd = bits(w, 4, 0);
         o->imm = sbits(w, 23, 5) << 2;
         o->size = (uint8_t)bits(w, 31, 30); /* 00=S 01=D 10=Q */
         o->opc = 1; /* literal */
+        o->rn = 31; /* unused for literal; mark */
         return 0;
     }
 
@@ -293,21 +294,28 @@ int jet_decode(uint32_t w, jet_insn *o) {
         if (V) {
             /* FP/SIMD LDR/STR */
             int is_load = (opc == 1 || opc == 3);
-            if ((w & 0x3B000000u) == 0x3D000000u) {
+            /* bit24=1 → unsigned imm; else unscaled / pre / post / reg */
+            if ((w & 0x01000000u) == 0x01000000u) {
                 /* unsigned imm */
-                int scale = size;
-                if (opc == 2 || opc == 3) scale = 4; /* 128-bit: size=00 opc=2/3 */
                 if (size == 0 && (opc == 2 || opc == 3)) o->size = 4;
                 o->uimm = bits(w, 21, 10) << ((o->size == 4) ? 4 : size);
                 o->op = is_load ? OP_LDR_FP : OP_STR_FP;
                 o->opc = 0; /* unsigned */
-            } else if ((w & 0x3B200C00u) == 0x3C000000u) {
+            } else if ((w & 0x00200C00u) == 0x00000000u) {
+                /* unscaled (LDUR/STUR): bit21=0, bits[11:10]=00 */
                 o->imm = sbits(w, 20, 12);
                 o->op = is_load ? OP_LDUR_FP : OP_STUR_FP;
             } else {
                 o->imm = sbits(w, 20, 12);
                 o->op = is_load ? OP_LDR_FP : OP_STR_FP;
                 o->opc = (uint8_t)bits(w, 11, 10); /* 1=post 3=pre */
+                if ((w & 0x00200C00u) == 0x00200800u) {
+                    /* register offset */
+                    o->rm = bits(w, 20, 16);
+                    o->cond = (uint8_t)bits(w, 15, 13); /* option */
+                    o->uimm = bit(w, 12); /* S */
+                    o->opc = 4;
+                }
             }
             return 0;
         }
@@ -408,7 +416,8 @@ int jet_decode(uint32_t w, jet_insn *o) {
         return 0;
     }
     /* Conditional compare */
-    if ((w & 0x1FE00C10u) == 0x3A400000u) {
+    /* CCMN/CCMP: sf op S=1 11010010 ... ; S is bit29. Mask drops sf/op. */
+    if ((w & 0x1FE00C10u) == 0x1A400000u && bit(w, 29)) {
         o->sf = bit(w, 31);
         o->rn = bits(w,9,5); o->rm = bits(w,20,16);
         o->cond = (uint8_t)bits(w, 15, 12);
@@ -435,8 +444,8 @@ int jet_decode(uint32_t w, jet_insn *o) {
         }
         return 0;
     }
-    if ((w & 0x1FFFFC00u) == 0x5AC00000u || (w & 0x5FFFFC00u) == 0x5AC00000u) {
-        /* 1-source: bits 31=sf, 30=1, 29=0, 28..21=11010110, rm=00000 */
+    if ((w & 0x5FFFFC00u) == 0x5AC00000u) {
+        /* 1-source: sf 1 0 11010110 00000 opcode Rn Rd */
         if (bits(w, 20, 16) != 0) return -1;
         o->sf = bit(w, 31);
         o->rd = bits(w,4,0); o->rn = bits(w,9,5);
@@ -458,8 +467,6 @@ int jet_decode(uint32_t w, jet_insn *o) {
         int op31 = bits(w, 30, 29); /* should be 00 for data-proc 3src of this form */
         (void)op31;
         int o0 = bit(w, 15);
-        int op = bits(w, 14, 10); /* actually ra encodes differently — check:
-           encoding: sf 00 11011 op31:op54  Rm o0 Ra Rd; for MADD op31=000 op54=00 */
         int opc = bits(w, 23, 21);
         if (opc == 0) o->op = o0 ? OP_MSUB : OP_MADD;
         else if (opc == 1) o->op = o0 ? OP_SMSUBL : OP_SMADDL;
@@ -474,25 +481,11 @@ int jet_decode(uint32_t w, jet_insn *o) {
 
     /* ---- FP / ASIMD (subset) ---- */
     /* FP data-processing 2-source / 1-source / compare / select */
-    if ((w & 0xFF200C00u) == 0x1E200800u || (w & 0xFF200C00u) == 0x1E201800u ||
-        (w & 0xFF200C00u) == 0x1E202800u || (w & 0xFF200C00u) == 0x1E203800u) {
-        /* type in bits 23:22 (00=S 01=D), opcode varies */
+    /* FP data-processing 2-source: M=0 S=0 type:2 opcode:4, bits[11:10]=10.
+     * One mask matches FMUL/FDIV/FADD/FSUB/FMIN/FMAX (opcode in 15:12). */
+    if ((w & 0xFF200C00u) == 0x1E200800u) {
         o->size = (uint8_t)bits(w, 23, 22);
         o->rd = bits(w,4,0); o->rn = bits(w,9,5); o->rm = bits(w,20,16);
-        int opcode = bits(w, 15, 12);
-        int op = bit(w, 21); /* for some */
-        (void)op;
-        /* 1-source: Rm==0 and bit21=1 and specific */
-        if (bits(w, 11, 10) == 2 && bits(w, 15, 14) == 0) {
-            /* FP 1-source */
-            switch (bits(w, 20, 15)) {
-            /* actually opcode in 20:15 for 1-src */ ;
-            }
-        }
-        /* Simpler path using raw classification: */
-        uint32_t top = w & 0xFFFFFC00u;
-        (void)top;
-        /* FADD/FSUB/FMUL/FDIV: M=0 S=0 type:xx opcode:xxxx */
         if ((w & 0xFF20FC00u) == 0x1E202800u) { o->op = OP_FADD; return 0; }
         if ((w & 0xFF20FC00u) == 0x1E203800u) { o->op = OP_FSUB; return 0; }
         if ((w & 0xFF20FC00u) == 0x1E200800u) { o->op = OP_FMUL; return 0; }
@@ -581,7 +574,8 @@ int jet_decode(uint32_t w, jet_insn *o) {
     }
 
     /* MOVI / ORR-imm / FMOV-imm (ASIMD modified immediate) */
-    if ((w & 0x9FF80C00u) == 0x0F000400u || (w & 0x9FF80C00u) == 0x0F001400u) {
+    /* ASIMD modified immediate: bits[11:10]=01; cmode in 15:12 varies */
+    if ((w & 0x9FF80400u) == 0x0F000400u) {
         o->op = OP_MOVI_V;
         o->regsize = bit(w, 30);
         o->rd = bits(w,4,0);
@@ -601,7 +595,8 @@ int jet_decode(uint32_t w, jet_insn *o) {
         return 0;
     }
     /* INS (element): Vd.ts[index], Vn.ts[index2] */
-    if ((w & 0xBFE08400u) == 0x6E000400u) {
+    /* INS element requires Q=1 */
+    if ((w & 0xFFE08400u) == 0x6E000400u) {
         o->op = OP_INS;
         o->rd = bits(w,4,0); o->rn = bits(w,9,5);
         o->uimm = bits(w, 20, 16); /* imm5 */

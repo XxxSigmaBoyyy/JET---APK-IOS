@@ -1,19 +1,23 @@
 /* host_bionic.c - bionic/Linux host trap implementations for guest imports. */
 #include "jet_internal.h"
 #include <errno.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
 #include <math.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/utsname.h>
-#include <sys/syscall.h>
 #include <poll.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <sched.h>
 #include <semaphore.h>
 #include <dlfcn.h>
 #include <locale.h>
@@ -24,9 +28,27 @@
 #include <ctype.h>
 #include <wchar.h>
 #include <wctype.h>
-#include "zlib_stub.h"
-#include <sys/prctl.h>
-#include <sys/auxv.h>
+/* zlib: prefer real headers; fall back to stub if absent. */
+#if defined(__has_include)
+#  if __has_include(<zlib.h>)
+#    include <zlib.h>
+#    define JET_HAVE_ZLIB 1
+#  elif __has_include("third_party/zlib.h")
+#    include "third_party/zlib.h"
+#    define JET_HAVE_ZLIB 1
+#  else
+#    include "zlib_stub.h"
+#  endif
+#else
+#  include "zlib_stub.h"
+#endif
+
+/* Linux-only host headers — guest getauxval/prctl are emulated, never call host. */
+#ifdef __linux__
+#  include <sys/prctl.h>
+#  include <sys/auxv.h>
+#  include <sys/syscall.h>
+#endif
 
 /* ---- helpers to read Linux AAPCS64 va_list from guest memory ---- */
 typedef struct {
@@ -51,7 +73,13 @@ static uint64_t va_arg_gr(jet_va_list_aapcs64 *ap) {
 /* ---- errno ---- */
 static uint64_t h___errno(jet_ctx *ctx, const jet_args *a, void *u) {
     (void)ctx; (void)a; (void)u;
+#if defined(__linux__)
     return H2G(__errno_location());
+#elif defined(__APPLE__)
+    return H2G(__error());
+#else
+    return H2G(&errno);
+#endif
 }
 
 /* ---- logging ---- */
@@ -158,8 +186,7 @@ static uint64_t h_vsnprintf(jet_ctx *c, const jet_args *a, void *u){
     for (const char *p=fmt; *p && o+1<sizeof out; p++) {
         if (*p!='%'){ out[o++]=*p; continue; }
         p++;
-        int longness=0;
-        while (*p=='l'||*p=='z'||*p=='t'||*p=='h'||*p=='j'){ if(*p=='l')longness++; p++; }
+        while (*p=='l'||*p=='z'||*p=='t'||*p=='h'||*p=='j'){ p++; }
         char tmp[128];
         switch (*p) {
         case '%': out[o++]='%'; break;
@@ -248,11 +275,28 @@ static uint64_t h_mprotect(jet_ctx *c, const jet_args *a, void *u){
 }
 static uint64_t h_getauxval(jet_ctx *c, const jet_args *a, void *u){
     (void)u;
+    /* Emulated guest auxv — do NOT call host getauxval. */
     unsigned long type = (unsigned long)a->x[0];
-    if (type == 16 /*AT_HWCAP*/) return c->cfg.hwcap;
-    if (type == 26 /*AT_HWCAP2*/) return c->cfg.hwcap2;
-    if (type == 6  /*AT_PAGESZ*/) return (uint64_t)sysconf(_SC_PAGESIZE);
-    return getauxval(type);
+    switch (type) {
+    case 16: return c->cfg.hwcap;          /* AT_HWCAP */
+    case 26: return c->cfg.hwcap2;         /* AT_HWCAP2 */
+    case 6:  return (uint64_t)sysconf(_SC_PAGESIZE); /* AT_PAGESZ */
+    case 11: return (uint64_t)getuid();    /* AT_UID */
+    case 12: return (uint64_t)geteuid();   /* AT_EUID */
+    case 13: return (uint64_t)getgid();    /* AT_GID */
+    case 14: return (uint64_t)getegid();   /* AT_EGID */
+    case 23: return 0;                     /* AT_SECURE */
+    case 25: {                             /* AT_RANDOM */
+        static uint8_t rnd[16];
+        static int once;
+        if (!once) { for (int i=0;i<16;i++) rnd[i]=(uint8_t)(rand()&0xff); once=1; }
+        return H2G(rnd);
+    }
+    case 31: return H2G("/system/bin/app_process64"); /* AT_EXECFN */
+    default:
+        jet_log(c, 2, "getauxval(%lu) -> 0", type);
+        return 0;
+    }
 }
 static uint64_t h_sysconf(jet_ctx *c, const jet_args *a, void *u){
     (void)c;(void)u; return (uint64_t)(int64_t)sysconf((int)a->x[0]);
@@ -273,12 +317,47 @@ static uint64_t h_usleep(jet_ctx *c, const jet_args *a, void *u){
     (void)c;(void)u; return (uint64_t)(int64_t)usleep((useconds_t)a->x[0]);
 }
 static uint64_t h_getpid(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)a;(void)u; return (uint64_t)getpid(); }
-static uint64_t h_gettid(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)a;(void)u; return (uint64_t)syscall(SYS_gettid); }
+static uint64_t h_gettid(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)a;(void)u;
+#if defined(__linux__) && defined(SYS_gettid)
+    return (uint64_t)syscall(SYS_gettid);
+#elif defined(__APPLE__)
+    uint64_t tid = 0; pthread_threadid_np(NULL, &tid); return tid;
+#else
+    return (uint64_t)(uintptr_t)pthread_self();
+#endif
+}
 static uint64_t h_getuid(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)a;(void)u; return (uint64_t)getuid(); }
 static uint64_t h_geteuid(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)a;(void)u; return (uint64_t)geteuid(); }
 static uint64_t h_uname(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)uname((struct utsname*)G2H(a->x[0])); }
 static uint64_t h_prctl(jet_ctx *c, const jet_args *a, void *u){
-    (void)c;(void)u; return (uint64_t)(int64_t)prctl((int)a->x[0], a->x[1], a->x[2], a->x[3], a->x[4]);
+    (void)u;
+    /* Emulate Linux prctl; do not require host <sys/prctl.h> on Darwin. */
+    int op = (int)a->x[0];
+    if (op == 15 /*PR_SET_NAME*/) {
+        const char *name = (const char *)G2H(a->x[1]);
+#if defined(__APPLE__)
+        if (name) (void)pthread_setname_np(name);
+#elif defined(__linux__)
+        if (name) (void)prctl(15, (unsigned long)name, 0, 0, 0);
+#else
+        (void)name;
+#endif
+        return 0;
+    }
+    if (op == 16 /*PR_GET_NAME*/) {
+        char *buf = (char *)G2H(a->x[1]);
+        if (buf) {
+#if defined(__APPLE__)
+            pthread_getname_np(pthread_self(), buf, 16);
+#else
+            buf[0] = '\0';
+#endif
+        }
+        return 0;
+    }
+    jet_log(c, 2, "prctl(%d) stubbed", op);
+    return 0;
 }
 
 /* file IO */
@@ -364,8 +443,23 @@ static uint64_t h_pthread_mutexattr_destroy(jet_ctx *c, const jet_args *a, void 
 static uint64_t h_pthread_mutexattr_settype(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)pthread_mutexattr_settype((pthread_mutexattr_t*)G2H(a->x[0]),(int)a->x[1]); }
 static uint64_t h_pthread_condattr_init(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)pthread_condattr_init((pthread_condattr_t*)G2H(a->x[0])); }
 static uint64_t h_pthread_condattr_destroy(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)pthread_condattr_destroy((pthread_condattr_t*)G2H(a->x[0])); }
-static uint64_t h_pthread_condattr_setclock(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)pthread_condattr_setclock((pthread_condattr_t*)G2H(a->x[0]),(clockid_t)a->x[1]); }
-static uint64_t h_pthread_setname_np(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)pthread_setname_np((pthread_t)a->x[0], (char*)G2H(a->x[1])); }
+static uint64_t h_pthread_condattr_setclock(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+#if defined(__APPLE__)
+    (void)a; return 0; /* Darwin: no setclock; cond uses realtime. */
+#else
+    return (uint64_t)(int64_t)pthread_condattr_setclock((pthread_condattr_t*)G2H(a->x[0]),(clockid_t)a->x[1]);
+#endif
+}
+static uint64_t h_pthread_setname_np(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+#if defined(__APPLE__)
+    const char *name = (const char *)G2H(a->x[1] ? a->x[1] : a->x[0]);
+    return name ? (uint64_t)(int64_t)pthread_setname_np(name) : 0;
+#else
+    return (uint64_t)(int64_t)pthread_setname_np((pthread_t)a->x[0], (char*)G2H(a->x[1]));
+#endif
+}
 static uint64_t h_pthread_key_delete(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)pthread_key_delete((pthread_key_t)a->x[0]); }
 static uint64_t h_pthread_equal(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)pthread_equal((pthread_t)a->x[0],(pthread_t)a->x[1]); }
 static uint64_t h_pthread_rwlock_init(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)pthread_rwlock_init((pthread_rwlock_t*)G2H(a->x[0]),NULL); }
@@ -404,7 +498,7 @@ static uint64_t h_sincos(jet_ctx *c, const jet_args *a, void *u){
     *(double*)G2H(a->x[0])=s; *(double*)G2H(a->x[1])=co; return 0;
 }
 /* float variants return in s0 — use F32 flag */
-#define HF1(name,fn) static uint64_t h_##name(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)u; float x; uint32_t bits=(uint32_t)(a->d[0]/*wrong*/); (void)bits; float xf; uint32_t lo; memcpy(&lo,&a->x[0],4); /* FP args in d[]: low 32 of d0 */ memcpy(&xf,&a->d[0],4); float r=fn(xf); uint32_t rb; memcpy(&rb,&r,4); return rb; }
+#define HF1(name,fn) static uint64_t h_##name(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)u; float xf; memcpy(&xf,&a->d[0],4); float r=fn(xf); uint32_t rb; memcpy(&rb,&r,4); return rb; }
 HF1(sinf,sinf) HF1(cosf,cosf) HF1(atanf,atanf) HF1(expf,expf) HF1(exp2f,exp2f) HF1(logf,logf) HF1(log10f,log10f) HF1(log2f,log2f) HF1(tanhf,tanhf) HF1(fabsf,fabsf)
 static uint64_t h_powf(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)u; float x,y; memcpy(&x,&a->d[0],4); memcpy(&y,&a->d[1],4); float r=powf(x,y); uint32_t b; memcpy(&b,&r,4); return b; }
 static uint64_t h_atan2f(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)u; float x,y; memcpy(&x,&a->d[0],4); memcpy(&y,&a->d[1],4); float r=atan2f(x,y); uint32_t b; memcpy(&b,&r,4); return b; }
@@ -463,8 +557,26 @@ static uint64_t h_stack_chk_fail(jet_ctx *c,const jet_args *a,void *u){
 }
 
 /* __cxa_atexit / finalize */
-static uint64_t h_cxa_atexit(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)a;(void)u; return 0; /* TODO: record */ }
-static uint64_t h_cxa_finalize(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)a;(void)u; return 0; }
+/* __cxa_atexit(dtor, arg, dso_handle) — record; we don't run dtors yet. */
+#define JET_ATEXIT_MAX 256
+static struct { uint64_t fn, arg, dso; } jet_atexit_list[JET_ATEXIT_MAX];
+static int jet_atexit_n;
+static uint64_t h_cxa_atexit(jet_ctx *c,const jet_args *a,void *u){
+    (void)u;
+    if (jet_atexit_n < JET_ATEXIT_MAX) {
+        jet_atexit_list[jet_atexit_n].fn = a->x[0];
+        jet_atexit_list[jet_atexit_n].arg = a->x[1];
+        jet_atexit_list[jet_atexit_n].dso = a->x[2];
+        jet_atexit_n++;
+    }
+    jet_log(c, 3, "__cxa_atexit(fn=%llx,arg=%llx,dso=%llx) n=%d",
+            (unsigned long long)a->x[0], (unsigned long long)a->x[1],
+            (unsigned long long)a->x[2], jet_atexit_n);
+    return 0;
+}
+static uint64_t h_cxa_finalize(jet_ctx *c,const jet_args *a,void *u){
+    (void)c;(void)a;(void)u; return 0;
+}
 
 /* FILE* stubs — expose host stdin/stdout/stderr as __sF-like */
 static FILE *jet_sf[3];
@@ -680,3 +792,263 @@ int jet_host_install_bionic(jet_ctx *ctx) {
     reg(ctx,"floor",h_floor); reg(ctx,"ceil",h_ceil); reg(ctx,"round",h_round); reg(ctx,"trunc",h_trunc);
     return 0;
 }
+
+/* ---- Linux AArch64 syscall emulation (portable; no host syscall() on Darwin) ---- */
+/* Numbers from linux/include/uapi/asm-generic/unistd.h (AArch64). */
+enum {
+    JET_NR_io_setup = 0,
+    JET_NR_setxattr = 5,
+    JET_NR_getcwd = 17,
+    JET_NR_eventfd2 = 19,
+    JET_NR_epoll_create1 = 20,
+    JET_NR_epoll_ctl = 21,
+    JET_NR_epoll_pwait = 22,
+    JET_NR_dup = 23,
+    JET_NR_dup3 = 24,
+    JET_NR_fcntl = 25,
+    JET_NR_ioctl = 29,
+    JET_NR_mknodat = 33,
+    JET_NR_mkdirat = 34,
+    JET_NR_unlinkat = 35,
+    JET_NR_symlinkat = 36,
+    JET_NR_linkat = 37,
+    JET_NR_renameat = 38,
+    JET_NR_umount2 = 39,
+    JET_NR_mount = 40,
+    JET_NR_statfs = 43,
+    JET_NR_fstatfs = 44,
+    JET_NR_truncate = 45,
+    JET_NR_ftruncate = 46,
+    JET_NR_fallocate = 47,
+    JET_NR_faccessat = 48,
+    JET_NR_chdir = 49,
+    JET_NR_fchdir = 50,
+    JET_NR_chroot = 51,
+    JET_NR_fchmod = 52,
+    JET_NR_fchmodat = 53,
+    JET_NR_fchownat = 54,
+    JET_NR_fchown = 55,
+    JET_NR_openat = 56,
+    JET_NR_close = 57,
+    JET_NR_vhangup = 58,
+    JET_NR_pipe2 = 59,
+    JET_NR_getdents64 = 61,
+    JET_NR_lseek = 62,
+    JET_NR_read = 63,
+    JET_NR_write = 64,
+    JET_NR_readv = 65,
+    JET_NR_writev = 66,
+    JET_NR_pread64 = 67,
+    JET_NR_pwrite64 = 68,
+    JET_NR_preadv = 69,
+    JET_NR_pwritev = 70,
+    JET_NR_pselect6 = 72,
+    JET_NR_ppoll = 73,
+    JET_NR_readlinkat = 78,
+    JET_NR_newfstatat = 79,
+    JET_NR_fstat = 80,
+    JET_NR_sync = 81,
+    JET_NR_fsync = 82,
+    JET_NR_fdatasync = 83,
+    JET_NR_timer_create = 107,
+    JET_NR_clock_gettime = 113,
+    JET_NR_clock_getres = 114,
+    JET_NR_clock_nanosleep = 115,
+    JET_NR_syslog = 116,
+    JET_NR_ptrace = 117,
+    JET_NR_sched_yield = 124,
+    JET_NR_kill = 129,
+    JET_NR_tkill = 130,
+    JET_NR_tgkill = 131,
+    JET_NR_sigaltstack = 132,
+    JET_NR_rt_sigsuspend = 133,
+    JET_NR_rt_sigaction = 134,
+    JET_NR_rt_sigprocmask = 135,
+    JET_NR_rt_sigpending = 136,
+    JET_NR_rt_sigtimedwait = 137,
+    JET_NR_rt_sigqueueinfo = 138,
+    JET_NR_rt_sigreturn = 139,
+    JET_NR_setpriority = 140,
+    JET_NR_getpriority = 141,
+    JET_NR_reboot = 142,
+    JET_NR_setregid = 143,
+    JET_NR_setgid = 144,
+    JET_NR_setreuid = 145,
+    JET_NR_setuid = 146,
+    JET_NR_getpgid = 155,
+    JET_NR_getsid = 156,
+    JET_NR_setsid = 157,
+    JET_NR_getgroups = 158,
+    JET_NR_uname = 160,
+    JET_NR_getrlimit = 163,
+    JET_NR_setrlimit = 164,
+    JET_NR_getrusage = 165,
+    JET_NR_umask = 166,
+    JET_NR_prctl = 167,
+    JET_NR_gettimeofday = 169,
+    JET_NR_getpid = 172,
+    JET_NR_getppid = 173,
+    JET_NR_getuid = 174,
+    JET_NR_geteuid = 175,
+    JET_NR_getgid = 176,
+    JET_NR_getegid = 177,
+    JET_NR_gettid = 178,
+    JET_NR_sysinfo = 179,
+    JET_NR_mq_open = 180,
+    JET_NR_semget = 190,
+    JET_NR_shmget = 194,
+    JET_NR_socket = 198,
+    JET_NR_socketpair = 199,
+    JET_NR_bind = 200,
+    JET_NR_listen = 201,
+    JET_NR_accept = 202,
+    JET_NR_connect = 203,
+    JET_NR_getsockname = 204,
+    JET_NR_getpeername = 205,
+    JET_NR_sendto = 206,
+    JET_NR_recvfrom = 207,
+    JET_NR_setsockopt = 208,
+    JET_NR_getsockopt = 209,
+    JET_NR_shutdown = 210,
+    JET_NR_sendmsg = 211,
+    JET_NR_recvmsg = 212,
+    JET_NR_readahead = 213,
+    JET_NR_brk = 214,
+    JET_NR_munmap = 215,
+    JET_NR_mremap = 216,
+    JET_NR_clone = 220,
+    JET_NR_execve = 221,
+    JET_NR_mmap = 222,
+    JET_NR_fadvise = 223,
+    JET_NR_mprotect = 226,
+    JET_NR_msync = 227,
+    JET_NR_mlock = 228,
+    JET_NR_munlock = 229,
+    JET_NR_madvise = 233,
+    JET_NR_getrandom = 278,
+    JET_NR_memfd_create = 279,
+    JET_NR_futex = 98,
+    JET_NR_set_tid_address = 96,
+    JET_NR_set_robust_list = 99,
+    JET_NR_get_robust_list = 100,
+    JET_NR_nanosleep = 101,
+    JET_NR_getitimer = 102,
+    JET_NR_setitimer = 103,
+    JET_NR_exit = 93,
+    JET_NR_exit_group = 94
+};
+
+int64_t jet_emulate_linux_syscall(jet_ctx *ctx, jet_cpu *cpu,
+                                  uint64_t nr, uint64_t a0, uint64_t a1,
+                                  uint64_t a2, uint64_t a3, uint64_t a4,
+                                  uint64_t a5) {
+    (void)cpu; (void)a4; (void)a5;
+    switch ((int)nr) {
+    case JET_NR_getpid:  return (int64_t)getpid();
+    case JET_NR_getppid: return (int64_t)getppid();
+    case JET_NR_getuid:  return (int64_t)getuid();
+    case JET_NR_geteuid: return (int64_t)geteuid();
+    case JET_NR_getgid:  return (int64_t)getgid();
+    case JET_NR_getegid: return (int64_t)getegid();
+    case JET_NR_gettid: {
+#if defined(__APPLE__)
+        uint64_t tid=0; pthread_threadid_np(NULL,&tid); return (int64_t)tid;
+#elif defined(__linux__) && defined(SYS_gettid)
+        return (int64_t)syscall(SYS_gettid);
+#else
+        return (int64_t)(uintptr_t)pthread_self();
+#endif
+    }
+    case JET_NR_clock_gettime:
+        return (int64_t)clock_gettime((clockid_t)a0, (struct timespec*)G2H(a1));
+    case JET_NR_clock_getres:
+        return (int64_t)clock_getres((clockid_t)a0, (struct timespec*)G2H(a1));
+    case JET_NR_gettimeofday:
+        return (int64_t)gettimeofday((struct timeval*)G2H(a0), NULL);
+    case JET_NR_nanosleep:
+        return (int64_t)nanosleep((struct timespec*)G2H(a0), (struct timespec*)G2H(a1));
+    case JET_NR_clock_nanosleep:
+        return (int64_t)clock_nanosleep((clockid_t)a0, (int)a1,
+                                        (struct timespec*)G2H(a2), (struct timespec*)G2H(a3));
+    case JET_NR_sched_yield:
+        return (int64_t)sched_yield();
+    case JET_NR_close:
+        return (int64_t)close((int)a0);
+    case JET_NR_read:
+        return (int64_t)read((int)a0, G2H(a1), (size_t)a2);
+    case JET_NR_write:
+        return (int64_t)write((int)a0, G2H(a1), (size_t)a2);
+    case JET_NR_lseek:
+        return (int64_t)lseek((int)a0, (off_t)a1, (int)a2);
+    case JET_NR_openat: {
+        /* Linux openat flags differ slightly; pass through best-effort. */
+        return (int64_t)openat((int)a0, (const char*)G2H(a1), (int)a2, (mode_t)a3);
+    }
+    case JET_NR_fstat:
+        return (int64_t)fstat((int)a0, (struct stat*)G2H(a1));
+    case JET_NR_newfstatat:
+        return (int64_t)fstatat((int)a0, (const char*)G2H(a1), (struct stat*)G2H(a2), (int)a3);
+    case JET_NR_readlinkat:
+        return (int64_t)readlinkat((int)a0, (const char*)G2H(a1), (char*)G2H(a2), (size_t)a3);
+    case JET_NR_faccessat:
+        return (int64_t)faccessat((int)a0, (const char*)G2H(a1), (int)a2, (int)a3);
+    case JET_NR_mmap: {
+        int prot = (int)a2 & ~PROT_EXEC;
+        int flags = (int)a3;
+        void *p = mmap(G2H(a0), (size_t)a1, prot, flags, (int)a4, (off_t)a5);
+        if (p == MAP_FAILED) return -errno;
+        return (int64_t)(uintptr_t)p;
+    }
+    case JET_NR_munmap:
+        return (int64_t)munmap(G2H(a0), (size_t)a1);
+    case JET_NR_mprotect: {
+        int prot = (int)a2 & ~PROT_EXEC;
+        return (int64_t)mprotect(G2H(a0), (size_t)a1, prot);
+    }
+    case JET_NR_madvise:
+#ifdef MADV_DONTNEED
+        return (int64_t)madvise(G2H(a0), (size_t)a1, (int)a2);
+#else
+        (void)a0;(void)a1;(void)a2; return 0;
+#endif
+    case JET_NR_brk:
+        /* Don't support brk heap; return current. */
+        return (int64_t)a0;
+    case JET_NR_uname:
+        return (int64_t)uname((struct utsname*)G2H(a0));
+    case JET_NR_prctl: {
+        jet_args aa = {0};
+        aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4;
+        return (int64_t)h_prctl(ctx, &aa, NULL);
+    }
+    case JET_NR_futex:
+        /* Minimal: FUTEX_WAKE / FUTEX_WAIT no-op / success. Enough for some ctors. */
+        jet_log(ctx, 3, "futex stub nr op=%llx", (unsigned long long)a1);
+        return 0;
+    case JET_NR_set_tid_address:
+        return (int64_t)getpid(); /* pretend */
+    case JET_NR_set_robust_list:
+    case JET_NR_get_robust_list:
+        return 0;
+    case JET_NR_getrandom: {
+        uint8_t *buf = (uint8_t*)G2H(a0);
+        size_t n = (size_t)a1;
+        for (size_t i=0;i<n;i++) buf[i]=(uint8_t)(rand() & 0xff);
+        return (int64_t)n;
+    }
+    case JET_NR_ioctl:
+        return (int64_t)ioctl((int)a0, (unsigned long)a1, (void*)G2H(a2));
+    case JET_NR_fcntl:
+        return (int64_t)fcntl((int)a0, (int)a1, a2);
+    case JET_NR_exit:
+    case JET_NR_exit_group:
+        jet_log(ctx, 0, "guest exit(%d) via SVC", (int)a0);
+        if (cpu) { cpu->stop = 1; cpu->err_code = 0; }
+        return 0;
+    default:
+        jet_log(ctx, 1, "unimplemented Linux syscall %llu", (unsigned long long)nr);
+        errno = ENOSYS;
+        return -ENOSYS;
+    }
+}
+
