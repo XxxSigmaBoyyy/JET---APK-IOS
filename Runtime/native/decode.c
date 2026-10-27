@@ -78,9 +78,22 @@ int jet_decode(uint32_t w, jet_insn *o) {
     if ((w & 0xFFFFFC1Fu) == 0xD61F0000u) { o->op = OP_BR;  o->rn = bits(w, 9, 5); return 0; }
     if ((w & 0xFFFFFC1Fu) == 0xD63F0000u) { o->op = OP_BLR; o->rn = bits(w, 9, 5); return 0; }
     if ((w & 0xFFFFFC1Fu) == 0xD65F0000u) { o->op = OP_RET; o->rn = bits(w, 9, 5); return 0; }
-    /* HINT / NOP */
-    if ((w & 0xFFFFF01Fu) == 0xD503201Fu) { o->op = OP_NOP; return 0; }
-    if ((w & 0xFFFFF000u) == 0xD5032000u) { o->op = OP_HINT; o->uimm = bits(w, 11, 5); return 0; }
+    /* HINT / NOP — all hints (NOP/YIELD/WFE/WFI/SEV/SEVL/BTI/PACIASP/AUTIASP/XPACLRI…) are NOP-safe */
+    if ((w & 0xFFFFF01Fu) == 0xD503201Fu) {
+        unsigned hint = bits(w, 11, 5);
+        o->op = hint == 0 ? OP_NOP : OP_HINT;
+        o->uimm = hint;
+        return 0;
+    }
+    /* Barriers: DMB/DSB/ISB — CRm option in 11:8; opc in 7:5 (100=DSB, 101=DMB, 110=ISB) */
+    if ((w & 0xFFFFF01Fu) == 0xD503301Fu) {
+        unsigned opc = bits(w, 7, 5);
+        o->uimm = bits(w, 11, 8);
+        if (opc == 5) { o->op = OP_DMB; return 0; }
+        if (opc == 4) { o->op = OP_DSB; return 0; }
+        if (opc == 6) { o->op = OP_ISB; return 0; }
+        if (opc == 2) { o->op = OP_CLREX; return 0; } /* CLREX CRm=0 opc=010 */
+    }
     /* SVC / BRK / HLT */
     if ((w & 0xFFE0001Fu) == 0xD4000001u) { o->op = OP_SVC; o->uimm = bits(w, 20, 5); return 0; }
     if ((w & 0xFFE0001Fu) == 0xD4200000u) { o->op = OP_BRK; o->uimm = bits(w, 20, 5); return 0; }
@@ -242,7 +255,34 @@ int jet_decode(uint32_t w, jet_insn *o) {
         return 0;
     }
 
-    /* Exclusive / acquire-release / LDAPR */
+    /* LSE atomic memory ops (LDADD/LDCLR/LDEOR/LDSET/SWP + acquire/release):
+     * size:111000 A R 1 Rs o3 0 opc Rn Rt  — bit21=1, bits29:24=111000 */
+    /* bits11:10 must be 00 (distinguishes from LDR/STR register-offset which uses 10). */
+    if ((w & 0x3F200C00u) == 0x38200000u) {
+        int size = bits(w, 31, 30);
+        int opc = bits(w, 14, 12);
+        int o3 = bit(w, 15); /* SWP when o3=1 and opc=0; else LD* */
+        o->size = (uint8_t)size;
+        o->rd = bits(w, 4, 0);   /* Rt */
+        o->rn = bits(w, 9, 5);
+        o->rm = bits(w, 20, 16); /* Rs */
+        o->opc = (uint8_t)((bit(w, 23) << 1) | bit(w, 22)); /* A:R for ordering */
+        if (o3) {
+            o->op = OP_SWP;
+        } else {
+            switch (opc) {
+            case 0: o->op = OP_LDADD; break;
+            case 1: o->op = OP_LDCLR; break;
+            case 2: o->op = OP_LDEOR; break;
+            case 3: o->op = OP_LDSET; break;
+            /* 100..111: LDSmax/LDSmin/LDUmax/LDUmin — map to LDADD-ish via raw in exec */
+            default: o->op = OP_LDADD; o->imm = opc; break;
+            }
+        }
+        return 0;
+    }
+
+    /* Exclusive / acquire-release / LDAPR / CAS / CASP */
     if ((w & 0x3F000000u) == 0x08000000u) {
         int size = bits(w, 31, 30);
         int L = bit(w, 22);
@@ -265,13 +305,13 @@ int jet_decode(uint32_t w, jet_insn *o) {
         } else if (!L && bits(w, 20, 16) == 0x1F && bits(w, 14, 10) == 0x1F) {
             o->op = OP_STLR;
         } else {
-            /* CAS / SWP / LDADD etc. (LSE) — mark as CAS-ish and decode opc */
-            if ((w & 0x3F20FC00u) == 0x08207C00u || (w & 0x3F208C00u) == 0x08208C00u) {
+            /* CAS / CASP in exclusive group (LSE) */
+            if (bits(w, 21, 21) == 1 && bits(w, 14, 10) == 0x1F) {
                 o->op = OP_CAS; o->opc = (uint8_t)o0;
-            } else if ((w & 0x3F20FC00u) == 0x38208000u) {
-                o->op = OP_SWP;
+            } else if (bits(w, 21, 21) == 1) {
+                o->op = OP_CASP; o->opc = (uint8_t)o0; /* Rt2 = ra */
             } else {
-                o->op = OP_LDADD; /* catch-all; exec looks at raw */
+                o->op = OP_CAS; o->opc = (uint8_t)o0;
             }
         }
         (void)ordered; (void)key;
@@ -420,7 +460,8 @@ int jet_decode(uint32_t w, jet_insn *o) {
     }
     /* Conditional compare */
     /* CCMN/CCMP: sf op S=1 11010010 ... ; S is bit29. Mask drops sf/op. */
-    if ((w & 0x1FE00C10u) == 0x1A400000u && bit(w, 29)) {
+    /* Ignore bit11 so both reg (11:10=00) and imm (11:10=10) forms match. */
+    if ((w & 0x1FE00410u) == 0x1A400000u && bit(w, 29)) {
         o->sf = bit(w, 31);
         o->rn = bits(w,9,5); o->rm = bits(w,20,16);
         o->cond = (uint8_t)bits(w, 15, 12);
@@ -502,6 +543,14 @@ int jet_decode(uint32_t w, jet_insn *o) {
         if ((w & 0xFF20FC00u) == 0x1E206800u) { o->op = OP_FMAXNM; return 0; }
         if ((w & 0xFF20FC00u) == 0x1E207800u) { o->op = OP_FMINNM; return 0; }
     }
+    /* FMOV (scalar, immediate): ftype in 23:22, imm8 in 20:13, Rn=00000, op=100 */
+    if ((w & 0xFF201C00u) == 0x1E201000u && bits(w, 9, 5) == 0) {
+        o->op = OP_FMOV_I;
+        o->size = (uint8_t)bits(w, 23, 22); /* 0=S, 1=D, 3=H */
+        o->rd = bits(w, 4, 0);
+        o->uimm = bits(w, 20, 13); /* imm8 */
+        return 0;
+    }
     /* FP 1-source */
     if ((w & 0xFF3FFC00u) == 0x1E204000u) { o->op = OP_FMOV_F; o->size=bits(w,23,22); o->rd=bits(w,4,0); o->rn=bits(w,9,5); return 0; }
     if ((w & 0xFF3FFC00u) == 0x1E20C000u) { o->op = OP_FABS;  o->size=bits(w,23,22); o->rd=bits(w,4,0); o->rn=bits(w,9,5); return 0; }
@@ -531,15 +580,22 @@ int jet_decode(uint32_t w, jet_insn *o) {
         int rmode = bits(w, 20, 19);
         int opc = bits(w, 18, 16);
         /* FMOV GPR<->FP: rmode=00 opc=110 (to FP) or 111 (to GPR) */
+        /* Opcode polarity matches GNU objdump / llvm (111=to FP, 110=to GPR). */
         if (rmode == 0 && opc == 7) {
-            /* FP → GPR: FMOV Wd,Sn / Xd,Dn */
-            o->op = OP_FMOV_G; o->opc = 1; return 0;
-        }
-        if (rmode == 0 && opc == 6) {
             /* GPR → FP: FMOV Sd,Wn / Dd,Xn */
             o->op = OP_FMOV_G; o->opc = 0; return 0;
         }
-        /* FMOV Vd.D[1],Xn / Xd,Vn.D[1]: rmode=01 opc=110/111, type=10 — skip for now */
+        if (rmode == 0 && opc == 6) {
+            /* FP → GPR: FMOV Wd,Sn / Xd,Dn */
+            o->op = OP_FMOV_G; o->opc = 1; return 0;
+        }
+        /* FMOV Vd.D[1],Xn / Xd,Vn.D[1]: rmode=01 opc=110/111, type=10 */
+        if (rmode == 1 && o->size == 2 && opc == 7) {
+            o->op = OP_FMOV_G; o->opc = 2; return 0; /* Xn → Vd.D[1] (objdump-confirmed) */
+        }
+        if (rmode == 1 && o->size == 2 && opc == 6) {
+            o->op = OP_FMOV_G; o->opc = 3; return 0; /* Vn.D[1] → Xd */
+        }
         if (rmode == 0 && opc == 2) { o->op = OP_SCVTF; return 0; }
         if (rmode == 0 && opc == 3) { o->op = OP_UCVTF; return 0; }
         if (rmode == 3 && opc == 0) { o->op = OP_FCVTZS; return 0; }
@@ -623,15 +679,19 @@ int jet_decode(uint32_t w, jet_insn *o) {
         return 0;
     }
 
-    /* MOVI / ORR-imm / FMOV-imm (ASIMD modified immediate) */
+    /* MOVI / MVNI / ORR-imm / FMOV-imm (ASIMD modified immediate) */
     /* ASIMD modified immediate: bits[11:10]=01; cmode in 15:12 varies */
     if ((w & 0x9FF80400u) == 0x0F000400u) {
-        o->op = OP_MOVI_V;
         o->regsize = bit(w, 30);
         o->rd = bits(w,4,0);
         o->uimm = (bits(w,18,16)<<5) | bits(w,9,5); /* abcdefgh */
         o->opc = bits(w, 15, 12); /* cmode */
         o->size = bit(w, 29); /* op bit */
+        /* cmode=1111: FMOV vector immediate (op=0 → 2S/4S, op=1 → 2D) */
+        if (bits(w, 15, 12) == 0xF)
+            o->op = OP_FMOV_V;
+        else
+            o->op = OP_MOVI_V;
         return 0;
     }
 

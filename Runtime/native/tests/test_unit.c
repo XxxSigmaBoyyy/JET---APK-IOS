@@ -245,6 +245,40 @@ int main(void) {
     }
 
 
+    /* ---- FMOV immediate / barriers ---- */
+    {
+        uint64_t fd = jet_native_sym(lib, "guest_fmov_d10");
+        CHECK(fd != 0, "sym guest_fmov_d10");
+        a.x[0]=0; r=0; double dret = 0;
+        CHECK(jet_native_call(ctx, fd, &a, &r, &dret) == 0, "call guest_fmov_d10");
+        CHECK(dret == 10.0, "guest_fmov_d10 => %g", dret);
+
+        uint64_t fs = jet_native_sym(lib, "guest_fmov_s1");
+        CHECK(fs != 0, "sym guest_fmov_s1");
+        a.x[0]=0; r=0; dret = 0;
+        CHECK(jet_native_call(ctx, fs, &a, &r, &dret) == 0, "call guest_fmov_s1");
+        float f; uint32_t fb; memcpy(&fb, &dret, 4); memcpy(&f, &fb, 4);
+        CHECK(f == 1.0f, "guest_fmov_s1 => %g", (double)f);
+
+        uint64_t db = jet_native_sym(lib, "guest_dmb_ish");
+        CHECK(db != 0, "sym guest_dmb_ish");
+        a.x[0]=0; r=0;
+        CHECK(jet_native_call(ctx, db, &a, &r, NULL) == 0 && r == 7,
+              "guest_dmb_ish => %llu", (unsigned long long)r);
+
+        uint64_t cx = jet_native_sym(lib, "guest_clrex");
+        CHECK(cx != 0, "sym guest_clrex");
+        a.x[0]=0; r=0;
+        CHECK(jet_native_call(ctx, cx, &a, &r, NULL) == 0 && r == 9,
+              "guest_clrex => %llu", (unsigned long long)r);
+
+        uint64_t d1 = jet_native_sym(lib, "guest_fmov_d1_lane");
+        CHECK(d1 != 0, "sym guest_fmov_d1_lane");
+        a.x[0]=0x1122334455667788ull; r=0;
+        CHECK(jet_native_call(ctx, d1, &a, &r, NULL) == 0 && r == 0x1122334455667788ull,
+              "guest_fmov_d1_lane => 0x%llx", (unsigned long long)r);
+    }
+
     /* ---- Soft-fault: JVM-safe SIGSEGV chaining ---- */
     {
         /* Prior SA_SIGINFO handler simulates JVM / -XX:-UseSignalChaining peer. */

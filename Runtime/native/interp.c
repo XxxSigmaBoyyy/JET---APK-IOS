@@ -579,71 +579,191 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
     case OP_LDXR: case OP_LDAXR: case OP_LDAR: case OP_LDLAR: {
         uint64_t addr = (i->rn == 31) ? c->sp : jet_x(c, i->rn);
         uint64_t v = 0;
+        void *p = G2H(addr);
         switch (i->size) {
-        case 0: v = ld1(addr); break;
-        case 1: v = ld2(addr); break;
-        case 2: v = ld4(addr); break;
-        case 3: v = ld8(addr); break;
+        case 0: v = __atomic_load_n((uint8_t *)p, __ATOMIC_ACQUIRE); break;
+        case 1: v = __atomic_load_n((uint16_t *)p, __ATOMIC_ACQUIRE); break;
+        case 2: v = __atomic_load_n((uint32_t *)p, __ATOMIC_ACQUIRE); break;
+        case 3: v = __atomic_load_n((uint64_t *)p, __ATOMIC_ACQUIRE); break;
         }
         jet_set_x(c, i->rd, v);
         if (i->op == OP_LDXR || i->op == OP_LDAXR) {
             pthread_mutex_lock(&ctx->excl_mu);
-            ctx->excl_valid = 1; ctx->excl_addr = addr;
+            ctx->excl_valid = 1; ctx->excl_addr = addr; ctx->excl_val = v;
             pthread_mutex_unlock(&ctx->excl_mu);
         }
         return 0;
     }
     case OP_STXR: case OP_STLXR: case OP_STLR: case OP_STLLR: {
         uint64_t addr = (i->rn == 31) ? c->sp : jet_x(c, i->rn);
+        void *p = G2H(addr);
+        uint64_t v = jet_x(c, i->rd);
         int ok = 1;
         if (i->op == OP_STXR || i->op == OP_STLXR) {
+            /* Emulate exclusive store with host CAS against monitored value. */
             pthread_mutex_lock(&ctx->excl_mu);
             ok = ctx->excl_valid && ctx->excl_addr == addr;
+            uint64_t expected = ctx->excl_val;
             ctx->excl_valid = 0;
             pthread_mutex_unlock(&ctx->excl_mu);
-            jet_set_x(c, i->rm, ok ? 0 : 1); /* Rs = status */
-        }
-        if (ok) {
-            uint64_t v = jet_x(c, i->rd);
+            if (ok) {
+                int success = 0;
+                switch (i->size) {
+                case 0: {
+                    uint8_t e = (uint8_t)expected, n = (uint8_t)v;
+                    success = __atomic_compare_exchange_n((uint8_t *)p, &e, n, 0,
+                                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                    break;
+                }
+                case 1: {
+                    uint16_t e = (uint16_t)expected, n = (uint16_t)v;
+                    success = __atomic_compare_exchange_n((uint16_t *)p, &e, n, 0,
+                                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                    break;
+                }
+                case 2: {
+                    uint32_t e = (uint32_t)expected, n = (uint32_t)v;
+                    success = __atomic_compare_exchange_n((uint32_t *)p, &e, n, 0,
+                                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                    break;
+                }
+                case 3: {
+                    uint64_t e = expected, n = v;
+                    success = __atomic_compare_exchange_n((uint64_t *)p, &e, n, 0,
+                                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                    break;
+                }
+                }
+                ok = success;
+            }
+            jet_set_x(c, i->rm, ok ? 0 : 1);
+        } else {
             switch (i->size) {
-            case 0: st1(addr, (uint8_t)v); break;
-            case 1: st2(addr, (uint16_t)v); break;
-            case 2: st4(addr, (uint32_t)v); break;
-            case 3: st8(addr, v); break;
+            case 0: __atomic_store_n((uint8_t *)p, (uint8_t)v, __ATOMIC_RELEASE); break;
+            case 1: __atomic_store_n((uint16_t *)p, (uint16_t)v, __ATOMIC_RELEASE); break;
+            case 2: __atomic_store_n((uint32_t *)p, (uint32_t)v, __ATOMIC_RELEASE); break;
+            case 3: __atomic_store_n((uint64_t *)p, v, __ATOMIC_RELEASE); break;
             }
         }
         return 0;
     }
-    case OP_CAS: case OP_SWP: case OP_LDADD: case OP_LDCLR: case OP_LDEOR: case OP_LDSET: {
-        /* Minimal LSE: operate as atomic on host (identity map). */
+    case OP_CAS: case OP_CASP: case OP_SWP: case OP_LDADD: case OP_LDCLR:
+    case OP_LDEOR: case OP_LDSET: {
         uint64_t addr = (i->rn == 31) ? c->sp : jet_x(c, i->rn);
+        void *p = G2H(addr);
         uint64_t rs = jet_x(c, i->rm), rt = jet_x(c, i->rd);
-        pthread_mutex_lock(&ctx->excl_mu);
         uint64_t old = 0;
-        switch (i->size) {
-        case 0: old = ld1(addr); break;
-        case 1: old = ld2(addr); break;
-        case 2: old = ld4(addr); break;
-        case 3: old = ld8(addr); break;
+        if (i->op == OP_CASP) {
+            /* Pair CAS: compare (Rs, Rs+1) with mem[addr:addr+sz*2], swap (Rt, Rt+1). */
+            int pair_sz = (i->size == 2) ? 4 : 8; /* W pair or X pair */
+            if (pair_sz == 4) {
+                uint64_t expect = (jet_x(c, i->rm) & 0xffffffffull) |
+                                  ((jet_x(c, i->rm | 1) & 0xffffffffull) << 32);
+                uint64_t desire = (jet_x(c, i->rd) & 0xffffffffull) |
+                                  ((jet_x(c, i->rd | 1) & 0xffffffffull) << 32);
+                uint64_t e = expect;
+                __atomic_compare_exchange_n((uint64_t *)p, &e, desire, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                jet_set_x(c, i->rm, (uint32_t)e);
+                jet_set_x(c, i->rm | 1, (uint32_t)(e >> 32));
+            } else {
+                /* 128-bit: use two 64-bit words under excl mutex (host may lack __int128 atomics). */
+                pthread_mutex_lock(&ctx->excl_mu);
+                uint64_t lo = __atomic_load_n((uint64_t *)p, __ATOMIC_RELAXED);
+                uint64_t hi = __atomic_load_n((uint64_t *)p + 1, __ATOMIC_RELAXED);
+                uint64_t rs0 = jet_x(c, i->rm), rs1 = jet_x(c, i->rm | 1);
+                if (lo == rs0 && hi == rs1) {
+                    __atomic_store_n((uint64_t *)p, jet_x(c, i->rd), __ATOMIC_RELAXED);
+                    __atomic_store_n((uint64_t *)p + 1, jet_x(c, i->rd | 1), __ATOMIC_RELAXED);
+                }
+                jet_set_x(c, i->rm, lo);
+                jet_set_x(c, i->rm | 1, hi);
+                pthread_mutex_unlock(&ctx->excl_mu);
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            }
+            return 0;
         }
-        uint64_t neu = old;
-        if (i->op == OP_CAS) { if (old == rs) neu = rt; }
-        else if (i->op == OP_SWP) neu = rt;
-        else if (i->op == OP_LDADD) neu = old + rs;
-        else if (i->op == OP_LDCLR) neu = old & ~rs;
-        else if (i->op == OP_LDEOR) neu = old ^ rs;
-        else if (i->op == OP_LDSET) neu = old | rs;
         switch (i->size) {
-        case 0: st1(addr, (uint8_t)neu); break;
-        case 1: st2(addr, (uint16_t)neu); break;
-        case 2: st4(addr, (uint32_t)neu); break;
-        case 3: st8(addr, neu); break;
+        case 0: {
+            uint8_t e, n, r;
+            if (i->op == OP_CAS) {
+                e = (uint8_t)rs; n = (uint8_t)rt;
+                __atomic_compare_exchange_n((uint8_t *)p, &e, n, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                old = e;
+            } else if (i->op == OP_SWP) {
+                old = __atomic_exchange_n((uint8_t *)p, (uint8_t)rt, __ATOMIC_ACQ_REL);
+            } else if (i->op == OP_LDADD) {
+                old = __atomic_fetch_add((uint8_t *)p, (uint8_t)rs, __ATOMIC_ACQ_REL);
+            } else if (i->op == OP_LDCLR) {
+                old = __atomic_fetch_and((uint8_t *)p, (uint8_t)~rs, __ATOMIC_ACQ_REL);
+            } else if (i->op == OP_LDEOR) {
+                old = __atomic_fetch_xor((uint8_t *)p, (uint8_t)rs, __ATOMIC_ACQ_REL);
+            } else { /* LDSET */
+                old = __atomic_fetch_or((uint8_t *)p, (uint8_t)rs, __ATOMIC_ACQ_REL);
+            }
+            (void)r;
+            break;
         }
-        jet_set_x(c, i->rd, old); /* Rs/Rt semantics: for CAS Rs compared, Rt written; result to Rs... 
-         * AArch64 CAS: Ws/Xs compared, Wt/Xt stored; Ws/Xs get old. Our rm=Rs, rd=Rt.
-         * Spec: after, Rs gets the loaded value. */
+        case 1: {
+            uint16_t e, n;
+            if (i->op == OP_CAS) {
+                e = (uint16_t)rs; n = (uint16_t)rt;
+                __atomic_compare_exchange_n((uint16_t *)p, &e, n, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                old = e;
+            } else if (i->op == OP_SWP) {
+                old = __atomic_exchange_n((uint16_t *)p, (uint16_t)rt, __ATOMIC_ACQ_REL);
+            } else if (i->op == OP_LDADD) {
+                old = __atomic_fetch_add((uint16_t *)p, (uint16_t)rs, __ATOMIC_ACQ_REL);
+            } else if (i->op == OP_LDCLR) {
+                old = __atomic_fetch_and((uint16_t *)p, (uint16_t)~rs, __ATOMIC_ACQ_REL);
+            } else if (i->op == OP_LDEOR) {
+                old = __atomic_fetch_xor((uint16_t *)p, (uint16_t)rs, __ATOMIC_ACQ_REL);
+            } else {
+                old = __atomic_fetch_or((uint16_t *)p, (uint16_t)rs, __ATOMIC_ACQ_REL);
+            }
+            break;
+        }
+        case 2: {
+            uint32_t e, n;
+            if (i->op == OP_CAS) {
+                e = (uint32_t)rs; n = (uint32_t)rt;
+                __atomic_compare_exchange_n((uint32_t *)p, &e, n, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                old = e;
+            } else if (i->op == OP_SWP) {
+                old = __atomic_exchange_n((uint32_t *)p, (uint32_t)rt, __ATOMIC_ACQ_REL);
+            } else if (i->op == OP_LDADD) {
+                old = __atomic_fetch_add((uint32_t *)p, (uint32_t)rs, __ATOMIC_ACQ_REL);
+            } else if (i->op == OP_LDCLR) {
+                old = __atomic_fetch_and((uint32_t *)p, (uint32_t)~rs, __ATOMIC_ACQ_REL);
+            } else if (i->op == OP_LDEOR) {
+                old = __atomic_fetch_xor((uint32_t *)p, (uint32_t)rs, __ATOMIC_ACQ_REL);
+            } else {
+                old = __atomic_fetch_or((uint32_t *)p, (uint32_t)rs, __ATOMIC_ACQ_REL);
+            }
+            break;
+        }
+        default: {
+            uint64_t e, n;
+            if (i->op == OP_CAS) {
+                e = rs; n = rt;
+                __atomic_compare_exchange_n((uint64_t *)p, &e, n, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                old = e;
+            } else if (i->op == OP_SWP) {
+                old = __atomic_exchange_n((uint64_t *)p, rt, __ATOMIC_ACQ_REL);
+            } else if (i->op == OP_LDADD) {
+                old = __atomic_fetch_add((uint64_t *)p, rs, __ATOMIC_ACQ_REL);
+            } else if (i->op == OP_LDCLR) {
+                old = __atomic_fetch_and((uint64_t *)p, ~rs, __ATOMIC_ACQ_REL);
+            } else if (i->op == OP_LDEOR) {
+                old = __atomic_fetch_xor((uint64_t *)p, rs, __ATOMIC_ACQ_REL);
+            } else {
+                old = __atomic_fetch_or((uint64_t *)p, rs, __ATOMIC_ACQ_REL);
+            }
+            break;
+        }
+        }
+        /* CAS/SWP/LD*: Rs (rm) receives the loaded value; Rt unchanged for CAS. */
         jet_set_x(c, i->rm, old);
-        pthread_mutex_unlock(&ctx->excl_mu);
         return 0;
     }
 
@@ -745,6 +865,13 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
             val = 0x80038003; /* reasonable stub */
         } else if ((i->raw & 0xFFFFFFE0u) == 0xD53B00A0u) { /* DCZID_EL0: no DC ZVA */
             val = 0x10; /* D bit set => DC ZVA prohibited */
+        } else if ((i->raw & 0xFFFFFFE0u) == 0xD53BE000u) { /* CNTFRQ_EL0 */
+            val = 1000000000ull; /* 1 GHz virtual counter freq */
+        } else if ((i->raw & 0xFFFFFFE0u) == 0xD53BD060u) { /* TPIDRRO_EL0 */
+            val = c->tpidr_el0; /* mirror writable TLS; bionic rarely distinguishes */
+        } else if ((i->raw & 0xFFFFFFE0u) == 0xD5300000u) { /* MIDR_EL1 (emulated) */
+            /* Implementer=ARM (0x41), part=Cortex-A53 (0xD03), revision=0 */
+            val = 0x410FD034ull;
         } else {
             jet_log(ctx, 1, "MRS unknown sysreg raw=%08x pc=%llx", i->raw, (unsigned long long)pc);
         }
@@ -764,6 +891,18 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
     case OP_SYS:
         /* DC ZVA etc. — no-op if prohibited */
         return 0;
+    case OP_DMB: case OP_DSB:
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        return 0;
+    case OP_ISB:
+        /* No host I-cache to flush for the interpreter; still seq_cst fence. */
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        return 0;
+    case OP_CLREX:
+        pthread_mutex_lock(&ctx->excl_mu);
+        ctx->excl_valid = 0;
+        pthread_mutex_unlock(&ctx->excl_mu);
+        return 0;
 
     /* ---- FP scalar (minimal) ---- */
     case OP_FMOV_F:
@@ -771,17 +910,73 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
         c->v[i->rd][1] = (i->size == 2) ? c->v[i->rn][1] : 0;
         return 0;
     case OP_FMOV_G: {
-        /* opc 0: GPR→FP, 1: FP→GPR; size 0=S/W 1=D/X */
+        /* opc 0: GPR→FP[0], 1: FP[0]→GPR, 2: GPR→Vd.D[1], 3: Vn.D[1]→GPR */
         if (i->opc == 0) {
             uint64_t v = jet_x(c, i->rn);
             if (i->size == 0) v &= 0xffffffffull;
             c->v[i->rd][0] = v;
             c->v[i->rd][1] = 0;
-        } else {
+        } else if (i->opc == 1) {
             uint64_t v = c->v[i->rn][0];
             if (i->size == 0) v &= 0xffffffffull;
             jet_set_x(c, i->rd, v);
+        } else if (i->opc == 2) {
+            c->v[i->rd][1] = jet_x(c, i->rn);
+        } else { /* opc == 3 */
+            jet_set_x(c, i->rd, c->v[i->rn][1]);
         }
+        return 0;
+    }
+    case OP_FMOV_I: {
+        /* VFPExpandImm(imm8) → H/S/D; upper lanes of Vd zeroed */
+        uint8_t imm8 = (uint8_t)i->uimm;
+        int ftype = i->size; /* 0=S, 1=D, 3=H */
+        int N = (ftype == 1) ? 64 : (ftype == 3) ? 16 : 32;
+        int E = (N == 16) ? 5 : (N == 32) ? 8 : 11;
+        int F = N - E - 1;
+        uint64_t sign = (imm8 >> 7) & 1u;
+        uint64_t bit6 = (imm8 >> 6) & 1u;
+        uint64_t exp = ((1u - bit6) << (E - 1)) |
+                       ((bit6 ? ((1ull << (E - 3)) - 1) : 0) << 2) |
+                       ((imm8 >> 4) & 3u);
+        uint64_t frac = ((uint64_t)(imm8 & 0xF)) << (F - 4);
+        uint64_t bitsv = (sign << (N - 1)) | (exp << F) | frac;
+        if (N < 64) bitsv &= (1ull << N) - 1;
+        c->v[i->rd][0] = bitsv;
+        c->v[i->rd][1] = 0; /* upper 64 zeroed for scalar FMOV */
+        return 0;
+    }
+    case OP_FMOV_V: {
+        /* ASIMD FMOV imm: cmode=1111; op=0 → 32-bit VFPExpand per lane;
+         * op=1 → 64-bit VFPExpand (2D only, Q=1). */
+        uint8_t imm8 = (uint8_t)i->uimm;
+        int opbit = i->size;
+        uint8_t out[16] = {0};
+        if (opbit) {
+            int E = 11, F = 52;
+            uint64_t sign = (imm8 >> 7) & 1u;
+            uint64_t bit6 = (imm8 >> 6) & 1u;
+            uint64_t exp = ((1u - bit6) << (E - 1)) |
+                           ((bit6 ? ((1ull << (E - 3)) - 1) : 0) << 2) |
+                           ((imm8 >> 4) & 3u);
+            uint64_t frac = ((uint64_t)(imm8 & 0xF)) << (F - 4);
+            uint64_t v = (sign << 63) | (exp << F) | frac;
+            memcpy(out, &v, 8);
+            if (i->regsize) memcpy(out + 8, &v, 8);
+        } else {
+            int E = 8, F = 23;
+            uint64_t sign = (imm8 >> 7) & 1u;
+            uint64_t bit6 = (imm8 >> 6) & 1u;
+            uint64_t exp = ((1u - bit6) << (E - 1)) |
+                           ((bit6 ? ((1ull << (E - 3)) - 1) : 0) << 2) |
+                           ((imm8 >> 4) & 3u);
+            uint64_t frac = ((uint64_t)(imm8 & 0xF)) << (F - 4);
+            uint32_t v = (uint32_t)((sign << 31) | (exp << F) | frac);
+            int n = i->regsize ? 4 : 2;
+            for (int k = 0; k < n; k++) memcpy(out + 4 * k, &v, 4);
+        }
+        memcpy(&c->v[i->rd][0], out, 16);
+        if (!i->regsize) c->v[i->rd][1] = 0;
         return 0;
     }
     case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV:
@@ -1478,13 +1673,14 @@ static void jet_fault_forward(int sig, siginfo_t *si, void *uctx) {
     struct sigaction *prev = (sig == SIGBUS) ? &jet_prev_bus : &jet_prev_segv;
     int have = (sig == SIGBUS) ? jet_fault_have_prev_bus : jet_fault_have_prev_segv;
     if (!have) {
-        /* No previous handler recorded — reset to DFL and re-raise. */
+        /* No previous handler — restore DFL and return so the faulting insn
+         * re-executes under SIG_DFL (honest crash). Never raise() here:
+         * SA_NODEFER would re-enter this handler. */
         struct sigaction dfl;
         memset(&dfl, 0, sizeof dfl);
         dfl.sa_handler = SIG_DFL;
         sigemptyset(&dfl.sa_mask);
         sigaction(sig, &dfl, NULL);
-        raise(sig);
         return;
     }
     if (prev->sa_flags & SA_SIGINFO) {
@@ -1493,16 +1689,9 @@ static void jet_fault_forward(int sig, siginfo_t *si, void *uctx) {
     }
     if (prev->sa_handler == SIG_IGN) return;
     if (prev->sa_handler == SIG_DFL || prev->sa_handler == NULL) {
-        /* Reset to DFL and re-raise so the kernel applies default disposition.
-         * Compatible with -XX:-UseSignalChaining (no libjsig wrapper). */
-        struct sigaction dfl, ours;
-        memset(&dfl, 0, sizeof dfl);
-        dfl.sa_handler = SIG_DFL;
-        sigemptyset(&dfl.sa_mask);
-        sigaction(sig, &dfl, &ours);
-        raise(sig);
-        /* If we survive, put ourselves back so later guest entries still work. */
-        sigaction(sig, &ours, NULL);
+        /* Restore prior (DFL) and return; kernel re-delivers on insn re-exec.
+         * Do NOT raise() — SA_NODEFER would recurse into jet_fault_handler. */
+        sigaction(sig, prev, NULL);
         return;
     }
     prev->sa_handler(sig);

@@ -9,7 +9,7 @@ OBJS = $(SRCS:%.c=build/%.o)
 
 .PHONY: all clean test test-unit test-tg ios-syntax check
 
-all: build/libjet_native.a build/test_unit build/test_tg
+all: build/libjet_native.a build/test_unit build/test_tg build/decode_sweep
 
 build:
 	mkdir -p build
@@ -39,7 +39,11 @@ test-unit: build/test_unit
 test-tg: build/test_tg
 	./build/test_tg
 
+build/decode_sweep: tests/decode_sweep.c build/libjet_native.a
+	$(CC) $(CFLAGS) tests/decode_sweep.c -I. -Lbuild -ljet_native $(LDFLAGS) -o $@
+
 test: test-unit test-tg
+
 
 # Ensure core sources are free of Linux-only headers in the public path.
 ios-syntax:

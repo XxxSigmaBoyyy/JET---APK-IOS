@@ -187,3 +187,35 @@ int guest_null_deref(void) {
     volatile int *p = 0;
     return *p;
 }
+
+/* FMOV scalar immediate + barrier smoke tests */
+double guest_fmov_d10(void) {
+    double d;
+    __asm__ volatile("fmov %d0, #10.0" : "=w"(d));
+    return d;
+}
+float guest_fmov_s1(void) {
+    float f;
+    __asm__ volatile("fmov %s0, #1.0" : "=w"(f));
+    return f;
+}
+/* DMB ISH then return 7 — must not undef */
+int guest_dmb_ish(void) {
+    __asm__ volatile("dmb ish" ::: "memory");
+    return 7;
+}
+int guest_clrex(void) {
+    __asm__ volatile("clrex" ::: "memory");
+    return 9;
+}
+
+u64 guest_fmov_d1_lane(u64 hi) {
+    u64 out;
+    __asm__ volatile(
+        "fmov d0, xzr\n"
+        "fmov v0.d[1], %1\n"
+        "fmov %0, v0.d[1]\n"
+        : "=r"(out) : "r"(hi) : "v0"
+    );
+    return out;
+}

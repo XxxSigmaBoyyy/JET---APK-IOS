@@ -102,6 +102,7 @@ typedef enum {
     OP_SVC, OP_BRK, OP_HLT,
     OP_MRS, OP_MSR,
     OP_SYS,                          /* DC ZVA etc. */
+    OP_DMB, OP_DSB, OP_ISB, OP_CLREX,
     /* FP / ASIMD (scalar + common vector) */
     OP_FMOV_I, OP_FMOV_G, OP_FMOV_F,
     OP_FADD, OP_FSUB, OP_FMUL, OP_FDIV, OP_FABS, OP_FNEG, OP_FSQRT,
@@ -245,6 +246,7 @@ struct jet_ctx {
     /* exclusive-monitor (simplified single global) */
     int       excl_valid;
     uint64_t  excl_addr;
+    uint64_t  excl_val;
     pthread_mutex_t excl_mu;
     pthread_mutex_t trap_mu;
 
