@@ -21,10 +21,20 @@ for spec in "iphoneos:arm64-apple-ios17.0" "iphonesimulator:arm64-apple-ios17.0-
     o="$od/$(basename "${f%.c}").o"
     msg=$("$CC" -target "$tgt" -isysroot "$SYSROOT" "${CFLAGS[@]}" -IRuntime/native -c "$f" -o "$o" 2>&1); r=$?
     if [ -n "$msg" ] || [ $r -ne 0 ]; then echo "----- $sdk $f (exit $r)" >> "$LOG"; printf '%s\n' "$msg" >> "$LOG"; fi
-    nerr=$((nerr + $(printf '%s\n' "$msg" | grep -c ': error:'))); nwarn=$((nwarn + $(printf '%s\n' "$msg" | grep -c ': warning:')))
+    nerr=$((nerr + $(printf '%s\n' "$msg" | grep -cE ': (fatal )?error:'))); nwarn=$((nwarn + $(printf '%s\n' "$msg" | grep -c ': warning:')))
     if [ $r -ne 0 ]; then nfail=$((nfail+1)); rc=1; else objs+=("$o"); fi
   done
   [ $nfail -eq 0 ] && xcrun --sdk "$sdk" libtool -static -o "$od/libjet_native.a" "${objs[@]}" >> "$LOG" 2>&1
+  # Probe (info only, never fatal): files that failed only on a missing Linux-only header are re-checked with
+  # empty stand-ins for those headers, so the diagnostics hidden behind the fatal error are visible too.
+  PI="$OUT/probe-include"; mkdir -p "$PI/sys"
+  for h in sys/prctl.h sys/auxv.h sys/sysmacros.h linux/futex.h features.h malloc.h; do mkdir -p "$PI/$(dirname $h)"; : > "$PI/$h"; done
+  for f in $SRCS; do
+    o="$od/$(basename "${f%.c}").o"; [ -f "$o" ] && continue
+    msg=$("$CC" -target "$tgt" -isysroot "$SYSROOT" "${CFLAGS[@]}" -IRuntime/native -I"$PI" -fsyntax-only "$f" 2>&1)
+    echo "----- (info, probe with empty Linux-only headers: sys/prctl.h sys/auxv.h ...) $sdk $f" >> "$LOG"; printf '%s\n' "${msg:-(no further diagnostics)}" >> "$LOG"
+    echo "$sdk probe $f: errors=$(printf '%s\n' "$msg" | grep -cE ': (fatal )?error:') warnings=$(printf '%s\n' "$msg" | grep -c ': warning:')" >> "$SUM"
+  done
   tw=0
   for f in Runtime/native/tests/*.c; do
     msg=$("$CC" -target "$tgt" -isysroot "$SYSROOT" "${CFLAGS[@]}" -IRuntime/native -fsyntax-only "$f" 2>&1)
