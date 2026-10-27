@@ -113,7 +113,7 @@ bash ./configure \
   --openjdk-target=aarch64-apple-ios \
   --with-toolchain-type=clang --with-sysroot="$SYSROOT" \
   --with-boot-jdk="$BOOT_JDK" --with-build-jdk="$BOOT_JDK" \
-  --with-jvm-variants=zero --with-jvm-features=-dtrace,-jvmci,-jfr \
+  --with-jvm-variants=zero --with-jvm-features=-dtrace \
   --with-libffi-include="$W/ffi/include" --with-libffi-lib="$W/ffi/lib" \
   --enable-headless-only=yes --with-freetype=bundled \
   --with-cups-include="$W/cups-$CUPS_VER" --with-fontconfig-include="$INC" \
