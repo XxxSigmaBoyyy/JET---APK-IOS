@@ -1,0 +1,2 @@
+package android.view.animation;
+public class AnimationSet extends Animation { private final java.util.ArrayList<Animation> l = new java.util.ArrayList<>(); public AnimationSet(boolean share) {} public AnimationSet(android.content.Context c, android.util.AttributeSet a) { super(c, a); } public void addAnimation(Animation a) { l.add(a); } public java.util.List<Animation> getAnimations() { return l; } }

@@ -29,22 +29,49 @@ if [[ -d "$SHIM_SRC" ]]; then
   # Fetch platform stub jar once into Vendor if missing (not committed).
   if [[ -z "$AJAR" ]]; then
     mkdir -p "$ROOT/Vendor"
-    # Prefer local proto copy when developing on the box
     if [[ -f /workspace/jet/proto/tools/soot/platforms/android-33/android.jar ]]; then
       cp /workspace/jet/proto/tools/soot/platforms/android-33/android.jar "$ROOT/Vendor/android-33.jar"
       AJAR="$ROOT/Vendor/android-33.jar"
+    else
+      # CI: fetch Android 33 platform android.jar (compile-only stubs; not shipped in the IPA).
+      Z="$ROOT/Vendor/platform-33.zip"
+      echo "fetching Android platform-33 android.jar..."
+      curl -fsSL -o "$Z" "https://dl.google.com/android/repository/platform-33_r02.zip"
+      unzip -qo "$Z" "android-13/android.jar" -d "$ROOT/Vendor/platform-33"
+      # zip layout varies; find android.jar
+      AJAR=$(find "$ROOT/Vendor/platform-33" -name android.jar | head -1)
+      if [[ -n "$AJAR" ]]; then cp "$AJAR" "$ROOT/Vendor/android-33.jar"; AJAR="$ROOT/Vendor/android-33.jar"; fi
+      rm -f "$Z"
     fi
   fi
+  # sqlite-jdbc (Maven Central) if still missing
+  if [[ -z "${SQLITE:-}" ]]; then :; fi
   mkdir -p "$W/shim"
+  # Optional SQLite JDBC (android.database.sqlite shim)
+  SQLITE=""
+  for c in "$ROOT/tools/android/sqlite-jdbc.jar" "$ROOT/Vendor/sqlite-jdbc.jar"; do
+    [[ -f "$c" ]] && SQLITE=$c && break
+  done
+  if [[ -z "$SQLITE" && -f /workspace/jet/proto/tools/sqlite-jdbc.jar ]]; then
+    cp /workspace/jet/proto/tools/sqlite-jdbc.jar "$ROOT/Vendor/sqlite-jdbc.jar"
+    SQLITE="$ROOT/Vendor/sqlite-jdbc.jar"
+  fi
+  if [[ -z "$SQLITE" ]]; then
+    echo "fetching sqlite-jdbc..."
+    curl -fsSL -o "$ROOT/Vendor/sqlite-jdbc.jar"       "https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/3.45.3.0/sqlite-jdbc-3.45.3.0.jar"
+    SQLITE="$ROOT/Vendor/sqlite-jdbc.jar"
+  fi
   CP="$ASM"
   [[ -n "$AJAR" ]] && CP="$AJAR:$CP"
+  [[ -n "$SQLITE" ]] && CP="$SQLITE:$CP"
   set +e
   "$JAVA_HOME/bin/javac" -nowarn --release 21 -cp "$CP" -d "$W/shim" \
-    $(find "$SHIM_SRC" -name '*.java') >"$W/shim-javac.log" 2>&1
+    $(find "$SHIM_SRC" -name '*.java' ! -name 'JetSkia*.java' ! -name 'SkiaInit.java') >"$W/shim-javac.log" 2>&1
   RC=$?
   set -e
   if [[ $RC -eq 0 ]]; then
     "$JAVA_HOME/bin/jar" cf "$V/jvm-app/jetshim.jar" -C "$W/shim" .
+    [[ -n "$SQLITE" ]] && cp "$SQLITE" "$V/jvm-app/"
     echo "shim: OK ($(find "$W/shim" -name '*.class' | wc -l) classes)"
   else
     echo "shim: javac failed (non-fatal for hello smoke); see Vendor leftover log"

@@ -27,3 +27,4 @@ Vendor/JetRuntime/
 Vendor/jre-*/
 Vendor/jni/
 Vendor/jvm-app/
+Runtime/interp/

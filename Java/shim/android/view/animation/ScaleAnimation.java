@@ -1,0 +1,2 @@
+package android.view.animation;
+public class ScaleAnimation extends Animation { public ScaleAnimation(float fx, float tx, float fy, float ty) {} public ScaleAnimation(float a, float b, float c, float d, float px, float py) {} public ScaleAnimation(float a, float b, float c, float d, int pxt, float px, int pyt, float py) {} public ScaleAnimation(android.content.Context c, android.util.AttributeSet a) { super(c, a); } }
