@@ -3,9 +3,6 @@ name: jre-ios (OpenJDK 21 Zero, no JIT)
 on:
   workflow_dispatch:
   workflow_call:
-  push:
-    branches: [ 'm2-*' ]
-    paths: [ 'scripts/jre/**', '.github/workflows/jre-ios.yml' ]
 jobs:
   jre:
     strategy:

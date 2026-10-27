@@ -12,6 +12,7 @@ struct HomeView: View {
     @State private var renaming: AppShortcut?
     @State private var renameText = ""
     @State private var pickerError: String?
+    @State private var console: ConsoleText?
 
     private let columns = [GridItem(.adaptive(minimum: 86, maximum: 110), spacing: 18, alignment: .top)]
 
@@ -63,6 +64,7 @@ struct HomeView: View {
         .fullScreenCover(item: $launching) { s in
             AppHostScreen(shortcut: s, icon: store.icon(for: s), bundle: store.bundleURL(for: s.id))
         }
+        .fullScreenCover(item: $console) { c in JVMConsoleView(title: c.title, text: c.text) }
         .alert("Rename", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
             TextField("Name", text: $renameText)
             Button("Save") { if let r = renaming { store.rename(r.id, to: renameText) }; renaming = nil }
@@ -75,7 +77,9 @@ struct HomeView: View {
         }
         .onOpenURL { url in handle(url) }
         .task {
-            if SmokeTest.shared.isActive {
+            if SmokeTest.shared.isJVMActive {
+                await SmokeTest.shared.runJVM { console = ConsoleText(title: $0, text: $1) }
+            } else if SmokeTest.shared.isActive {
                 await SmokeTest.shared.start(store: store, importer: importer) { launching = $0 }
             }
         }
@@ -128,4 +132,10 @@ struct HomeView: View {
             launching = s
         }
     }
+}
+
+struct ConsoleText: Identifiable {
+    let id = UUID()
+    let title: String
+    let text: String
 }

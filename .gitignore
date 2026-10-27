@@ -23,3 +23,7 @@ dist/
 xcuserdata/
 # optional prebuilt runtime (scripts/fetch_runtime.sh / build_host_lib.sh --install) — never commit
 Vendor/JetRuntime/
+# CI-built JRE / JNI headers / compiled Java staged by scripts/jre/stage_jvm.sh — never commit
+Vendor/jre-*/
+Vendor/jni/
+Vendor/jvm-app/

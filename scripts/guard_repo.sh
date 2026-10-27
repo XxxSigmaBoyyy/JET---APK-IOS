@@ -11,8 +11,8 @@ fail=0
 if git ls-files | grep -Ei '\.(apk|xapk|apks|aab|obb|dex|ipa|p12|pfx|cer|mobileprovision|keystore|jks)$'; then
   echo "::error::Android/iOS packages and signing material must never be committed (files listed above)."; fail=1
 fi
-if git ls-files | grep -E '^(dist|build|Vendor/JetRuntime)/'; then
-  echo "::error::dist/, build/ and Vendor/JetRuntime/ are build outputs and must never be committed."; fail=1
+if git ls-files | grep -E '^(dist|build|Vendor/JetRuntime|Vendor/jre-[a-z]+|Vendor/jni|Vendor/jvm-app)/'; then
+  echo "::error::dist/, build/, Vendor/JetRuntime/ and staged JRE dirs are build outputs and must never be committed."; fail=1
 fi
 PATTERNS=(
   'gh[pousr]_[A-Za-z0-9]{36,}'                  # GitHub classic tokens

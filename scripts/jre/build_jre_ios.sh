@@ -77,6 +77,7 @@ ln -sfn "$W/cups-$CUPS_VER/cups" "$INC/cups"
 ln -sfn "$MACSYSROOT/System/Library/Frameworks/CoreAudio.framework/Headers" "$INC/CoreAudio"
 ln -sfn "$MACSYSROOT/System/Library/Frameworks/IOKit.framework/Headers" "$INC/IOKit"
 BREW=$(brew --prefix)
+command -v autoconf >/dev/null || HOMEBREW_NO_AUTO_UPDATE=1 brew install autoconf >/dev/null
 [ -d "$BREW/include/fontconfig" ] || HOMEBREW_NO_AUTO_UPDATE=1 brew install fontconfig >/dev/null
 ln -sfn "$BREW/include/fontconfig" "$INC/fontconfig"
 # X11 headers: only needed as include path for headless awt; take them from brew libx11/xorgproto

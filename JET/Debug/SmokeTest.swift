@@ -7,13 +7,16 @@ import UIKit
 ///   -JETSmokeAPK <path>          APK to import (relative paths are resolved against the app's home directory)
 ///   -JETSmokeTaps "1,2,0,~TC"    labels to tap in order; "~label" = long press (700 ms)
 ///
-/// Writes Documents/jet-smoke/{NN_<label>.png, log.txt, result.txt}. Inactive without -JETSmokeAPK.
+///   -JETSmokeJVM hello           boot the embedded no-JIT JVM and run dev.jet.Hello (M2 step 1); no APK needed
+///
+/// Writes Documents/jet-smoke/{NN_<label>.png, log.txt, result.txt}. Inactive without -JETSmokeAPK / -JETSmokeJVM.
 @MainActor
 final class SmokeTest {
     static let shared = SmokeTest()
 
     let apk: URL?
     let taps: [String]
+    let jvmMode: String?
     let outDir: URL
     private var started = false
     private var attached = false
@@ -26,12 +29,49 @@ final class SmokeTest {
         } else {
             apk = nil
         }
+        jvmMode = args.string(forKey: "JETSmokeJVM").flatMap { $0.isEmpty ? nil : $0 }
         taps = (args.string(forKey: "JETSmokeTaps") ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         outDir = docs.appendingPathComponent("jet-smoke", isDirectory: true)
     }
 
     var isActive: Bool { apk != nil }
+    var isJVMActive: Bool { jvmMode != nil }
+
+    /// JVM smoke: boot the bundled JRE, run dev.jet.Hello, show the output full screen and capture it.
+    func runJVM(show: @escaping (String, String) -> Void) async {
+        guard let mode = jvmMode, !started else { return }
+        started = true
+        try? FileManager.default.removeItem(at: outDir)
+        try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+        let jvmLog = outDir.appendingPathComponent("jvm.log")
+        note("jvm mode=\(mode) compiled=\(jet_jvm_compiled()) bundled=\(JetJVM.isBundled) home=\(JetJVM.javaHome.path)")
+        let jars = (try? FileManager.default.contentsOfDirectory(at: JetJVM.appJars, includingPropertiesForKeys: nil))?
+            .filter { $0.pathExtension == "jar" }.sorted { $0.path < $1.path } ?? []
+        note("classpath \(jars.map(\.lastPathComponent))")
+        let t0 = ProcessInfo.processInfo.systemUptime
+        let boot = await Task.detached { JetJVM.boot(classpath: jars, log: jvmLog) }.value
+        note(String(format: "boot ok=%@ JNI_CreateJavaVM=%.1f ms err=%@", boot.ok ? "yes" : "no", boot.ms, boot.error))
+        guard boot.ok else {
+            show("JVM boot FAILED", boot.error + "\n\n" + ((try? String(contentsOf: jvmLog)) ?? ""))
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            captureKeyWindow("00_jvm"); finish("FAIL boot: \(boot.error)"); return
+        }
+        let t1 = ProcessInfo.processInfo.systemUptime
+        let r = await Task.detached { JetJVM.callString("dev/jet/Hello", "run", "JET smoke \(mode)") }.value
+        let t2 = ProcessInfo.processInfo.systemUptime
+        note(String(format: "Hello.run ok=%@ in %.1f ms (boot+call %.1f ms)", r.ok ? "yes" : "no", (t2 - t1) * 1000, (t2 - t0) * 1000))
+        for line in r.out.split(separator: "\n") { note("java> \(line)") }
+        show(r.ok ? String(format: "JVM (Zero, no JIT) — boot %.0f ms", boot.ms) : "JVM call FAILED", r.out)
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        captureKeyWindow("00_jvm_hello")
+        finish(r.ok && r.out.contains("Hello from Java") ? "PASS" : "FAIL \(r.out.prefix(200))")
+    }
+
+    private func captureKeyWindow(_ name: String) {
+        let w = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.keyWindow }.first
+        if let w { capture(w, name) } else { note("capture \(name): no key window") }
+    }
 
     private func note(_ s: String) {
         let line = "\(String(format: "%.2f", ProcessInfo.processInfo.systemUptime)) \(s)"
@@ -89,7 +129,7 @@ final class SmokeTest {
     }
 
     private func capture(_ view: UIView, _ name: String) {
-        guard let window = view.window else { note("capture \(name): no window"); return }
+        guard let window = (view as? UIWindow) ?? view.window else { note("capture \(name): no window"); return }
         let img = UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
             window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
         }
