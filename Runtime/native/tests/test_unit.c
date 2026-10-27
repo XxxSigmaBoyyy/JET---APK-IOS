@@ -129,6 +129,54 @@ int main(void) {
           "x8 indirect result {%llu,%llu,%llu}",
           (unsigned long long)big.a, (unsigned long long)big.b, (unsigned long long)big.c);
 
+    /* REV misdecode regression: was UDIV/SDIV with Rm=0 → always 0 (SHA/PBKDF2). */
+    {
+        uint64_t x = 0xdef09abc56781234ull;
+        uint64_t rev = jet_native_sym(lib, "guest_rev64");
+        a.x[0]=x; r=0;
+        CHECK(jet_native_call(ctx, rev, &a, &r, NULL)==0 && r==0x34127856bc9af0deull,
+              "guest_rev64 => 0x%llx", (unsigned long long)r);
+        uint64_t revw = jet_native_sym(lib, "guest_rev32_w");
+        a.x[0]=x; r=0;
+        CHECK(jet_native_call(ctx, revw, &a, &r, NULL)==0 && r==0x34127856ull,
+              "guest_rev32_w => 0x%llx", (unsigned long long)r);
+        uint64_t extr = jet_native_sym(lib, "guest_extr_ror64");
+        a.x[0]=x; r=0;
+        CHECK(jet_native_call(ctx, extr, &a, &r, NULL)==0 && r==0x48d37bc26af159e0ull,
+              "guest_extr_ror64 => 0x%llx", (unsigned long long)r);
+        uint64_t eor = jet_native_sym(lib, "guest_eor_ror23");
+        a.x[0]=x; r=0;
+        CHECK(jet_native_call(ctx, eor, &a, &r, NULL)==0 && r==0x2ed4f301b74d6a98ull,
+              "guest_eor_ror23 => 0x%llx", (unsigned long long)r);
+        uint64_t wadd = jet_native_sym(lib, "guest_w_add_zero_upper");
+        a.x[0]=0xbeefdeadffffffffull; r=0;
+        CHECK(jet_native_call(ctx, wadd, &a, &r, NULL)==0 && r==0x0ull,
+              "guest_w_add_zero_upper (ffffffff+1) => 0x%llx", (unsigned long long)r);
+        a.x[0]=0xbeefdeadffff0000ull; r=0;
+        CHECK(jet_native_call(ctx, wadd, &a, &r, NULL)==0 && r==0xffff0001ull,
+              "guest_w_add_zero_upper upper-cleared => 0x%llx", (unsigned long long)r);
+        /* MOVI.16B byte-replicate + EOR — HMAC ipad/opad (was 64-bit expand). */
+        {
+            uint8_t src[16] = {0}, dst[16] = {0};
+            memcpy(src, "password", 8);
+            uint64_t ipad = jet_native_sym(lib, "guest_hmac_ipad16");
+            a.x[0]=(uint64_t)(uintptr_t)dst; a.x[1]=(uint64_t)(uintptr_t)src; r=0;
+            CHECK(jet_native_call(ctx, ipad, &a, &r, NULL)==0, "call guest_hmac_ipad16");
+            const uint8_t exp_i[16] = {
+                0x46,0x57,0x45,0x45,0x41,0x59,0x44,0x52,
+                0x36,0x36,0x36,0x36,0x36,0x36,0x36,0x36};
+            CHECK(memcmp(dst, exp_i, 16)==0, "guest_hmac_ipad16 bytes");
+            uint64_t opad = jet_native_sym(lib, "guest_hmac_opad16");
+            memset(dst, 0, 16);
+            a.x[0]=(uint64_t)(uintptr_t)dst; a.x[1]=(uint64_t)(uintptr_t)src; r=0;
+            CHECK(jet_native_call(ctx, opad, &a, &r, NULL)==0, "call guest_hmac_opad16");
+            const uint8_t exp_o[16] = {
+                0x2c,0x3d,0x2f,0x2f,0x2b,0x33,0x2e,0x38,
+                0x5c,0x5c,0x5c,0x5c,0x5c,0x5c,0x5c,0x5c};
+            CHECK(memcmp(dst, exp_o, 16)==0, "guest_hmac_opad16 bytes");
+        }
+    }
+
     jet_native_destroy(ctx);
     if (g_fail) { fprintf(stderr, "\n%d FAILURES\n", g_fail); return 1; }
     fprintf(stderr, "\nALL PASS\n");

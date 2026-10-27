@@ -96,3 +96,82 @@ struct guest_big guest_return_big(u64 a, u64 b, u64 c) {
     r.a = a; r.b = b; r.c = c;
     return r;
 }
+
+/* ---- Hypotheses: REV / ROR / EXTR / w-zero-extend ---- */
+u64 guest_rev64(u64 x) {
+    u64 r;
+    __asm__ __volatile__("rev %0, %1" : "=r"(r) : "r"(x));
+    return r;
+}
+u64 guest_ror64(u64 x, int n) {
+    /* Variable ROR via RORV */
+    u64 r;
+    __asm__ __volatile__("ror %0, %1, %2" : "=r"(r) : "r"(x), "r"((u64)(n & 63)));
+    return r;
+}
+u64 guest_extr_ror64(u64 x) {
+    u64 r;
+    __asm__ __volatile__("extr %0, %1, %1, #14" : "=r"(r) : "r"(x));
+    return r;
+}
+u64 guest_rev32_w(u64 x) {
+    u64 r;
+    __asm__ __volatile__("rev %w0, %w1" : "=r"(r) : "r"(x));
+    return r;
+}
+/* Put garbage in upper 32, then ADD W — upper must become 0. */
+u64 guest_w_add_zero_upper(u64 x) {
+    u64 r;
+    __asm__ __volatile__("add %w0, %w1, #1" : "=r"(r) : "r"(x));
+    return r;
+}
+u64 guest_eor_ror23(u64 x) {
+    u64 r;
+    __asm__ __volatile__("eor %0, %1, %1, ror #23" : "=r"(r) : "r"(x));
+    return r;
+}
+
+/* MOVI Vd.16B + EOR — HMAC ipad/opad path (cmode=0xE op=0 must byte-replicate). */
+u64 guest_movi_eor_ipad(u64 lo, u64 hi) {
+    u64 out_lo, out_hi;
+    __asm__ __volatile__(
+        "mov v0.d[0], %2\n\t"
+        "mov v0.d[1], %3\n\t"
+        "movi v2.16b, #0x36\n\t"
+        "eor v0.16b, v0.16b, v2.16b\n\t"
+        "mov %0, v0.d[0]\n\t"
+        "mov %1, v0.d[1]\n\t"
+        : "=r"(out_lo), "=r"(out_hi)
+        : "r"(lo), "r"(hi)
+        : "v0", "v2"
+    );
+    /* Pack: return lo; caller also checks via side buffer if needed.
+       Encode both in return by xoring hi into a known check via returning lo only
+       and writing hi through a pointer would need another arg — return lo,
+       and put hi in a static for the test... Better: use two outputs via pointer. */
+    (void)out_hi;
+    return out_lo;
+}
+/* Write 16-byte ipad result to dst. */
+void guest_hmac_ipad16(void *dst, const void *src) {
+    __asm__ __volatile__(
+        "ldr q0, [%1]\n\t"
+        "movi v2.16b, #0x36\n\t"
+        "eor v0.16b, v0.16b, v2.16b\n\t"
+        "str q0, [%0]\n\t"
+        :
+        : "r"(dst), "r"(src)
+        : "v0", "v2", "memory"
+    );
+}
+void guest_hmac_opad16(void *dst, const void *src) {
+    __asm__ __volatile__(
+        "ldr q0, [%1]\n\t"
+        "movi v2.16b, #0x5c\n\t"
+        "eor v0.16b, v0.16b, v2.16b\n\t"
+        "str q0, [%0]\n\t"
+        :
+        : "r"(dst), "r"(src)
+        : "v0", "v2", "memory"
+    );
+}

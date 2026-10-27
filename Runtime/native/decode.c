@@ -431,9 +431,29 @@ int jet_decode(uint32_t w, jet_insn *o) {
         return 0;
     }
 
-    /* Data-processing 2-source / 1-source / 3-source */
-    if ((w & 0x1FE00000u) == 0x1AC00000u) {
-        o->sf = bit(w, 31);
+    /* Data-processing 1-source BEFORE 2-source: encodings share bits[28:21]=0xAC
+     * but differ in bit30 (1-src=1, 2-src=0). A mask that ignores bit30 matches
+     * REV/RBIT/CLZ as UDIV/SDIV with Rm=0 → result 0 (broke SHA/PBKDF2). */
+    /* 1-source: sf 1 0 11010110 00000 opcode Rn Rd
+     * Mask bits[30:16] only — bits[15:10] are opcode (must not be fixed to 0). */
+    if (((w & 0x3FFF0000u) == 0x1AC00000u) && bit(w, 30) == 1) {
+        if (bits(w, 20, 16) != 0) return -1;
+        o->sf = (uint8_t)bit(w, 31);
+        o->rd = bits(w,4,0); o->rn = bits(w,9,5);
+        switch (bits(w, 15, 10)) {
+        case 0: o->op = OP_RBIT; break;
+        case 1: o->op = OP_REV16; break;
+        case 2: o->op = o->sf ? OP_REV32 : OP_REV; break;
+        case 3: o->op = OP_REV; break;
+        case 4: o->op = OP_CLZ; break;
+        case 5: o->op = OP_CLS; break;
+        default: return -1;
+        }
+        return 0;
+    }
+    /* 2-source: sf 0 0 11010110 Rm opcode Rn Rd — require bit30=0 */
+    if ((w & 0x5FE00000u) == 0x1AC00000u) {
+        o->sf = (uint8_t)bit(w, 31);
         o->rd = bits(w,4,0); o->rn = bits(w,9,5); o->rm = bits(w,20,16);
         int opcode = bits(w, 15, 10);
         switch (opcode) {
@@ -443,22 +463,6 @@ int jet_decode(uint32_t w, jet_insn *o) {
         case 9: o->op = OP_LSRV; break;
         case 10: o->op = OP_ASRV; break;
         case 11: o->op = OP_RORV; break;
-        default: return -1;
-        }
-        return 0;
-    }
-    if ((w & 0x5FFFFC00u) == 0x5AC00000u) {
-        /* 1-source: sf 1 0 11010110 00000 opcode Rn Rd */
-        if (bits(w, 20, 16) != 0) return -1;
-        o->sf = bit(w, 31);
-        o->rd = bits(w,4,0); o->rn = bits(w,9,5);
-        switch (bits(w, 15, 10)) {
-        case 0: o->op = OP_RBIT; break;
-        case 1: o->op = OP_REV16; break;
-        case 2: o->op = o->sf ? OP_REV32 : OP_REV; break;
-        case 3: o->op = OP_REV; break;
-        case 4: o->op = OP_CLZ; break;
-        case 5: o->op = OP_CLS; break;
         default: return -1;
         }
         return 0;

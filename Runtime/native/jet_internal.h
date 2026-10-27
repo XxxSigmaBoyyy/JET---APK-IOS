@@ -254,6 +254,19 @@ struct jet_ctx {
     uint64_t last_trap_pc;
     uint64_t fault_x[8];
     uint64_t fault_sp, fault_lr, fault_pc;
+
+    /* Guest-emulated signal state. NEVER installed on the host process —
+     * the embedding JVM owns SIGSEGV/SIGBUS. */
+    uint8_t  guest_sig_mask[16];          /* rt_sigset, 128-bit */
+    struct {
+        uint64_t handler;                 /* sa_handler / sa_sigaction bits */
+        uint64_t flags;
+        uint8_t  mask[16];
+        int      set;
+    } guest_sig_action[64];
+    uint64_t guest_ss_sp;
+    uint64_t guest_ss_size;
+    int      guest_ss_flags;
 };
 
 /* ---- helpers ---- */

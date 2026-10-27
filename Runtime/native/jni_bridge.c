@@ -193,9 +193,10 @@ static uint64_t jni_trap(jet_ctx *ctx, const jet_args *a, void *user) {
     case JNI_IDX_GetStringUTFLength:
         return (uint64_t)strlen((char*)G2H(a->x[1]));
     case JNI_IDX_GetArrayLength: {
-        /* Our NewByteArray layout: int64 length, then bytes. */
         if (!a->x[1]) return 0;
         int64_t *p = (int64_t*)G2H(a->x[1]);
+        jet_log(ctx, 2, "GetArrayLength(%llx) -> %lld",
+                (unsigned long long)a->x[1], (long long)p[0]);
         return (uint64_t)(int64_t)p[0];
     }
     case JNI_IDX_NewByteArray: {
@@ -208,10 +209,25 @@ static uint64_t jni_trap(jet_ctx *ctx, const jet_args *a, void *user) {
     case JNI_IDX_GetByteArrayElements: {
         uint8_t *p = (uint8_t*)G2H(a->x[1]);
         if (a->x[2]) *(uint8_t*)G2H(a->x[2]) = 0;
+        jet_log(ctx, 2, "GetByteArrayElements(arr=%llx) -> %llx len=%lld",
+                (unsigned long long)a->x[1], (unsigned long long)H2G(p+8),
+                (long long)*(int64_t*)p);
         return H2G(p + 8);
     }
-    case JNI_IDX_ReleaseByteArrayElements:
+    case JNI_IDX_ReleaseByteArrayElements: {
+        /* mode: 0=copy-back+free, 1=JNI_COMMIT copy-back keep, 2=JNI_ABORT discard.
+         * Our Get* returns a pointer into the array body, so copy-back is a no-op
+         * for mode 0/1; still honor ABI. */
+        int mode = (int)a->x[3];
+        uint8_t *arr = a->x[1] ? (uint8_t*)G2H(a->x[1]) : NULL;
+        uint8_t *elems = a->x[2] ? (uint8_t*)G2H(a->x[2]) : NULL;
+        if (arr && elems && (mode == 0 || mode == 1)) {
+            int64_t n = *(int64_t*)arr;
+            if (n > 0 && elems != arr + 8)
+                memcpy(arr + 8, elems, (size_t)n);
+        }
         return 0;
+    }
     case JNI_IDX_GetByteArrayRegion: {
         uint8_t *p = (uint8_t*)G2H(a->x[1]);
         jsize start = (jsize)a->x[2], len = (jsize)a->x[3];

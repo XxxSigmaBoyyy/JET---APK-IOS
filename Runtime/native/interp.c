@@ -1054,24 +1054,36 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
         return 0;
     }
     case OP_MOVI_V: {
-        /* cmode + abcdefgh → replicate */
+        /* cmode + abcdefgh → replicate. i->size holds the op bit (bit29).
+         * cmode=1110 op=0: MOVI Vd.8B/16B, #imm (byte replicate)
+         * cmode=1110 op=1: MOVI Vd.D/2D with per-byte 00/FF expand
+         * cmode=0xxx: 32-bit shifted; cmode=01xx/10xx per ARM ARM. */
         uint8_t imm = (uint8_t)i->uimm;
         uint8_t out[16] = {0};
         int cmode = i->opc;
-        if (cmode == 0xE) { /* 64-bit MOVI expanded from bits */
-            uint64_t v = 0;
-            for (int b = 0; b < 8; b++) if (imm & (1u << b)) v |= 0xFFull << (8*b);
-            memcpy(out, &v, 8);
-            if (i->regsize) memcpy(out+8, &v, 8);
+        int opbit = i->size; /* decode stored bit29 here for MOVI */
+        if (cmode == 0xE) {
+            if (opbit) {
+                /* 64-bit expanded imm8 → each bit selects 0x00 or 0xFF in that byte */
+                uint64_t v = 0;
+                for (int b = 0; b < 8; b++) if (imm & (1u << b)) v |= 0xFFull << (8*b);
+                memcpy(out, &v, 8);
+                if (i->regsize) memcpy(out+8, &v, 8);
+            } else {
+                /* byte replicate — used by HMAC ipad/opad (movi vN.16b, #0x36/#0x5c) */
+                memset(out, imm, i->regsize ? 16 : 8);
+            }
         } else if ((cmode & 0xC) == 0x0) { /* 32-bit shifted */
             uint32_t v = (uint32_t)imm << (8 * ((cmode >> 1) & 3));
             for (int k = 0; k < (i->regsize?4:2); k++) memcpy(out+4*k, &v, 4);
         } else if ((cmode & 0xC) == 0x4) {
             uint16_t v = (uint16_t)(imm << (8 * ((cmode >> 1) & 1)));
             for (int k = 0; k < (i->regsize?8:4); k++) memcpy(out+2*k, &v, 2);
-        } else if (cmode == 0xE && 0) {
+        } else if ((cmode & 0xE) == 0xC) {
+            /* cmode=110x: 32-bit shifting ones (MVNI-ish forms); approximate as shifted */
+            uint32_t v = (uint32_t)imm << (8 * ((cmode >> 1) & 1));
+            for (int k = 0; k < (i->regsize?4:2); k++) memcpy(out+4*k, &v, 4);
         } else {
-            /* byte replicate (cmode=1110 op=0) already handled; fallback fill */
             memset(out, imm, i->regsize ? 16 : 8);
         }
         memcpy(&c->v[i->rd][0], out, 16);
@@ -1355,17 +1367,38 @@ static int dispatch_stub(jet_ctx *ctx, jet_cpu *c, int idx) {
 }
 
 
-/* Soft-fault guest memory accesses: SIGSEGV/SIGBUS → stop with error. */
+/* Soft-fault guest memory accesses: SIGSEGV/SIGBUS → stop with error.
+ * CRITICAL: chain to the previous handler when inactive. Never reset to
+ * SIG_DFL — the embedding JVM owns SIGSEGV/SIGBUS (null checks, safepoints).
+ * Guest sigaction/signal/sigaltstack/pthread_sigmask are emulated in
+ * host_bionic and must never install handlers on the host process. */
 static __thread sigjmp_buf jet_fault_jmp;
 static __thread volatile int jet_fault_active;
 static __thread jet_cpu *jet_fault_cpu;
 static __thread jet_ctx *jet_fault_ctx;
+static struct sigaction jet_prev_segv, jet_prev_bus;
+
+static void jet_chain_prev_fault(int sig, siginfo_t *si, void *uctx) {
+    struct sigaction *prev = (sig == SIGBUS) ? &jet_prev_bus : &jet_prev_segv;
+    if (prev->sa_flags & SA_SIGINFO) {
+        if (prev->sa_sigaction) prev->sa_sigaction(sig, si, uctx);
+        return;
+    }
+    if (prev->sa_handler == SIG_IGN) return;
+    if (prev->sa_handler == SIG_DFL || prev->sa_handler == NULL) {
+        /* Re-raise with default disposition without permanently clobbering
+         * whatever was installed after us: temporarily install DFL, raise,
+         * then re-install ourselves is unsafe from a handler. Best-effort:
+         * unblock and re-raise; if we return, continue. */
+        raise(sig);
+        return;
+    }
+    prev->sa_handler(sig);
+}
 
 static void jet_fault_handler(int sig, siginfo_t *si, void *uctx) {
-    (void)uctx;
     if (!jet_fault_active || !jet_fault_cpu) {
-        signal(sig, SIG_DFL);
-        raise(sig);
+        jet_chain_prev_fault(sig, si, uctx);
         return;
     }
     if (jet_fault_ctx) {
@@ -1400,8 +1433,9 @@ static void jet_fault_ensure_installed(void) {
     sa.sa_sigaction = jet_fault_handler;
     sa.sa_flags = SA_SIGINFO | SA_NODEFER;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS, &sa, NULL);
+    /* Save JVM (or prior) handlers so we can chain when inactive. */
+    sigaction(SIGSEGV, &sa, &jet_prev_segv);
+    sigaction(SIGBUS, &sa, &jet_prev_bus);
 }
 
 int jet_interp_run(jet_ctx *ctx, jet_cpu *cpu) {

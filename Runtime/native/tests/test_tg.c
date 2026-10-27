@@ -211,8 +211,7 @@ int main(int argc, char **argv) {
         }
         ctx->last_error[0] = 0;
         if (aes) {
-            /* aesIgeEncryption(JNIEnv*,jobject, ByteBuffer, byte[] key, byte[] iv, boolean, boolean, int, int)
-             * Export is the Java_* form; pass fake direct-buffer wrap + key/iv arrays. */
+            /* aesIgeEncryption(JNIEnv*,jclass, ByteBuffer, byte[] key, byte[] iv, boolean encrypt, int offset, int length) */
             enum { K=32, IV=32, N=64 };
             uint8_t *key = calloc(1, 8+K); *(int64_t*)key = K;
             uint8_t *iv  = calloc(1, 8+IV); *(int64_t*)iv = IV;
@@ -227,14 +226,17 @@ int main(int argc, char **argv) {
             a.x[3]=(uint64_t)(uintptr_t)key;
             a.x[4]=(uint64_t)(uintptr_t)iv;
             a.x[5]=1; /* encrypt */
-            a.x[6]=0; /* changeByteBuffer=false → use offset/length */
-            a.x[7]=0; /* length? depends on sig — may be on stack */
-            uint64_t stack[4]={0,0,(uint64_t)N,0};
-            a.stack = stack;
+            a.x[6]=0; /* offset */
+            a.x[7]=N; /* length */
             uint64_t r=0;
-            int rc2 = jet_native_call_ex(ctx, aes, &a, 4, &r, NULL);
+            int rc2 = jet_native_call(ctx, aes, &a, &r, NULL);
             fprintf(stderr, "call Utilities.aesIgeEncryption rc=%d ret=%llu err='%s'\n",
                     rc2, (unsigned long long)r, jet_native_last_error(ctx));
+            if (rc2 == 0) {
+                fprintf(stderr, "  aes ct:");
+                for (int i=0;i<16;i++) fprintf(stderr, " %02x", raw[i]);
+                fprintf(stderr, "\n");
+            }
         }
         ctx->last_error[0] = 0;
         if (pbk) {

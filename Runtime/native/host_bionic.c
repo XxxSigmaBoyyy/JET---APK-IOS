@@ -123,7 +123,9 @@ static uint64_t h_posix_memalign(jet_ctx *c, const jet_args *a, void *u){
     if (r==0) *(uint64_t*)G2H(a->x[0]) = H2G(p);
     return (uint64_t)(int64_t)r;
 }
-static uint64_t h_memcpy(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return H2G(memcpy(G2H(a->x[0]),G2H(a->x[1]),(size_t)a->x[2])); }
+static uint64_t h_memcpy(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u; return H2G(memcpy(G2H(a->x[0]),G2H(a->x[1]),(size_t)a->x[2]));
+}
 static uint64_t h_memmove(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return H2G(memmove(G2H(a->x[0]),G2H(a->x[1]),(size_t)a->x[2])); }
 static uint64_t h_memset(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return H2G(memset(G2H(a->x[0]),(int)a->x[1],(size_t)a->x[2])); }
 static uint64_t h_memcmp(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)memcmp(G2H(a->x[0]),G2H(a->x[1]),(size_t)a->x[2]); }
@@ -738,6 +740,18 @@ static void reg(jet_ctx *ctx, const char *n, jet_host_fn f){ jet_native_register
 static void regf64(jet_ctx *ctx, const char *n, jet_host_fn f){ jet_native_register_host_ex(ctx,n,f,NULL,JET_HOST_RET_F64); }
 static void regf32(jet_ctx *ctx, const char *n, jet_host_fn f){ jet_native_register_host_ex(ctx,n,f,NULL,JET_HOST_RET_F32); }
 
+
+/* Forward decls: guest signal emulation (defs later; never touch host). */
+static uint64_t h_guest_sigemptyset(jet_ctx *c, const jet_args *a, void *u);
+static uint64_t h_guest_sigfillset(jet_ctx *c, const jet_args *a, void *u);
+static uint64_t h_guest_sigaddset(jet_ctx *c, const jet_args *a, void *u);
+static uint64_t h_guest_sigismember(jet_ctx *c, const jet_args *a, void *u);
+static uint64_t h_guest_sigaction(jet_ctx *c, const jet_args *a, void *u);
+static uint64_t h_guest_signal(jet_ctx *c, const jet_args *a, void *u);
+static uint64_t h_guest_sigaltstack(jet_ctx *c, const jet_args *a, void *u);
+static uint64_t h_guest_sigprocmask(jet_ctx *c, const jet_args *a, void *u);
+static uint64_t h_guest_pthread_sigmask(jet_ctx *c, const jet_args *a, void *u);
+
 int jet_host_install_bionic(jet_ctx *ctx) {
     jet_sf[0]=stdin; jet_sf[1]=stdout; jet_sf[2]=stderr;
     jet_native_register_data(ctx, "__sF", jet_sf);
@@ -825,7 +839,7 @@ int jet_host_install_bionic(jet_ctx *ctx) {
     reg(ctx,"pthread_rwlock_rdlock",h_pthread_rwlock_rdlock);
     reg(ctx,"pthread_rwlock_wrlock",h_pthread_rwlock_wrlock);
     reg(ctx,"pthread_rwlock_unlock",h_pthread_rwlock_unlock);
-    reg(ctx,"pthread_sigmask",h_stub0);
+    reg(ctx,"pthread_sigmask",h_guest_pthread_sigmask);
     reg(ctx,"pthread_setschedparam",h_stub0);
 
     reg(ctx,"qsort",h_qsort); reg(ctx,"bsearch",h_bsearch);
@@ -920,8 +934,12 @@ int jet_host_install_bionic(jet_ctx *ctx) {
     reg(ctx,"chmod",h_stub0); reg(ctx,"fchmod",h_stub0); reg(ctx,"fchown",h_stub0);
     reg(ctx,"ftruncate",h_stub0); reg(ctx,"fsync",h_stub0);
     reg(ctx,"opendir",h_stub0); reg(ctx,"readdir",h_stub0); reg(ctx,"closedir",h_stub0);
-    reg(ctx,"sigaction",h_stub0); reg(ctx,"sigemptyset",h_stub0); reg(ctx,"sigfillset",h_stub0);
-    reg(ctx,"sigaddset",h_stub0); reg(ctx,"tgkill",h_stub0);
+    reg(ctx,"sigaction",h_guest_sigaction); reg(ctx,"sigemptyset",h_guest_sigemptyset);
+    reg(ctx,"sigfillset",h_guest_sigfillset); reg(ctx,"sigaddset",h_guest_sigaddset);
+    reg(ctx,"sigismember",h_guest_sigismember);
+    reg(ctx,"signal",h_guest_signal); reg(ctx,"bsd_signal",h_guest_signal);
+    reg(ctx,"sigprocmask",h_guest_sigprocmask); reg(ctx,"sigaltstack",h_guest_sigaltstack);
+    reg(ctx,"tgkill",h_stub0);
     reg(ctx,"android_set_abort_message",h_stub0);
     reg(ctx,"__assert2",h_abort);
 
@@ -1092,6 +1110,125 @@ enum {
     JET_NR_exit_group = 94
 };
 
+/* ---- Guest signal emulation (never touch host handlers/masks) ---- */
+/* Linux AArch64 sigaction layout (roughly): handler, flags, restorer, mask[16]. */
+typedef struct {
+    uint64_t handler;
+    uint64_t flags;
+    uint64_t restorer;
+    uint8_t  mask[16];
+} jet_guest_sigaction;
+
+static uint64_t h_guest_sigemptyset(jet_ctx *c, const jet_args *a, void *u) {
+    (void)c;(void)u;
+    if (a->x[0]) memset(G2H(a->x[0]), 0, 16);
+    return 0;
+}
+static uint64_t h_guest_sigfillset(jet_ctx *c, const jet_args *a, void *u) {
+    (void)c;(void)u;
+    if (a->x[0]) memset(G2H(a->x[0]), 0xff, 16);
+    return 0;
+}
+static uint64_t h_guest_sigaddset(jet_ctx *c, const jet_args *a, void *u) {
+    (void)c;(void)u;
+    if (!a->x[0]) return 0;
+    int sig = (int)a->x[1];
+    if (sig < 1 || sig > 128) { errno = EINVAL; return (uint64_t)(int64_t)-1; }
+    uint8_t *set = (uint8_t*)G2H(a->x[0]);
+    set[(sig-1)/8] |= (uint8_t)(1u << ((sig-1)%8));
+    return 0;
+}
+static uint64_t h_guest_sigismember(jet_ctx *c, const jet_args *a, void *u) {
+    (void)c;(void)u;
+    if (!a->x[0]) return 0;
+    int sig = (int)a->x[1];
+    if (sig < 1 || sig > 128) return 0;
+    uint8_t *set = (uint8_t*)G2H(a->x[0]);
+    return (set[(sig-1)/8] & (1u << ((sig-1)%8))) ? 1 : 0;
+}
+
+static uint64_t h_guest_sigaction(jet_ctx *c, const jet_args *a, void *u) {
+    (void)u;
+    int sig = (int)a->x[0];
+    const jet_guest_sigaction *act = a->x[1] ? (const jet_guest_sigaction*)G2H(a->x[1]) : NULL;
+    jet_guest_sigaction *oact = a->x[2] ? (jet_guest_sigaction*)G2H(a->x[2]) : NULL;
+    if (sig < 1 || sig >= 64) { errno = EINVAL; return (uint64_t)(int64_t)-1; }
+    if (oact) {
+        memset(oact, 0, sizeof *oact);
+        if (c->guest_sig_action[sig].set) {
+            oact->handler = c->guest_sig_action[sig].handler;
+            oact->flags = c->guest_sig_action[sig].flags;
+            memcpy(oact->mask, c->guest_sig_action[sig].mask, 16);
+        }
+    }
+    if (act) {
+        c->guest_sig_action[sig].handler = act->handler;
+        c->guest_sig_action[sig].flags = act->flags;
+        memcpy(c->guest_sig_action[sig].mask, act->mask, 16);
+        c->guest_sig_action[sig].set = 1;
+    }
+    /* Intentionally do NOT call host sigaction — JVM owns SIGSEGV/SIGBUS. */
+    return 0;
+}
+
+static uint64_t h_guest_signal(jet_ctx *c, const jet_args *a, void *u) {
+    (void)u;
+    int sig = (int)a->x[0];
+    uint64_t handler = a->x[1];
+    if (sig < 1 || sig >= 64) { errno = EINVAL; return (uint64_t)(int64_t)-1; }
+    uint64_t prev = c->guest_sig_action[sig].set ? c->guest_sig_action[sig].handler : 0;
+    c->guest_sig_action[sig].handler = handler;
+    c->guest_sig_action[sig].flags = 0;
+    memset(c->guest_sig_action[sig].mask, 0, 16);
+    c->guest_sig_action[sig].set = 1;
+    return prev;
+}
+
+static uint64_t h_guest_sigaltstack(jet_ctx *c, const jet_args *a, void *u) {
+    (void)u;
+    /* stack_t: ss_sp, ss_flags, ss_size (Linux aarch64) */
+    typedef struct { uint64_t ss_sp; int ss_flags; int _pad; uint64_t ss_size; } jet_stack_t;
+    const jet_stack_t *ss = a->x[0] ? (const jet_stack_t*)G2H(a->x[0]) : NULL;
+    jet_stack_t *oss = a->x[1] ? (jet_stack_t*)G2H(a->x[1]) : NULL;
+    if (oss) {
+        memset(oss, 0, sizeof *oss);
+        oss->ss_sp = c->guest_ss_sp;
+        oss->ss_size = c->guest_ss_size;
+        oss->ss_flags = c->guest_ss_flags;
+    }
+    if (ss) {
+        c->guest_ss_sp = ss->ss_sp;
+        c->guest_ss_size = ss->ss_size;
+        c->guest_ss_flags = ss->ss_flags;
+    }
+    return 0;
+}
+
+static uint64_t h_guest_sigprocmask(jet_ctx *c, const jet_args *a, void *u) {
+    (void)u;
+    int how = (int)a->x[0];
+    const uint8_t *set = a->x[1] ? (const uint8_t*)G2H(a->x[1]) : NULL;
+    uint8_t *oldset = a->x[2] ? (uint8_t*)G2H(a->x[2]) : NULL;
+    if (oldset) memcpy(oldset, c->guest_sig_mask, 16);
+    if (set) {
+        if (how == 0 /* SIG_BLOCK */) {
+            for (int i=0;i<16;i++) c->guest_sig_mask[i] |= set[i];
+        } else if (how == 1 /* SIG_UNBLOCK */) {
+            for (int i=0;i<16;i++) c->guest_sig_mask[i] &= (uint8_t)~set[i];
+        } else if (how == 2 /* SIG_SETMASK */) {
+            memcpy(c->guest_sig_mask, set, 16);
+        } else {
+            errno = EINVAL; return (uint64_t)(int64_t)-1;
+        }
+    }
+    return 0;
+}
+
+static uint64_t h_guest_pthread_sigmask(jet_ctx *c, const jet_args *a, void *u) {
+    /* Same guest-mask semantics; never call host pthread_sigmask. */
+    return h_guest_sigprocmask(c, a, u);
+}
+
 int64_t jet_emulate_linux_syscall(jet_ctx *ctx, jet_cpu *cpu,
                                   uint64_t nr, uint64_t a0, uint64_t a1,
                                   uint64_t a2, uint64_t a3, uint64_t a4,
@@ -1121,9 +1258,46 @@ int64_t jet_emulate_linux_syscall(jet_ctx *ctx, jet_cpu *cpu,
         return (int64_t)gettimeofday((struct timeval*)G2H(a0), NULL);
     case JET_NR_nanosleep:
         return (int64_t)nanosleep((struct timespec*)G2H(a0), (struct timespec*)G2H(a1));
-    case JET_NR_clock_nanosleep:
-        return (int64_t)clock_nanosleep((clockid_t)a0, (int)a1,
-                                        (struct timespec*)G2H(a2), (struct timespec*)G2H(a3));
+    case JET_NR_clock_nanosleep: {
+        /* Darwin has no clock_nanosleep. Emulate with nanosleep.
+         * TIMER_ABSTIME: sleep until absolute time on clockid. */
+#ifndef TIMER_ABSTIME
+#define TIMER_ABSTIME 1
+#endif
+        int flags = (int)a1;
+        const struct timespec *req = (const struct timespec *)G2H(a2);
+        struct timespec *rem = a3 ? (struct timespec *)G2H(a3) : NULL;
+        if (!req) { errno = EFAULT; return -1; }
+#if defined(__APPLE__)
+        if (flags & TIMER_ABSTIME) {
+            for (;;) {
+                struct timespec now, delta;
+                if (clock_gettime((clockid_t)a0, &now) != 0) return -1;
+                delta.tv_sec = req->tv_sec - now.tv_sec;
+                delta.tv_nsec = req->tv_nsec - now.tv_nsec;
+                if (delta.tv_nsec < 0) { delta.tv_sec--; delta.tv_nsec += 1000000000L; }
+                if (delta.tv_sec < 0 || (delta.tv_sec == 0 && delta.tv_nsec <= 0))
+                    return 0;
+                int rc = nanosleep(&delta, NULL);
+                if (rc == 0) return 0;
+                if (errno != EINTR) return -1;
+                /* EINTR: recompute remaining absolute delta */
+            }
+        } else {
+            struct timespec left = *req;
+            for (;;) {
+                struct timespec out;
+                int rc = nanosleep(&left, &out);
+                if (rc == 0) { if (rem) { rem->tv_sec = 0; rem->tv_nsec = 0; } return 0; }
+                if (errno != EINTR) return -1;
+                left = out;
+                if (rem) *rem = out;
+            }
+        }
+#else
+        return (int64_t)clock_nanosleep((clockid_t)a0, flags, req, rem);
+#endif
+    }
     case JET_NR_sched_yield:
         return (int64_t)sched_yield();
     case JET_NR_close:
@@ -1208,6 +1382,28 @@ int64_t jet_emulate_linux_syscall(jet_ctx *ctx, jet_cpu *cpu,
         nanosleep(&ts, NULL);
         return 0;
     }
+    case JET_NR_sigaltstack: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1;
+        return (int64_t)h_guest_sigaltstack(ctx, &aa, NULL);
+    }
+    case JET_NR_rt_sigaction: {
+        /* a0=sig, a1=act, a2=oact, a3=sigsetsize — ignore size */
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2;
+        return (int64_t)h_guest_sigaction(ctx, &aa, NULL);
+    }
+    case JET_NR_rt_sigprocmask: {
+        jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2;
+        return (int64_t)h_guest_sigprocmask(ctx, &aa, NULL);
+    }
+    case JET_NR_rt_sigpending:
+        if (a0) memset(G2H(a0), 0, a1 ? (size_t)a1 : 16);
+        return 0;
+    case JET_NR_rt_sigsuspend:
+    case JET_NR_rt_sigtimedwait:
+    case JET_NR_rt_sigqueueinfo:
+    case JET_NR_rt_sigreturn:
+        /* No host delivery — report as if no signal pending / success. */
+        return 0;
     case JET_NR_exit:
     case JET_NR_exit_group:
         jet_log(ctx, 0, "guest exit(%d) via SVC", (int)a0);
