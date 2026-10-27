@@ -41,7 +41,7 @@ if [[ ! -f "$JLIB/fontconfig.properties" && ! -f "$JLIB/fontconfig.bfc" ]]; then
     done
   } > "$JLIB/fontconfig.properties.in"
 fi
-cp "$JAVA_HOME/include/jni.h" "$JAVA_HOME/include/darwin/jni_md.h" "$V/jni/"
+cp "$JAVA_HOME/include/jni.h" "$JAVA_HOME/include/jvmti.h" "$JAVA_HOME/include/darwin/jni_md.h" "$V/jni/"   # jvmti.h: jet_jni_bridge FindClass/RegisterNatives override
 
 ASM="$ROOT/tools/asm/asm-9.7.jar:$ROOT/tools/asm/asm-tree-9.7.jar"
 # dex2jar v2.4 (Apache-2.0) runtime pieces for the per-class DEX->JVM loader (jet.dex.DexClassLoader); never committed.
