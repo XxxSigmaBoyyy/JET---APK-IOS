@@ -267,6 +267,16 @@ static int register_natives_class(JNIEnv *env) {
     return (*env)->RegisterNatives(env, c, m, (jint)(sizeof m / sizeof m[0]));
 }
 
+static int g_log_level = 2;
+static void jet_bridge_log(void *user, int level, const char *msg) {
+    (void)user;
+    if (level > g_log_level) return;
+    static const char *L[] = {"E","W","I","D"};
+    fprintf(stderr, "[jet:%s] %s\n", L[level < 0 ? 0 : (level > 3 ? 3 : level)], msg);
+}
+
+static void jet_bridge_dump_stats(void) { if (g_ctx) jet_native_dump_stats(g_ctx); }
+
 int32_t jet_jni_bridge_init(char *err, int32_t errlen) {
     /* libjvm is dlopen'd by jetjvm.c — do not link JNI_GetCreatedJavaVMs. */
     JavaVM *vm = (JavaVM *)jet_jvm_vm();
@@ -274,7 +284,12 @@ int32_t jet_jni_bridge_init(char *err, int32_t errlen) {
         snprintf(err, errlen, "no JavaVM (boot JVM first)"); return -1;
     }
     g_vm = vm;
-    g_ctx = jet_native_create(NULL);
+    /* Guest log filter: per-trap [jet:D] lines cost a format + stderr write on every host call. Default: info and above;
+       JET_LOG_LEVEL=3 restores the full trap trace. */
+    { const char *lv = getenv("JET_LOG_LEVEL"); g_log_level = lv ? atoi(lv) : 2; }
+    jet_config cfg; memset(&cfg, 0, sizeof cfg); cfg.log = jet_bridge_log;
+    g_ctx = jet_native_create(&cfg);
+    { const char *st = getenv("JET_NATIVE_STATS"); if (g_ctx && st && *st && *st != '0') atexit(jet_bridge_dump_stats); }
     JNIEnv *env = NULL;
     if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
         if ((*vm)->AttachCurrentThread(vm, (void **)&env, NULL) != JNI_OK) {

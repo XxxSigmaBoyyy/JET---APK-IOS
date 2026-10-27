@@ -98,7 +98,33 @@ public final class Natives {
     /** The first native method an app called, for diagnostics (null until then). */
     public static volatile String firstCall;
 
+    /** -Djet.natives.stats=true: wall time spent inside each guest JNI method (per thread), printed at exit. */
+    static final boolean STATS = Boolean.getBoolean("jet.natives.stats");
+    static final ConcurrentHashMap<String, long[]> STAT = new ConcurrentHashMap<>();
+    static {
+        if (STATS) Runtime.getRuntime().addShutdownHook(new Thread(Natives::dumpStats, "jet-natives-stats"));
+    }
+    public static void dumpStats() {
+        java.util.List<java.util.Map.Entry<String, long[]>> l = new java.util.ArrayList<>(STAT.entrySet());
+        l.sort((x, y) -> Long.compare(y.getValue()[1], x.getValue()[1]));
+        System.err.println("[jet.natives] stats: top guest JNI time (thread | method | calls | ms)");
+        for (int i = 0; i < Math.min(25, l.size()); i++)
+            System.err.println("[jet.natives]   " + l.get(i).getKey() + " | " + l.get(i).getValue()[0] + " | " + l.get(i).getValue()[1] / 1000000);
+    }
+
     public static Object jni(Class<?> owner, String name, String desc, Object self, Object[] args) {
+        if (!STATS) return jni0(owner, name, desc, self, args);
+        long t0 = System.nanoTime();
+        try { return jni0(owner, name, desc, self, args); }
+        finally {
+            long dt = System.nanoTime() - t0; String t = Thread.currentThread().getName();
+            if (t.startsWith("DispatchQueuePool")) t = "DispatchQueuePool*";
+            long[] a = STAT.computeIfAbsent(t + " | " + owner.getName() + "." + name, k -> new long[2]);
+            synchronized (a) { a[0]++; a[1] += dt; }
+        }
+    }
+
+    static Object jni0(Class<?> owner, String name, String desc, Object self, Object[] args) {
         String cls = owner.getName().replace('.', '/');
         String key = cls + "." + name + desc;
         if (firstCall == null) firstCall = key;
