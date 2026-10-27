@@ -7,6 +7,20 @@
 #include <setjmp.h>
 #include <signal.h>
 
+/* Soft-fault claim flag: FALSE while running host trap / SVC code so JVM
+ * implicit-null SIGSEGV inside JNI is not stolen. Nested guest re-entry
+ * (RegisterNatives → jet_native_call) sets it again via jet_interp_run. */
+static __thread volatile int jet_fault_active;
+__thread volatile int jet_mem_guard_depth;
+static inline int jet_fault_host_enter(void) {
+    int s = jet_fault_active;
+    jet_fault_active = 0;
+    return s;
+}
+static inline void jet_fault_host_leave(int saved) {
+    jet_fault_active = saved;
+}
+
 static int bit_fp128(const jet_insn *i);
 static uint64_t bits_imm5(const jet_insn *i);
 
@@ -700,9 +714,12 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
                                                  uint64_t nr, uint64_t a0, uint64_t a1,
                                                  uint64_t a2, uint64_t a3, uint64_t a4,
                                                  uint64_t a5);
+        /* Host path: drop soft-fault claim so JVM/host SIGSEGV is not stolen. */
+        int svc_saved_active = jet_fault_host_enter();
         int64_t r = jet_emulate_linux_syscall(ctx, c, c->x[8],
                                               c->x[0], c->x[1], c->x[2],
                                               c->x[3], c->x[4], c->x[5]);
+        jet_fault_host_leave(svc_saved_active);
         c->x[0] = (uint64_t)r;
         return 0;
     }
@@ -1344,7 +1361,13 @@ static int dispatch_stub(jet_ctx *ctx, jet_cpu *c, int idx) {
                 (unsigned long long)c->x[8], (unsigned long long)c->sp,
                 (unsigned long long)c->x[30]);
     }
+    /* Host trap: clear jet_fault_active so JNIEnv→JVM / bionic / callbacks
+     * that raise SIGSEGV (implicit null checks) are not claimed by soft-fault.
+     * Nested jet_native_call from host re-enters interp and sets active again;
+     * restore the saved value on return so outer guest stays claimable. */
+    int trap_saved_active = jet_fault_host_enter();
     uint64_t ret = t->fn(ctx, &a, t->user);
+    jet_fault_host_leave(trap_saved_active);
     if (c->stop) {
         /* Host trap requested stop (abort/stack_chk/etc.) — do not resume at LR. */
         return 1;
@@ -1368,37 +1391,126 @@ static int dispatch_stub(jet_ctx *ctx, jet_cpu *c, int idx) {
 
 
 /* Soft-fault guest memory accesses: SIGSEGV/SIGBUS → stop with error.
- * CRITICAL: chain to the previous handler when inactive. Never reset to
- * SIG_DFL — the embedding JVM owns SIGSEGV/SIGBUS (null checks, safepoints).
- * Guest sigaction/signal/sigaltstack/pthread_sigmask are emulated in
- * host_bionic and must never install handlers on the host process. */
-static __thread sigjmp_buf jet_fault_jmp;
-static __thread volatile int jet_fault_active;
+ *
+ * JVM-safe (Zero / no-JIT rely on SIGSEGV for null checks & stack banging):
+ *  - Host handlers installed lazily on interpreter entry only.
+ *  - On each entry, re-check: if we are no longer the chained head, save the
+ *    newer handler as previous and re-install ourselves on top (libjsig /
+ *    -XX:-UseSignalChaining compatible). Never clobber a newer handler.
+ *  - jet_fault_active is cleared around every host trap / SVC dispatch and
+ *    restored on return (nested guest re-entry sets it again in interp_run).
+ *  - Claim ONLY when active AND (fault PC site is a guarded load/store helper
+ *    via jet_mem_guard_depth, OR si_addr is in a guest-mapped range). Host
+ *    PCs never claim. Everything else is forwarded
+ *    to the saved previous handler exactly (SA_SIGINFO vs plain, SA_ONSTACK
+ *    preserved on install, SIG_IGN → return, SIG_DFL → reset+re-raise).
+ *  - Guest sigaction/signal/sigaltstack/pthread_sigmask stay emulated in
+ *    host_bionic and never install on the host process.
+ */
+/* Nesting: RegisterNatives callback → jet_native_call re-enters interp. */
+#define JET_FAULT_NEST_MAX 8
+static __thread sigjmp_buf jet_fault_jmps[JET_FAULT_NEST_MAX];
+static __thread int jet_fault_depth;             /* # active jet_interp_run frames */
+/* jet_fault_active / jet_mem_guard_depth / host_enter|leave: defined at file top. */
 static __thread jet_cpu *jet_fault_cpu;
 static __thread jet_ctx *jet_fault_ctx;
-static struct sigaction jet_prev_segv, jet_prev_bus;
+static __thread jet_cpu *jet_fault_cpu_stack[JET_FAULT_NEST_MAX];
+static __thread jet_ctx *jet_fault_ctx_stack[JET_FAULT_NEST_MAX];
+static __thread int jet_fault_active_stack[JET_FAULT_NEST_MAX];
 
-static void jet_chain_prev_fault(int sig, siginfo_t *si, void *uctx) {
+static struct sigaction jet_prev_segv, jet_prev_bus;
+static int jet_fault_have_prev_segv, jet_fault_have_prev_bus;
+static int jet_fault_installed;
+static pthread_mutex_t jet_fault_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void jet_fault_handler(int sig, siginfo_t *si, void *uctx);
+
+static int jet_sa_is_ours(const struct sigaction *sa) {
+    if (sa->sa_flags & SA_SIGINFO)
+        return sa->sa_sigaction == jet_fault_handler;
+    return (void *)sa->sa_handler == (void *)jet_fault_handler;
+}
+
+/* True if addr falls in an identity-mapped guest region we know about. */
+static int jet_fault_addr_in_guest(jet_ctx *ctx, void *addr) {
+    if (!ctx || !addr) return 0;
+    uintptr_t a = (uintptr_t)addr;
+    /* Stub page */
+    if (ctx->stub_page && ctx->stub_page_size) {
+        uintptr_t b = (uintptr_t)ctx->stub_page;
+        if (a >= b && a < b + ctx->stub_page_size) return 1;
+    }
+    /* Loaded ELF images */
+    for (jet_lib *L = ctx->libs; L; L = L->next) {
+        if (!L->base || !L->map_size) continue;
+        uintptr_t b = (uintptr_t)L->base;
+        if (a >= b && a < b + L->map_size) return 1;
+    }
+    /* Guest stacks + TLS blobs on known CPUs */
+    if (ctx->main_cpu) {
+        jet_cpu *c = ctx->main_cpu;
+        if (c->stack_base && c->stack_size) {
+            uintptr_t b = (uintptr_t)G2H(c->stack_base);
+            if (a >= b && a < b + c->stack_size) return 1;
+        }
+        if (c->tls_alloc) {
+            /* TLS alloc is small; treat the TCB page conservatively */
+            uintptr_t b = (uintptr_t)c->tls_alloc;
+            if (a >= b && a < b + 4096) return 1;
+        }
+    }
+    return 0;
+}
+
+/* Claim only when this thread is in guest execution (active) AND the fault
+ * is from an interpreter guarded load/store (mem_guard_depth) OR si_addr
+ * falls in a known guest mapping. Host PCs (JNI/JVM/bionic) never claim. */
+static int jet_fault_should_claim(jet_ctx *ctx, siginfo_t *si) {
+    if (!jet_fault_active || !jet_fault_cpu) return 0;
+    if (jet_mem_guard_depth > 0) return 1;
+    void *addr = (si && (si->si_signo == SIGSEGV || si->si_signo == SIGBUS))
+                     ? si->si_addr : NULL;
+    if (addr && jet_fault_addr_in_guest(ctx, addr)) return 1;
+    return 0;
+}
+
+static void jet_fault_forward(int sig, siginfo_t *si, void *uctx) {
     struct sigaction *prev = (sig == SIGBUS) ? &jet_prev_bus : &jet_prev_segv;
+    int have = (sig == SIGBUS) ? jet_fault_have_prev_bus : jet_fault_have_prev_segv;
+    if (!have) {
+        /* No previous handler recorded — reset to DFL and re-raise. */
+        struct sigaction dfl;
+        memset(&dfl, 0, sizeof dfl);
+        dfl.sa_handler = SIG_DFL;
+        sigemptyset(&dfl.sa_mask);
+        sigaction(sig, &dfl, NULL);
+        raise(sig);
+        return;
+    }
     if (prev->sa_flags & SA_SIGINFO) {
         if (prev->sa_sigaction) prev->sa_sigaction(sig, si, uctx);
         return;
     }
     if (prev->sa_handler == SIG_IGN) return;
     if (prev->sa_handler == SIG_DFL || prev->sa_handler == NULL) {
-        /* Re-raise with default disposition without permanently clobbering
-         * whatever was installed after us: temporarily install DFL, raise,
-         * then re-install ourselves is unsafe from a handler. Best-effort:
-         * unblock and re-raise; if we return, continue. */
+        /* Reset to DFL and re-raise so the kernel applies default disposition.
+         * Compatible with -XX:-UseSignalChaining (no libjsig wrapper). */
+        struct sigaction dfl, ours;
+        memset(&dfl, 0, sizeof dfl);
+        dfl.sa_handler = SIG_DFL;
+        sigemptyset(&dfl.sa_mask);
+        sigaction(sig, &dfl, &ours);
         raise(sig);
+        /* If we survive, put ourselves back so later guest entries still work. */
+        sigaction(sig, &ours, NULL);
         return;
     }
     prev->sa_handler(sig);
 }
 
 static void jet_fault_handler(int sig, siginfo_t *si, void *uctx) {
-    if (!jet_fault_active || !jet_fault_cpu) {
-        jet_chain_prev_fault(sig, si, uctx);
+    if (!jet_fault_should_claim(jet_fault_ctx, si)) {
+        jet_fault_forward(sig, si, uctx);
         return;
     }
     if (jet_fault_ctx) {
@@ -1417,37 +1529,82 @@ static void jet_fault_handler(int sig, siginfo_t *si, void *uctx) {
              (unsigned long long)jet_fault_cpu->x[1],
              (jet_fault_ctx && jet_fault_ctx->last_trap_name[0])
                 ? jet_fault_ctx->last_trap_name : "-");
-    if (jet_fault_ctx)
-        jet_set_error(jet_fault_ctx, "%s", jet_fault_cpu->err_msg);
+    /* Error string is applied after siglongjmp in jet_interp_run. */
     jet_fault_cpu->err_code = 2;
     jet_fault_cpu->stop = 1;
-    siglongjmp(jet_fault_jmp, 1);
+    if (jet_fault_depth < 1 || jet_fault_depth > JET_FAULT_NEST_MAX) {
+        jet_fault_forward(sig, si, uctx);
+        return;
+    }
+    siglongjmp(jet_fault_jmps[jet_fault_depth - 1], 1);
+}
+
+static void jet_fault_install_one(int sig, struct sigaction *prev_out, int *have_prev) {
+    struct sigaction cur, our;
+    memset(&our, 0, sizeof our);
+    our.sa_sigaction = jet_fault_handler;
+    our.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&our.sa_mask);
+
+    if (sigaction(sig, NULL, &cur) != 0) return;
+
+    if (jet_fault_installed && jet_sa_is_ours(&cur)) {
+        /* Already head of chain — keep saved previous untouched. */
+        return;
+    }
+
+    /* Preserve SA_ONSTACK from whoever we displace so alt-stack delivery
+     * still works for the previous (JVM) handler when we forward. */
+    if (cur.sa_flags & SA_ONSTACK)
+        our.sa_flags |= SA_ONSTACK;
+
+    /* Save current (prior JVM / test / DFL) then install ourselves on top. */
+    *prev_out = cur;
+    *have_prev = 1;
+    sigaction(sig, &our, NULL);
 }
 
 static void jet_fault_ensure_installed(void) {
-    static int once;
-    if (once) return;
-    once = 1;
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_sigaction = jet_fault_handler;
-    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
-    sigemptyset(&sa.sa_mask);
-    /* Save JVM (or prior) handlers so we can chain when inactive. */
-    sigaction(SIGSEGV, &sa, &jet_prev_segv);
-    sigaction(SIGBUS, &sa, &jet_prev_bus);
+    pthread_mutex_lock(&jet_fault_mu);
+    jet_fault_install_one(SIGSEGV, &jet_prev_segv, &jet_fault_have_prev_segv);
+    jet_fault_install_one(SIGBUS,  &jet_prev_bus,  &jet_fault_have_prev_bus);
+    jet_fault_installed = 1;
+    pthread_mutex_unlock(&jet_fault_mu);
 }
 
 int jet_interp_run(jet_ctx *ctx, jet_cpu *cpu) {
     cpu->stop = 0;
     cpu->err_code = 0;
 
+    /* Lazy install / re-chain on every guest entry. */
     jet_fault_ensure_installed();
+
+    int nest = jet_fault_depth;
+    if (nest >= JET_FAULT_NEST_MAX) {
+        snprintf(cpu->err_msg, sizeof cpu->err_msg, "soft-fault nest overflow");
+        cpu->err_code = 1; cpu->stop = 1;
+        jet_set_error(ctx, "%s", cpu->err_msg);
+        return -1;
+    }
+    jet_fault_cpu_stack[nest] = cpu;
+    jet_fault_ctx_stack[nest] = ctx;
+    jet_fault_active_stack[nest] = jet_fault_active;
     jet_fault_cpu = cpu;
     jet_fault_ctx = ctx;
     jet_fault_active = 1;
-    if (sigsetjmp(jet_fault_jmp, 1) != 0) {
-        jet_fault_active = 0;
+    jet_fault_depth = nest + 1;
+
+    if (sigsetjmp(jet_fault_jmps[nest], 1) != 0) {
+        jet_mem_guard_depth = 0; /* longjmp skipped leave of guarded load/store */
+        jet_fault_depth = nest;
+        jet_fault_active = jet_fault_active_stack[nest];
+        if (nest > 0) {
+            jet_fault_cpu = jet_fault_cpu_stack[nest - 1];
+            jet_fault_ctx = jet_fault_ctx_stack[nest - 1];
+        } else {
+            jet_fault_cpu = NULL;
+            jet_fault_ctx = NULL;
+        }
         jet_set_error(ctx, "%s", cpu->err_msg);
         return -1;
     }
@@ -1488,7 +1645,16 @@ int jet_interp_run(jet_ctx *ctx, jet_cpu *cpu) {
             if (jet_is_stub(ctx, cpu->pc)) break;
         }
     }
-    jet_fault_active = 0;
+    jet_fault_depth = nest;
+    jet_fault_active = jet_fault_active_stack[nest];
+    if (nest > 0) {
+        jet_fault_cpu = jet_fault_cpu_stack[nest - 1];
+        jet_fault_ctx = jet_fault_ctx_stack[nest - 1];
+    } else {
+        jet_fault_cpu = NULL;
+        jet_fault_ctx = NULL;
+        jet_mem_guard_depth = 0;
+    }
     if (cpu->err_code) {
         jet_set_error(ctx, "%s", cpu->err_msg);
         return -1;

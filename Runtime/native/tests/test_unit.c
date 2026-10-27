@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <setjmp.h>
+#include <signal.h>
 
 static int g_fail = 0;
 #define CHECK(cond, fmt, ...) do { \
@@ -21,6 +23,70 @@ static uint64_t host_add(jet_ctx *c, const jet_args *a, void *u) {
     return (uint64_t)(int64_t)((int)a->x[0] + (int)a->x[1]);
 }
 
+
+/* Soft-fault test helpers (file scope — no nested fns). */
+static volatile int g_sf_prior_hits;
+static sigjmp_buf g_sf_prior_jmp;
+static void softfault_prior_handler(int sig, siginfo_t *si, void *uctx) {
+    (void)sig; (void)si; (void)uctx;
+    g_sf_prior_hits++;
+    siglongjmp(g_sf_prior_jmp, 1);
+}
+void softfault_test_reset_hits(void) { g_sf_prior_hits = 0; }
+int softfault_test_prior_hits(void) { return g_sf_prior_hits; }
+void softfault_test_install_prior(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = softfault_prior_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
+int softfault_test_raise_and_catch(void) {
+    if (sigsetjmp(g_sf_prior_jmp, 1) == 0) {
+        raise(SIGSEGV);
+        return 0; /* not caught */
+    }
+    return 1;
+}
+
+/* Host trap that dereferences NULL. Soft-fault must forward to prior while
+ * jet_fault_active is cleared around trap dispatch. setjmp here so prior's
+ * longjmp resumes inside the trap and guest returns cleanly. */
+static uint64_t host_null_trap(jet_ctx *c, const jet_args *a, void *u) {
+    (void)c; (void)a; (void)u;
+    if (sigsetjmp(g_sf_prior_jmp, 1) == 0) {
+        volatile int *p = 0;
+        return (uint64_t)(int64_t)(*p);
+    }
+    return 1; /* prior handler caught it */
+}
+
+/* "Newer" handler that displaces jet — used to verify re-chain on next guest entry. */
+static volatile int g_sf_mid_hits;
+static sigjmp_buf g_sf_mid_jmp;
+static void softfault_mid_handler(int sig, siginfo_t *si, void *uctx) {
+    (void)sig; (void)si; (void)uctx;
+    g_sf_mid_hits++;
+    siglongjmp(g_sf_mid_jmp, 1);
+}
+static void softfault_test_install_mid(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = softfault_mid_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+}
+static int softfault_test_raise_mid(void) {
+    if (sigsetjmp(g_sf_mid_jmp, 1) == 0) {
+        raise(SIGSEGV);
+        return 0;
+    }
+    return 1;
+}
+
 static double now_ms(void) {
     struct timeval tv; gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
@@ -33,6 +99,7 @@ int main(void) {
     CHECK(ctx, "create ctx");
 
     jet_native_register_host(ctx, "host_add", host_add, NULL);
+    jet_native_register_host(ctx, "host_null_trap", host_null_trap, NULL);
 
     char err[256];
     jet_lib *lib = jet_native_load(ctx, "tests/guest_lib.so", err, sizeof err);
@@ -177,8 +244,87 @@ int main(void) {
         }
     }
 
+
+    /* ---- Soft-fault: JVM-safe SIGSEGV chaining ---- */
+    {
+        /* Prior SA_SIGINFO handler simulates JVM / -XX:-UseSignalChaining peer. */
+        softfault_test_reset_hits();
+        softfault_test_install_prior();
+
+        /* (1) Fault OUTSIDE guest → prior handler must run. */
+        CHECK(softfault_test_raise_and_catch() == 1, "outside-guest fault caught by prior");
+        CHECK(softfault_test_prior_hits() >= 1, "prior_hits after outside fault => %d",
+              softfault_test_prior_hits());
+
+        /* Enter guest once so jet installs on top and chains to prior. */
+        a.x[0]=1; a.x[1]=2; r=0;
+        CHECK(jet_native_call(ctx, add, &a, &r, NULL) == 0 && r == 3,
+              "guest_add after prior install => %llu", (unsigned long long)r);
+
+        /* (2) Fault INSIDE guest (NULL deref) → soft-handled, not prior. */
+        {
+            int hits_before = softfault_test_prior_hits();
+            uint64_t nd = jet_native_sym(lib, "guest_null_deref");
+            CHECK(nd != 0, "sym guest_null_deref");
+            a.x[0]=0; r=0;
+            int nrc = jet_native_call(ctx, nd, &a, &r, NULL);
+            CHECK(nrc != 0, "inside-guest NULL deref soft-handled rc=%d err=%s",
+                  nrc, jet_native_last_error(ctx));
+            CHECK(softfault_test_prior_hits() == hits_before,
+                  "prior NOT called for inside-guest fault (hits %d -> %d)",
+                  hits_before, softfault_test_prior_hits());
+        }
+
+        /* (3) Nested install: second guest entry must not lose prior.
+         * Another guest call re-checks chain; then outside fault still hits prior. */
+        a.x[0]=7; a.x[1]=8; r=0;
+        CHECK(jet_native_call(ctx, add, &a, &r, NULL) == 0 && r == 15,
+              "nested guest entry => %llu", (unsigned long long)r);
+        {
+            int hits_before = softfault_test_prior_hits();
+            CHECK(softfault_test_raise_and_catch() == 1, "after nested install, outside fault to prior");
+            CHECK(softfault_test_prior_hits() == hits_before + 1,
+                  "prior still chained after nested install (hits %d)",
+                  softfault_test_prior_hits());
+        }
+
+        /* (4) Newer handler displaces jet; next guest entry re-chains without
+         * losing the newer one (libjsig / late JVM install). */
+        {
+            g_sf_mid_hits = 0;
+            softfault_test_install_mid(); /* now mid is head, jet displaced */
+            a.x[0]=3; a.x[1]=4; r=0;
+            CHECK(jet_native_call(ctx, add, &a, &r, NULL) == 0 && r == 7,
+                  "guest entry re-chains over mid => %llu", (unsigned long long)r);
+            /* Outside fault should hit mid (saved as previous), not be lost. */
+            CHECK(softfault_test_raise_mid() == 1, "outside fault forwarded to mid after re-chain");
+            CHECK(g_sf_mid_hits == 1, "mid_hits after re-chain forward => %d", g_sf_mid_hits);
+        }
+
+        /* (5) Guest → host trap that NULL-derefs: prior must receive it
+         * (jet_fault_active cleared around trap; host PC not claimed). */
+        {
+            softfault_test_install_prior();
+            a.x[0]=1; a.x[1]=1; r=0;
+            CHECK(jet_native_call(ctx, add, &a, &r, NULL) == 0 && r == 2,
+                  "re-chain prior before host-null test => %llu", (unsigned long long)r);
+            int hits_before = softfault_test_prior_hits();
+            uint64_t hn = jet_native_sym(lib, "guest_call_host_null");
+            CHECK(hn != 0, "sym guest_call_host_null");
+            a.x[0]=0; r=0;
+            int hrc = jet_native_call(ctx, hn, &a, &r, NULL);
+            CHECK(hrc == 0 && r == 1,
+                  "host-null trap forwarded to prior, guest returned r=%llu rc=%d err=%s",
+                  (unsigned long long)r, hrc, jet_native_last_error(ctx));
+            CHECK(softfault_test_prior_hits() == hits_before + 1,
+                  "prior received host-trap NULL (hits %d -> %d)",
+                  hits_before, softfault_test_prior_hits());
+        }
+    }
+
     jet_native_destroy(ctx);
     if (g_fail) { fprintf(stderr, "\n%d FAILURES\n", g_fail); return 1; }
     fprintf(stderr, "\nALL PASS\n");
     return 0;
 }
+

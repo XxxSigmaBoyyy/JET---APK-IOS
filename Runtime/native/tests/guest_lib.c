@@ -8,6 +8,7 @@ typedef int i32;
 /* Imported from host trap table */
 extern void *__errno_location_like(void);
 extern int host_add(int a, int b);
+extern int host_null_trap(void);
 extern void host_log(const char *s);
 
 /* Simple exports */
@@ -23,6 +24,11 @@ u64 guest_sum_array(const int *p, int n) {
 /* Calls a host import */
 int guest_call_host(int a, int b) {
     return host_add(a, b);
+}
+
+/* Guest → host trap that will NULL-deref on the host (soft-fault must forward). */
+int guest_call_host_null(void) {
+    return host_null_trap();
 }
 
 /* setjmp / longjmp exercise — use our host traps by calling them as symbols */
@@ -174,4 +180,10 @@ void guest_hmac_opad16(void *dst, const void *src) {
         : "r"(dst), "r"(src)
         : "v0", "v2", "memory"
     );
+}
+
+/* Deliberate NULL deref for soft-fault unit tests. */
+int guest_null_deref(void) {
+    volatile int *p = 0;
+    return *p;
 }

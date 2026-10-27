@@ -328,18 +328,57 @@ uint64_t jet_tramp_invoke(jet_ctx *ctx, uint64_t guest_fn, const jet_args *a);
 int jet_host_install_setjmp(jet_ctx *ctx);
 void jet_tramp_set_active(jet_ctx *ctx);
 
-/* Memory helpers (identity map: guest VA == host pointer). */
+/* Memory helpers (identity map: guest VA == host pointer).
+ * jet_mem_guard_depth marks interpreter guarded load/store sites so soft-fault
+ * only claims SIGSEGV/SIGBUS raised from these helpers (or guest-mapped si_addr). */
+extern __thread volatile int jet_mem_guard_depth;
 static inline void *G2H(uint64_t g) { return (void *)(uintptr_t)g; }
 static inline uint64_t H2G(const void *h) { return (uint64_t)(uintptr_t)h; }
 
-static inline uint8_t  ld1(uint64_t a){ return *(volatile uint8_t*)G2H(a); }
-static inline uint16_t ld2(uint64_t a){ return *(volatile uint16_t*)G2H(a); }
-static inline uint32_t ld4(uint64_t a){ return *(volatile uint32_t*)G2H(a); }
-static inline uint64_t ld8(uint64_t a){ return *(volatile uint64_t*)G2H(a); }
-static inline void st1(uint64_t a, uint8_t  v){ *(volatile uint8_t*)G2H(a)=v; }
-static inline void st2(uint64_t a, uint16_t v){ *(volatile uint16_t*)G2H(a)=v; }
-static inline void st4(uint64_t a, uint32_t v){ *(volatile uint32_t*)G2H(a)=v; }
-static inline void st8(uint64_t a, uint64_t v){ *(volatile uint64_t*)G2H(a)=v; }
+static inline uint8_t  ld1(uint64_t a){
+    jet_mem_guard_depth++;
+    uint8_t v = *(volatile uint8_t*)G2H(a);
+    jet_mem_guard_depth--;
+    return v;
+}
+static inline uint16_t ld2(uint64_t a){
+    jet_mem_guard_depth++;
+    uint16_t v = *(volatile uint16_t*)G2H(a);
+    jet_mem_guard_depth--;
+    return v;
+}
+static inline uint32_t ld4(uint64_t a){
+    jet_mem_guard_depth++;
+    uint32_t v = *(volatile uint32_t*)G2H(a);
+    jet_mem_guard_depth--;
+    return v;
+}
+static inline uint64_t ld8(uint64_t a){
+    jet_mem_guard_depth++;
+    uint64_t v = *(volatile uint64_t*)G2H(a);
+    jet_mem_guard_depth--;
+    return v;
+}
+static inline void st1(uint64_t a, uint8_t  v){
+    jet_mem_guard_depth++;
+    *(volatile uint8_t*)G2H(a)=v;
+    jet_mem_guard_depth--;
+}
+static inline void st2(uint64_t a, uint16_t v){
+    jet_mem_guard_depth++;
+    *(volatile uint16_t*)G2H(a)=v;
+    jet_mem_guard_depth--;
+}
+static inline void st4(uint64_t a, uint32_t v){
+    jet_mem_guard_depth++;
+    *(volatile uint32_t*)G2H(a)=v;
+    jet_mem_guard_depth--;
+}
+static inline void st8(uint64_t a, uint64_t v){
+    jet_mem_guard_depth++;
+    *(volatile uint64_t*)G2H(a)=v;
+    jet_mem_guard_depth--;
+}
 
 /* Linux SVC emulation (host_bionic.c) — portable, no raw syscall() on Darwin. */
 int64_t jet_emulate_linux_syscall(jet_ctx *ctx, jet_cpu *cpu,
