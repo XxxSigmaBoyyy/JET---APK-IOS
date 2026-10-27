@@ -19,6 +19,9 @@
 #define HAVE_JVMTI 1
 #else
 #define HAVE_JVMTI 0
+#if HAVE_JNI && defined(__APPLE__)
+#error "jvmti.h not found: scripts/stage_jvm.sh must copy it into Vendor/jni (JNI FindClass/RegisterNatives override)"
+#endif
 #endif
 
 #if HAVE_JNI
@@ -162,8 +165,10 @@ static void install_find_class_override(JNIEnv *env) {
     jvmtiError e = (*ti)->SetJNIFunctionTable(ti, tbl);
     (*ti)->Deallocate(ti, (unsigned char *)tbl);
     if (e != JVMTI_ERROR_NONE) fprintf(stderr, "[jetjni] SetJNIFunctionTable failed: %d\n", (int)e);
+    else fprintf(stderr, "[jetjni] JVMTI JNI overrides installed (FindClass/RegisterNatives/UnregisterNatives)\n");
 #else
     (void)env;
+    fprintf(stderr, "[jetjni] built without jvmti.h: guest FindClass/RegisterNatives fall back to stock JNI\n");
 #endif
 }
 

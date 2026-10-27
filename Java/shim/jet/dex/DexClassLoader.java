@@ -32,7 +32,20 @@ public final class DexClassLoader extends ClassLoader {
     static { registerAsParallelCapable(); }
     static final int READ = DexFileReader.SKIP_DEBUG;
 
-    final class Dex { final DexFileReader r; final DexFileNode meta = new DexFileNode(); Map<String, Object> clz; Dex(DexFileReader r) { this.r = r; } }
+    /** Index visitor: keeps class headers + class annotations only (all Dex2Asm.collectClzInfo reads); members dropped. */
+    static final class MetaNode extends DexFileNode {
+        @Override public com.googlecode.d2j.visitors.DexClassVisitor visit(int access, String className, String superClass, String[] interfaceNames) {
+            DexClassNode c = new DexClassNode(access, className, superClass, interfaceNames) {
+                @Override public com.googlecode.d2j.visitors.DexFieldVisitor visitField(int a, com.googlecode.d2j.Field f, Object v) { return null; }
+                @Override public com.googlecode.d2j.visitors.DexMethodVisitor visitMethod(int a, Method m) { return null; }
+            };
+            if (clzs == null) clzs = new ArrayList<>();
+            clzs.add(c);
+            return c;
+        }
+    }
+
+    final class Dex { final DexFileReader r; final DexFileNode meta = new MetaNode(); Map<String, Object> clz; Dex(DexFileReader r) { this.r = r; } }
     final List<Dex> dexes = new ArrayList<>();
     final Map<String, Object[]> index = new HashMap<>();       // binary name -> {Dex, Integer idx}
     final Set<String> interfaces = new HashSet<>();             // internal names

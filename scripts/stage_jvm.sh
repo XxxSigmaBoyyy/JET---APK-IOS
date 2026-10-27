@@ -54,6 +54,9 @@ if [[ ! -f "$D2JZ" ]]; then
 fi
 echo "$D2J_SHA  $D2JZ" | shasum -a 256 -c - >/dev/null || { echo "dex-tools-v2.4.zip sha256 mismatch"; exit 1; }
 for j in $D2J_JARS; do unzip -qjo "$D2JZ" "dex-tools-v2.4/lib/$j" -d "$ROOT/Vendor/d2j"; done
+# memoize DexFileReader.getString (MUTF-8 decode per lookup dominated per-class translation): tools/d2jpatch
+PW=$(mktemp -d); javac -nowarn -d "$PW" -cp "$ASM" "$ROOT/tools/d2jpatch/D2jPatch.java"
+java -cp "$ASM:$PW" D2jPatch "$ROOT/Vendor/d2j/dex-reader-v2.4.jar" "$ROOT/Vendor/d2j/dex-reader-v2.4.jar"; rm -rf "$PW"
 D2J=""; for j in $D2J_JARS; do D2J="$D2J:$ROOT/Vendor/d2j/$j"; done; D2J=${D2J#:}
 W=$(mktemp -d)
 # 1) nativeapi (+ ASM for JetAppClassLoader) and hello
