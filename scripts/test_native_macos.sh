@@ -32,6 +32,9 @@ msg=$("$XCC" --target=aarch64-linux-gnu -fuse-ld=lld -nostdlib -shared -fPIC -O0
 echo "----- guest_lib.so (aarch64-linux-gnu, lld) exit $r" >> "$LOG"; printf '%s\n' "${msg:-(clean)}" >> "$LOG"
 echo "guest_lib.so: $([ $r -eq 0 ] && echo built || echo "BUILD-FAIL exit=$r")" | tee -a "$SUM"
 
+# PATH shim: `clang` -> Homebrew clang with -fuse-ld=lld (for tests that build aarch64-linux ELF guest code themselves).
+WRAP="$OUT/clang-wrap"; mkdir -p "$WRAP"
+printf '#!/bin/sh\nexec "%s" -fuse-ld=lld "$@"\n' "$XCC" > "$WRAP/clang"; chmod +x "$WRAP/clang"
 SUITES="test_unit test_jni test_mem_bitfield test_v9_jni_dl test_cxx_eh test_v10_trap_abi test_v101_guest_abi test_v11_xzr_excl test_v101_darwin_abi test_v102_fs_netdb test_tg"
 for t in $SUITES; do
   src="$N/tests/$t.c"; [ -f "$src" ] || { echo "$t: MISSING" | tee -a "$SUM"; continue; }
@@ -39,12 +42,13 @@ for t in $SUITES; do
   if [ -n "$msg" ] || [ $r -ne 0 ]; then echo "----- macos-arm64 $src (exit $r)" >> "$LOG"; printf '%s\n' "$msg" >> "$LOG"; fi
   if [ $r -ne 0 ]; then echo "$t: BUILD-FAIL exit=$r" | tee -a "$SUM"; rc=1; continue; fi
   # Run from Runtime/native (tests load tests/guest_lib.so relative to it); 120 s cap per suite.
-  ( cd "$N" && perl -e 'alarm shift; exec @ARGV' 120 "$OUT/bin/$t" ) > "$OUT/$t.txt" 2>&1; r=$?
+  # Tests that cross-build their own aarch64-linux guest code call `clang` from PATH: use Homebrew LLVM (lld) for that.
+  ( cd "$N" && PATH="$WRAP:${LLVM:+$LLVM/bin:}$PATH" perl -e 'alarm shift; exec @ARGV' 120 "$OUT/bin/$t" ) > "$OUT/$t.txt" 2>&1; r=$?
   tail_line=$(grep -E 'PASS|FAIL|passed|failed' "$OUT/$t.txt" | tail -1)
-  if [ $r -eq 0 ]; then st=PASS; elif [ $r -eq 142 ]; then st=TIMEOUT; else st="FAIL(exit=$r)"; fi
+  if [ $r -eq 0 ] && grep -q '^SKIP' "$OUT/$t.txt"; then st=SKIP; tail_line=$(grep -m1 '^SKIP' "$OUT/$t.txt"); elif [ $r -eq 0 ]; then st=PASS; elif [ $r -eq 142 ]; then st=TIMEOUT; else st="FAIL(exit=$r)"; fi
   # test_tg needs the Telegram corpus (not in the repo): informational only.
   if [ "$t" = test_tg ]; then echo "$t: $st (info only; needs Telegram corpus) | $tail_line" | tee -a "$SUM"; continue; fi
-  [ $st = PASS ] || rc=1
+  [ "$st" = PASS ] || [ "$st" = SKIP ] || rc=1
   echo "$t: $st | $tail_line" | tee -a "$SUM"
 done
 rm -f "$N/tests/guest_lib.so"
