@@ -1,0 +1,46 @@
+# Symbols re-exported from Darwin with identical AAPCS/Darwin ABI (no jb_ wrapper).
+# Generated into a reexport list for libjetbionic; anything NOT listed here and imported
+# by a .so is either jb_<name> (ABI-divergent) or missing (must be implemented).
+# Libc / libm / libdl / libz / pthread (ABI-identical on arm64 Darwin for these):
+abort abs accept access acos asin atan atan2 atan2f atanf atoi bind bsearch
+btowc calloc cbrt chmod clock close closedir connect cos cosf cosh
+deflate deflateEnd deflateInit2_ dladdr dlclose dlerror dlopen dlsym
+exit exp exp2 exp2f expf expm1 fabs fclose fflush fgets fileno fmod fmodf
+fopen fprintf_NOT  # fprintf is variadic - in abi list
+fputc fputs fread free freeaddrinfo freelocale freopen frexp fseek fseeko
+fsync ftell ftello ftruncate fwrite gai_strerror getc getcwd getegid getenv
+geteuid getgid getpagesize getpeername getpid getsockname getsockopt getuid
+gmtime_r hypot if_indextoname inet_ntoa inet_ntop inet_pton inflate inflateEnd
+inflateInit2_ isalnum isalpha isascii isatty isdigit islower isspace isupper
+iswalpha iswblank iswcntrl iswdigit iswlower iswprint iswpunct iswspace
+iswupper iswxdigit isxdigit labs listen localeconv localtime localtime_r
+log log10 log10f log2f logf longjmp lrand48 lseek malloc mbrlen mbrtowc
+mbsnrtowcs mbsrtowcs mbtowc memchr memcmp memcpy memmove memset mkdir mkstemp
+mktime munmap nan nanosleep open opendir perror pipe poll posix_memalign
+pow powf printf_NOT pthread_attr_destroy pthread_attr_init
+pthread_attr_setdetachstate pthread_attr_setstacksize pthread_cond_broadcast
+pthread_cond_destroy pthread_cond_signal pthread_create pthread_detach
+pthread_equal pthread_getspecific pthread_join pthread_key_create
+pthread_key_delete pthread_mutex_destroy pthread_mutex_lock
+pthread_mutex_trylock pthread_mutex_unlock pthread_mutexattr_destroy
+pthread_mutexattr_init pthread_once pthread_rwlock_destroy pthread_rwlock_rdlock
+pthread_rwlock_unlock pthread_rwlock_wrlock pthread_self pthread_setname_np
+pthread_setspecific pthread_sigmask putc putenv qsort rand random read
+readdir readlink realloc recv recvfrom remove rename rmdir sched_yield
+sem_destroy sem_post sem_trywait sem_wait send sendto setenv setjmp setlocale
+setsockopt shutdown sigaction_NOT sigaddset sigemptyset sigfillset sin sincos_NOT
+sincosf_NOT sinf sinh sleep snprintf_NOT socket socketpair sprintf_NOT srand
+srandom sscanf_NOT strcasecmp strchr strcmp strcoll strcpy strcspn strerror
+strftime strlen strncat strncmp strncpy strnlen strrchr strspn strstr strtod
+strtof strtol strtoll strtoul strtoull strxfrm tan tanh tanhf time tolower
+toupper towlower towupper uname ungetc unlink usleep utimes vasprintf
+vfprintf_NOT vsnprintf_NOT vsscanf_NOT wcrtomb wcscoll wcslen wcsnrtombs
+wcstod wcstof wcstol wcstoll wcstoul wcstoull wcsxfrm wctob wmemchr wmemcmp
+wmemcpy wmemmove wmemset write
+# GLES (identical):
+glActiveTexture glAttachShader glBindBuffer glBindTexture glBlendFunc
+glBufferData glBufferSubData glClear glClearColor glClearDepthf glCompileShader
+glCreateProgram glCreateShader glDepthFunc glDisable glDrawArrays glEnable
+glEnableVertexAttribArray glGenBuffers glGetAttribLocation glGetProgramiv
+glGetShaderiv glGetUniformLocation glLinkProgram glShaderSource glUniform1f
+glUniform1i glUniform4fv glUseProgram glViewport
