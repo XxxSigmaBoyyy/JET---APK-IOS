@@ -1,0 +1,26 @@
+name: Validate (Linux)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Refuse Android packages
+        run: |
+          if git ls-files | grep -Ei '\.(apk|xapk|apks|aab|obb)$'; then
+            echo "::error::Android packages must never be committed."
+            exit 1
+          fi
+      - name: YAML + scripts
+        run: |
+          python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ios-ipa.yml')); yaml.safe_load(open('project.yml')); print('yaml ok')"
+          bash -n scripts/*.sh
+          test -f Assets/AppIcon-1024.png
+          test -f JET/Resources/Assets.xcassets/BrandIcon.imageset/BrandIcon.png
+          echo validate ok
