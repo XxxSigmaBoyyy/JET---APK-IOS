@@ -1,0 +1,13 @@
+--- a/make/modules/java.desktop/lib/Awt2dLibraries.gmk
++++ b/make/modules/java.desktop/lib/Awt2dLibraries.gmk
+@@ -368,7 +368,8 @@ ifeq ($(call isTargetOs, windows macosx_NOTIOS), false)
+       common/java2d \
+       $(TOPDIR)/src/$(MODULE)/$(OPENJDK_TARGET_OS_TYPE)/native/common/awt \
+       #
+ 
+-  LIBAWT_HEADLESS_EXCLUDES := medialib
++  # JET_IOS: no X11/GLX on device; software Java2D path only (directory basenames).
++  LIBAWT_HEADLESS_EXCLUDES := medialib x11 opengl
+ 
+   LIBAWT_HEADLESS_EXTRA_HEADER_DIRS := \
+       $(LIBAWT_DEFAULT_HEADER_DIRS) \

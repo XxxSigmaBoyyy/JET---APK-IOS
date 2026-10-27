@@ -89,6 +89,13 @@ XINC=$W/xinc; rm -rf "$XINC"; mkdir -p "$XINC/X11"
 for f in libx11 xorgproto libxext libxrender libxtst libxi libxt libxrandr; do
   cp -R "$BREW/opt/$f/include/X11/." "$XINC/X11/" 2>/dev/null || true
 done
+# macosx configure ignores --x-includes; FLAGS -I$XINC is what actually feeds the compiler. Verify:
+if [ ! -f "$XINC/X11/Xlib.h" ]; then
+  log "FATAL: $XINC/X11/Xlib.h missing after brew copy"
+  ls -la "$BREW/opt/libx11/include/X11" 2>&1 | head -20 || true
+  exit 1
+fi
+log "X11 headers ready: $(ls "$XINC/X11" | wc -l) files"
 
 # --- OpenJDK source ---
 if [ ! -d jdk/.git ]; then
@@ -105,7 +112,7 @@ mv src/java.desktop/macosx_NOTIOS/native/libjsound src/java.desktop/macosx/nativ
 # JET local patches (if any)
 for p in "$ROOT"/scripts/jre/patches/*.diff; do [ -f "$p" ] && { log "apply $(basename "$p")"; git apply --whitespace=nowarn "$p"; }; done
 
-FLAGS="-DJET_IOS=1 -DHEADLESS=1 -I$INC -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-function-pointer-types -DLE_STANDALONE -O2"
+FLAGS="-DJET_IOS=1 -DHEADLESS=1 -I$INC -I$XINC -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-function-pointer-types -DLE_STANDALONE -O2"
 export BUILD_SYSROOT_CFLAGS="-isysroot $MACSYSROOT"
 export HOTSPOT_DISABLE_DTRACE_PROBES=1
 log "configure ($SDK, zero)"
