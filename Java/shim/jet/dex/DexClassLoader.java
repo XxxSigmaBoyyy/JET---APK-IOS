@@ -112,16 +112,110 @@ public final class DexClassLoader extends ClassLoader {
     public byte[] classBytes(String name) throws ClassNotFoundException {
         Object[] e = index.get(name);
         if (e == null) return null;
+        byte[] b = cached(name);
+        if (b != null) { cacheHits.incrementAndGet(); return b; }
+        java.util.concurrent.CompletableFuture<byte[]> mine = new java.util.concurrent.CompletableFuture<>();
+        java.util.concurrent.CompletableFuture<byte[]> f = inflight.putIfAbsent(name, mine);
+        if (f != null) {
+            Job j = jobs.get(name);
+            if (j != null && j.claim()) { mine = f; f = null; }   // still queued: translate it here instead of waiting in line
+        }
+        if (f != null) {   // a lookahead worker is translating it (or finished): wait instead of translating twice
+            long w0 = System.nanoTime();
+            try { b = f.join(); lookaheadWaitNanos.addAndGet(System.nanoTime() - w0); }
+            catch (java.util.concurrent.CompletionException ce) { Throwable t = ce.getCause(); throw new ClassNotFoundException(name + " (dex translation failed: " + t + ")", t); }
+            if (b != null) { lookaheadHits.incrementAndGet(); prefetchRefs(b, 0); return b; }
+        }
+        try { b = translateAndStore(name, e); mine.complete(b); }
+        catch (Throwable t) { mine.completeExceptionally(t); throw new ClassNotFoundException(name + " (dex translation failed: " + t + ")", t); }
+        prefetchRefs(b, 0);
+        return b;
+    }
+
+    byte[] cached(String name) {
+        java.util.concurrent.CompletableFuture<byte[]> f = inflight.get(name);
+        if (f != null && f.isDone() && !f.isCompletedExceptionally()) return f.join();
         File cf = cacheDir == null ? null : new File(cacheDir, name.replace('.', '/') + ".class");
-        if (cf != null && cf.isFile()) { try { cacheHits.incrementAndGet(); return Files.readAllBytes(cf.toPath()); } catch (IOException ignore) {} }
+        if (cf != null && cf.isFile()) { try { return Files.readAllBytes(cf.toPath()); } catch (IOException ignore) {} }
+        return null;
+    }
+
+    byte[] translateAndStore(String name, Object[] e) {
         long t0 = System.nanoTime();
-        byte[] raw;
-        try { raw = translate((Dex) e[0], (Integer) e[1]); }
-        catch (Throwable t) { throw new ClassNotFoundException(name + " (dex translation failed: " + t + ")", t); }
-        byte[] out = postProcess(raw);
+        byte[] out = postProcess(translate((Dex) e[0], (Integer) e[1]));
         translateNanos.addAndGet(System.nanoTime() - t0); translated.incrementAndGet();
-        if (cf != null) { try { cf.getParentFile().mkdirs(); File tmp = new File(cf.getPath() + ".tmp"); Files.write(tmp.toPath(), out); Files.move(tmp.toPath(), cf.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE); } catch (IOException ignore) {} }
+        File cf = cacheDir == null ? null : new File(cacheDir, name.replace('.', '/') + ".class");
+        if (cf != null) { try { cf.getParentFile().mkdirs(); File tmp = new File(cf.getPath() + ".tmp" + Thread.currentThread().getId()); Files.write(tmp.toPath(), out); Files.move(tmp.toPath(), cf.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE); } catch (IOException ignore) {} }
         return out;
+    }
+
+    // ---- parallel lookahead: translate classes the just-translated ones reference, on the spare cores ----
+    // ART compiles at install; here each class is translated the first time it is needed. The app's main thread then
+    // spends most of its cold start inside dex2jar, serially. Every translated class names (in its constant pool) the
+    // classes it will most likely load next, so hand those to worker threads: by the time the main thread asks, the
+    // bytes are usually ready. Bounded by depth (refs of refs) and a total cap so huge apps don't translate everything.
+    final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<byte[]>> inflight = new java.util.concurrent.ConcurrentHashMap<>();
+    final java.util.concurrent.ConcurrentHashMap<String, Job> jobs = new java.util.concurrent.ConcurrentHashMap<>();
+    public static final AtomicLong lookaheadHits = new AtomicLong(), lookaheadQueued = new AtomicLong(), lookaheadWaitNanos = new AtomicLong();
+    public static int LOOKAHEAD_DEPTH = Integer.getInteger("jet.dex.lookahead.depth", 2);
+    public static int LOOKAHEAD_MAX = Integer.getInteger("jet.dex.lookahead.max", 4000);
+    public static int LOOKAHEAD_THREADS = Integer.getInteger("jet.dex.lookahead.threads", Math.max(0, Math.min(6, Runtime.getRuntime().availableProcessors() - 1)));
+    private java.util.concurrent.ThreadPoolExecutor pool;
+    private synchronized java.util.concurrent.ThreadPoolExecutor pool() {
+        if (pool == null && LOOKAHEAD_THREADS > 0) {
+            final java.util.concurrent.atomic.AtomicInteger n = new java.util.concurrent.atomic.AtomicInteger();
+            pool = new java.util.concurrent.ThreadPoolExecutor(LOOKAHEAD_THREADS, LOOKAHEAD_THREADS, 30, java.util.concurrent.TimeUnit.SECONDS,
+                    new java.util.concurrent.PriorityBlockingQueue<Runnable>(),
+                    r -> { Thread t = new Thread(null, r, "jet-dex-lookahead-" + n.incrementAndGet(), 16L << 20); t.setDaemon(true); t.setPriority(Thread.MIN_PRIORITY); return t; });
+            pool.allowCoreThreadTimeOut(true);
+        }
+        return pool;
+    }
+    static final java.util.concurrent.atomic.AtomicLong SEQ = new java.util.concurrent.atomic.AtomicLong();
+    /** Shallow refs first (depth), then FIFO. */
+    final class Job implements Runnable, Comparable<Job> {
+        final String name; final int depth; final long seq = SEQ.incrementAndGet(); final java.util.concurrent.CompletableFuture<byte[]> f;
+        Job(String name, int depth, java.util.concurrent.CompletableFuture<byte[]> f) { this.name = name; this.depth = depth; this.f = f; }
+        public int compareTo(Job o) { return depth != o.depth ? Integer.compare(depth, o.depth) : Long.compare(seq, o.seq); }
+        final java.util.concurrent.atomic.AtomicBoolean started = new java.util.concurrent.atomic.AtomicBoolean();
+        boolean claim() { return started.compareAndSet(false, true); }
+        public void run() {
+            if (!claim()) return;
+            Object[] e = index.get(name);
+            try {
+                byte[] b = null;
+                File cf = cacheDir == null ? null : new File(cacheDir, name.replace('.', '/') + ".class");
+                if (cf != null && cf.isFile()) { try { b = Files.readAllBytes(cf.toPath()); } catch (IOException ignore) {} }
+                if (b == null) b = translateAndStore(name, e);
+                f.complete(b);
+                prefetchRefs(b, depth);
+            } catch (Throwable t) { f.completeExceptionally(t); }
+        }
+    }
+    /** Queue a class for background translation (e.g. Application / launcher activity right after import). */
+    public void prefetch(String name) { enqueue(name, 0); }
+    void enqueue(String name, int depth) {
+        if (!index.containsKey(name) || inflight.containsKey(name) || lookaheadQueued.get() >= LOOKAHEAD_MAX) return;
+        java.util.concurrent.ThreadPoolExecutor p = pool(); if (p == null) return;
+        java.util.concurrent.CompletableFuture<byte[]> f = new java.util.concurrent.CompletableFuture<>();
+        if (inflight.putIfAbsent(name, f) != null) return;
+        lookaheadQueued.incrementAndGet();
+        Job j = new Job(name, depth, f); jobs.put(name, j);
+        p.execute(j);
+    }
+    void prefetchRefs(byte[] b, int depth) {
+        if (depth >= LOOKAHEAD_DEPTH || LOOKAHEAD_THREADS <= 0) return;
+        try {
+            ClassReader cr = new ClassReader(b); char[] buf = new char[cr.getMaxStringLength()];
+            for (int i = 1; i < cr.getItemCount(); i++) {
+                int off = cr.getItem(i);
+                if (off == 0 || b[off - 1] != 7) continue;   // CONSTANT_Class
+                String in = cr.readUTF8(off, buf);
+                if (in == null || in.startsWith("[")) continue;
+                String bin = in.replace('/', '.');
+                if (!inflight.containsKey(bin) && index.containsKey(bin)) enqueue(bin, depth + 1);
+            }
+        } catch (Throwable ignore) {}
     }
 
     // ---- dex2jar per class, same IR pipeline as Dex2jar defaults (reuseReg/topoSort/optimizeSynchronized off) ----
@@ -138,6 +232,22 @@ public final class DexClassLoader extends ClassLoader {
     };
     static final class D2A extends ExDex2Asm {
         D2A() { super(HANDLER); }
+        // Per-instance transformers (ExDex2Asm's T_* are static singletons; translation now runs on several threads).
+        final com.googlecode.dex2jar.ir.ts.CleanLabel T_cleanLabel = new com.googlecode.dex2jar.ir.ts.CleanLabel();
+        final com.googlecode.dex2jar.ir.ts.Ir2JRegAssignTransformer T_ir2jRegAssign = new com.googlecode.dex2jar.ir.ts.Ir2JRegAssignTransformer();
+        final com.googlecode.dex2jar.ir.ts.NewTransformer T_new = new com.googlecode.dex2jar.ir.ts.NewTransformer();
+        final com.googlecode.dex2jar.ir.ts.RemoveConstantFromSSA T_removeConst = new com.googlecode.dex2jar.ir.ts.RemoveConstantFromSSA();
+        final com.googlecode.dex2jar.ir.ts.RemoveLocalFromSSA T_removeLocal = new com.googlecode.dex2jar.ir.ts.RemoveLocalFromSSA();
+        final com.googlecode.dex2jar.ir.ts.ExceptionHandlerTrim T_trimEx = new com.googlecode.dex2jar.ir.ts.ExceptionHandlerTrim();
+        final com.googlecode.dex2jar.ir.ts.TypeTransformer T_type = new com.googlecode.dex2jar.ir.ts.TypeTransformer();
+        final com.googlecode.dex2jar.ir.ts.DeadCodeTransformer T_deadCode = new com.googlecode.dex2jar.ir.ts.DeadCodeTransformer();
+        final com.googlecode.dex2jar.ir.ts.array.FillArrayTransformer T_fillArray = new com.googlecode.dex2jar.ir.ts.array.FillArrayTransformer();
+        final com.googlecode.dex2jar.ir.ts.AggTransformer T_agg = new com.googlecode.dex2jar.ir.ts.AggTransformer();
+        final com.googlecode.dex2jar.ir.ts.UnSSATransformer T_unssa = new com.googlecode.dex2jar.ir.ts.UnSSATransformer();
+        final com.googlecode.dex2jar.ir.ts.ZeroTransformer T_zero = new com.googlecode.dex2jar.ir.ts.ZeroTransformer();
+        final com.googlecode.dex2jar.ir.ts.VoidInvokeTransformer T_voidInvoke = new com.googlecode.dex2jar.ir.ts.VoidInvokeTransformer();
+        final com.googlecode.dex2jar.ir.ts.NpeTransformer T_npe = new com.googlecode.dex2jar.ir.ts.NpeTransformer();
+        final com.googlecode.dex2jar.ir.ts.MultiArrayTransformer T_multiArray = new com.googlecode.dex2jar.ir.ts.MultiArrayTransformer();
         @Override public void optimize(IrMethod irMethod) {
             T_cleanLabel.transform(irMethod);
             T_deadCode.transform(irMethod); T_removeLocal.transform(irMethod); T_removeConst.transform(irMethod);

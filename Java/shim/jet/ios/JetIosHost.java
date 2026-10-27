@@ -59,10 +59,40 @@ public final class JetIosHost {
                 }
             }
             Properties p = props(bundle);
+            // Index the dex now and start translating the entry points (Application, launcher activity and what they
+            // reference) on spare cores while the user is still looking at the import; launch reuses this loader.
+            long ti = System.nanoTime();
+            DexClassLoader cl = loader(dir);
+            for (String k : new String[]{"application", "mainActivity"}) { String c = p.getProperty(k, ""); if (!c.isEmpty()) cl.prefetch(c); }
+            tableTask(bundle, true);
+            long tx = System.nanoTime();
             int dex; try (ZipFile z = new ZipFile(base)) { dex = (int) z.stream().filter(x -> x.getName().matches("classes\\d*\\.dex")).count(); }
-            return String.format(Locale.US, "ok bundle_ms=%.0f total_ms=%.0f%npackage=%s%nlabel=%s%nmainActivity=%s%ndex=%d%nnative_libs=%d%n",
-                    (tb - t0) / 1e6, (System.nanoTime() - t0) / 1e6, p.getProperty("package", ""), p.getProperty("label", ""), p.getProperty("mainActivity", ""), dex, libs);
+            return String.format(Locale.US, "ok bundle_ms=%.0f dex_index_ms=%.0f total_ms=%.0f%npackage=%s%nlabel=%s%nmainActivity=%s%ndex=%d%nnative_libs=%d%n",
+                    (tb - t0) / 1e6, (tx - ti) / 1e6, (System.nanoTime() - t0) / 1e6, p.getProperty("package", ""), p.getProperty("label", ""), p.getProperty("mainActivity", ""), dex, libs);
         } catch (Throwable t) { return "error " + root(t) + " @ " + top(root(t)); }
+    }
+
+    static final Map<String, DexClassLoader> LOADERS = new HashMap<>();
+    static synchronized DexClassLoader loader(File dir) throws IOException {
+        String k = dir.getCanonicalPath();
+        DexClassLoader cl = LOADERS.get(k);
+        if (cl == null) { cl = new DexClassLoader(new File(dir, "base.apk"), new File(dir, "dexcache"), JetIosHost.class.getClassLoader()); LOADERS.put(k, cl); }
+        return cl;
+    }
+
+    /** One parsed resource table per bundle (values.xml is MBs of XML: parse once, off the main thread when possible,
+     *  instead of once for the Application and again for every Activity). */
+    static final Map<String, java.util.concurrent.FutureTask<ResTable>> TABLES = new HashMap<>();
+    static java.util.concurrent.FutureTask<ResTable> tableTask(File bundle, boolean background) throws IOException {
+        String k = bundle.getCanonicalPath(); java.util.concurrent.FutureTask<ResTable> f; boolean mine = false;
+        synchronized (TABLES) { f = TABLES.get(k); if (f == null) { f = new java.util.concurrent.FutureTask<>(() -> new ResTable(bundle, 2f)); TABLES.put(k, f); mine = true; } }
+        if (mine) { if (background) { Thread t = new Thread(null, f, "jet-res-preload", 16L << 20); t.setDaemon(true); t.start(); } else f.run(); }
+        return f;
+    }
+    static ResTable table(File bundle) throws Exception {
+        java.util.concurrent.FutureTask<ResTable> f = tableTask(bundle, false);
+        f.run();   // no-op if already run/running elsewhere
+        try { return f.get(); } catch (java.util.concurrent.ExecutionException e) { Throwable c = e.getCause(); throw c instanceof Exception ? (Exception) c : new RuntimeException(c); }
     }
 
     static Properties props(File bundle) throws IOException {
@@ -84,8 +114,9 @@ public final class JetIosHost {
         ui.setDaemon(true); ui.start();
         try { firstFrame.await(timeout, TimeUnit.MILLISECONDS); } catch (InterruptedException ignored) {}
         synchronized (JetIosHost.class) {
-            return "state=" + state + "\n" + report + String.format(Locale.US, "dex_classes_translated=%d%ndex_cache_hits=%d%ndex_translate_ms=%.0f%nsdk_stubs=%d%nsdk_stub_calls=%d%n",
-                    DexClassLoader.translated.get(), DexClassLoader.cacheHits.get(), DexClassLoader.translateNanos.get() / 1e6, SdkStubs.MISSING.size(), SdkStubs.STUB_CALLS.size());
+            return "state=" + state + "\n" + report + String.format(Locale.US, "dex_classes_translated=%d%ndex_cache_hits=%d%ndex_translate_ms=%.0f%ndex_lookahead_queued=%d%ndex_lookahead_hits=%d%ndex_lookahead_wait_ms=%.0f%nsdk_stubs=%d%nsdk_stub_calls=%d%n",
+                    DexClassLoader.translated.get(), DexClassLoader.cacheHits.get(), DexClassLoader.translateNanos.get() / 1e6,
+                    DexClassLoader.lookaheadQueued.get(), DexClassLoader.lookaheadHits.get(), DexClassLoader.lookaheadWaitNanos.get() / 1e6, SdkStubs.MISSING.size(), SdkStubs.STUB_CALLS.size());
         }
     }
 
@@ -107,7 +138,7 @@ public final class JetIosHost {
             Thread.setDefaultUncaughtExceptionHandler((th, ex) -> { log("thread_death", th.getName() + ": " + root(ex)); ex.printStackTrace(); });
 
             long tl = System.nanoTime();
-            DexClassLoader cl = new DexClassLoader(apk, new File(dir, "dexcache"), JetIosHost.class.getClassLoader());
+            DexClassLoader cl = loader(dir);
             Thread.currentThread().setContextClassLoader(cl);
             log("dex_index_ms", ms(tl)); log("dex_classes", cl.classCount());
 
@@ -117,7 +148,7 @@ public final class JetIosHost {
             if (!appName.isEmpty() && android.app.Application.jetCurrent == null) {
                 long ta = System.nanoTime();
                 android.app.Application app = (android.app.Application) cl.loadClass(appName).getDeclaredConstructor().newInstance();
-                app.jetAttach(new Resources(new ResTable(bundle, 2f)));
+                app.jetAttach(new Resources(table(bundle)));
                 android.app.Application.jetCurrent = app;
                 int aid = ResTable.refId(props.getProperty("appTheme", "")); if (aid != 0) app.setTheme(aid);
                 installProviders(cl, app, props);
@@ -132,7 +163,7 @@ public final class JetIosHost {
                 if (intent == null) { intent = new android.content.Intent(android.content.Intent.ACTION_MAIN); intent.addCategory(android.content.Intent.CATEGORY_LAUNCHER); intent.setClassName(pkg, main); }
                 act.setIntent(intent);
                 try { String so = props.getProperty("orientation." + main, ""); if (!so.isEmpty()) { Boolean l = Activity.jetIsLandscape(Integer.decode(so)); if (l != null) android.util.DisplayMetrics.jetSetLandscape(l); } } catch (Throwable ignore) {}
-                act.jetAttach(new Resources(new ResTable(bundle, 2f)));
+                act.jetAttach(new Resources(table(bundle)));
                 String th = props.getProperty("theme." + main, ""); if (th.isEmpty()) th = props.getProperty("appTheme", "");
                 int tid = ResTable.refId(th); if (tid != 0) act.setTheme(tid);
                 long tc = System.nanoTime();

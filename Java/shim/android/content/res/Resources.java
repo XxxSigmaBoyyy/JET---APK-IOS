@@ -78,9 +78,9 @@ public Resources(ResTable t) {
         }
     }
     public int getIdentifier(String name, String defType, String defPackage) {
-        String n = name; int c = n.indexOf(':'); if (c >= 0) n = n.substring(c + 1);
+        String n = name, pk = defPackage; int c = n.indexOf(':'); if (c >= 0) { pk = n.substring(0, c); n = n.substring(c + 1); }
         String ty = defType; int sl = n.indexOf('/'); if (sl >= 0) { ty = n.substring(0, sl); n = n.substring(sl + 1); }
-        Integer id = ty == null ? null : t.idByName(ty, n); return id == null ? 0 : id;
+        Integer id = ty == null ? null : t.idByName(ty, n, "android".equals(pk)); return id == null ? 0 : id;
     }
     public android.graphics.drawable.Drawable getDrawable(int id) { try { return t.drawable("@" + Integer.toHexString(id)); } catch (Throwable e) { return null; } }
     public android.graphics.drawable.Drawable getDrawable(int id, Theme th) { return getDrawable(id); }

@@ -74,7 +74,12 @@ public final class ResTable {
         return name;
     }
     /** Key under which a style item for attribute {@code id} is stored in values.xml. */
-    public String attrKey(int id) {
+    public synchronized String attrKey(int id) {
+        String c = attrKeyCache.get(id);
+        if (c == null) { c = attrKey0(id); attrKeyCache.put(id, c); }
+        return c;
+    }
+    private String attrKey0(int id) {
         // Style items and theme bags are keyed by attribute *name* ("colorPrimary"), never by the hex id.
         // Framework names come from fwattrs.properties; app names from values.xml. Fall back to 0x%08x when
         // unknown OR when the decoder stripped the name ("(name removed)") — otherwise every app attr
@@ -95,7 +100,7 @@ public final class ResTable {
             String n = name(id);
             if (n != null && !n.isEmpty() && !"(name removed)".equals(n)) return n;
         }
-        return String.format("0x%08x", id);
+        return hex8(id);
     }
     public boolean isStyle(int id) { return styleItems.containsKey(id); }
     /** "@7F120000" / "@android:0106000D" / "?7F04..." -> id (0 if not a ref). */
@@ -137,13 +142,37 @@ public final class ResTable {
 
     public String name(int id) { String[] n = names.get(id); return n == null ? null : n[1]; }
     public String fullName(int id) { String[] n = names.get(id); return n == null ? "0x" + Integer.toHexString(id) : ((id >>> 24) == 1 ? "android" : pkg) + ":" + n[0] + "/" + n[1]; }
-    public Integer idByName(String type, String name) {
-        for (Map.Entry<Integer, String[]> e : names.entrySet()) if (e.getValue()[0].equals(type) && e.getValue()[1].equals(name)) return e.getKey();
-        return null;
+    /** "type/name" -> id, built once (names only grows in the constructor); was a linear scan per lookup.
+     *  App resources win over framework ones of the same name; idByName(.., true) asks for android:. */
+    private Map<String, Integer> byName, byNameFw; private int byNameSize = -1;
+    public Integer idByName(String type, String name) { return idByName(type, name, false); }
+    public synchronized Integer idByName(String type, String name, boolean framework) {
+        if (byName == null || byNameSize != names.size()) {
+            Map<String, Integer> app = new HashMap<>(names.size() * 2), fw = new HashMap<>(names.size());
+            for (Map.Entry<Integer, String[]> e : names.entrySet()) {
+                String k = e.getValue()[0] + "/" + e.getValue()[1];
+                Map<String, Integer> m = (e.getKey() >>> 24) == 0x01 ? fw : app;
+                Integer prev = m.get(k);
+                if (prev == null || (e.getKey() & 0xffffffffL) < (prev & 0xffffffffL)) m.put(k, e.getKey());
+            }
+            byName = app; byNameFw = fw; byNameSize = names.size();
+        }
+        String k = type + "/" + name;
+        Integer r = framework ? byNameFw.get(k) : byName.get(k);
+        return r != null ? r : (framework ? byName.get(k) : byNameFw.get(k));
     }
+    private static String hex8(int a) { String h = Integer.toHexString(a); return "0x" + "00000000".substring(h.length()) + h; }
+    private final Map<Integer, String> attrKeyCache = new HashMap<>();
+    private final Map<Integer, Map<String, String>> styleCache = new HashMap<>();
 
     /** Flattened style attributes along the parent chain (self-referential ?attr/X→X items skipped). */
     public Map<String, String> style(int id) {
+        Map<String, String> c;
+        synchronized (this) { c = styleCache.get(id); }
+        if (c == null) { c = style0(id); synchronized (this) { styleCache.put(id, c); } }
+        return new LinkedHashMap<>(c);   // callers may mutate; styles never change after load
+    }
+    private Map<String, String> style0(int id) {
         LinkedList<Map<String, String>> chain = new LinkedList<>();
         Integer cur = id;
         while (cur != null && styleItems.containsKey(cur)) { chain.addFirst(styleItems.get(cur)); cur = styleParent.get(cur); }
@@ -154,7 +183,7 @@ public final class ResTable {
             // bridge themes; putAll would overwrite Theme.Material's concrete @color → Theme.raw self-ref → magenta.
             if (v != null && v.startsWith("?")) {
                 int a = refId(v); String ak = attrKey(a);
-                if (key.equals(ak) || key.equals(String.format("0x%08x", a)) || key.equals(name(a))) continue;
+                if (key.equals(ak) || key.equals(hex8(a)) || key.equals(name(a))) continue;
             }
             out.put(key, v);
         }
