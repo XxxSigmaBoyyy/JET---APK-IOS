@@ -78,14 +78,16 @@ def ensure_unpacked(path):
             os.unlink(tmp.name); return path
     return path
 
-def main(elf_path, out_path, shim_install='@rpath/libjetbionic.dylib', install_name=None):
+PLATFORMS = {'ios': 2, 'macos': 1, 'iossim': 7}
+
+def main(elf_path, out_path, shim_install='@rpath/libjetbionic.dylib', install_name=None, platform='ios', abi=()):
     work = ensure_unpacked(elf_path)
     try:
-        convert(work, out_path, shim_install, install_name or ('@rpath/' + os.path.basename(out_path)))
+        convert(work, out_path, shim_install, install_name or ('@rpath/' + os.path.basename(out_path)), platform, abi)
     finally:
         if work != elf_path: os.unlink(work)
 
-def convert(elf_path, out_path, shim_install, install_name):
+def convert(elf_path, out_path, shim_install, install_name, platform='ios', abi=()):
     raw = bytearray(open(elf_path, 'rb').read())
     elf = ELFFile(io.BytesIO(raw))
     if elf.get_machine_arch() != 'AArch64': raise Refuse('not arm64 ELF')
@@ -126,7 +128,7 @@ def convert(elf_path, out_path, shim_install, install_name):
     dynsym = next(s for s in elf.iter_sections() if s.name == '.dynsym')
     syms = list(dynsym.iter_symbols())
 
-    relatives, binds, import_names = [], [], {}
+    relatives, binds, import_names, weak = [], [], {}, set()
     for sec in elf.iter_sections():
         if sec.name in ('.rela.dyn', '.rela.plt') and hasattr(sec, 'iter_relocations'):
             for r in sec.iter_relocations():
@@ -140,6 +142,8 @@ def convert(elf_path, out_path, shim_install, install_name):
                     if not nm:
                         relatives.append((off, add)); continue
                     if syms[si].entry.st_shndx == 'SHN_UNDEF':
+                        if nm in abi: nm = 'jb_' + nm          # ABI-divergent: bridge's translating wrapper
+                        if syms[si].entry.st_info.bind == 'STB_WEAK': weak.add(nm)
                         binds.append((off, nm, add)); import_names.setdefault(nm, None)
                     else:
                         # own symbol: materialize S+A and rebase
@@ -181,7 +185,7 @@ def convert(elf_path, out_path, shim_install, install_name):
     last_add = 0
     for va, nm, add in sorted(binds):
         seg, off = to_seg(va)
-        bd += bytes([BIND_SET_SYM]) + nm.encode() + b'\0'
+        bd += bytes([BIND_SET_SYM | (1 if nm in weak else 0)]) + ('_' + nm).encode() + b'\0'
         if add != last_add: bd += bytes([BIND_SET_ADD]) + sleb(add); last_add = add
         bd += bytes([BIND_SET_SEG | seg]) + uleb(off) + bytes([BIND_DO])
     bd += bytes([BIND_DONE])
@@ -189,36 +193,63 @@ def convert(elf_path, out_path, shim_install, install_name):
     # ---- export trie (flat root -> each name as one edge) ----
     # Darwin C convention: leading underscore on every C symbol.
     def build_export_trie(exps):
+        """Proper Mach-O export trie (child count is one byte, so a flat root is not an option)."""
         if not exps: return b''
-        terms, names = {}, []
+        root = {'term': None, 'kids': {}}
         for nm, off in exps:
-            dnm = '_' + nm
-            payload = uleb(0) + uleb(off)  # KIND_REGULAR
-            term = uleb(len(payload)) + payload + bytes([0])
-            terms[dnm] = term; names.append(dnm)
-        names.sort()
-        root = bytearray(uleb(0)) + uleb(len(names))
-        slots = []
-        for nm in names:
-            root += nm.encode() + b'\0'; slots.append(len(root)); root += b'\0'*5
-        blob = bytearray(root); offs = {}
-        for nm in names:
-            offs[nm] = len(blob); blob += terms[nm]
-        for i, nm in enumerate(names):
-            struct.pack_into('5s', blob, slots[i], uleb5(offs[nm]))
-        return bytes(blob)
-    export_trie = build_export_trie(exports)
+            node, key = root, '_' + nm
+            while True:  # insert with edge splitting (radix tree)
+                for lab in list(node['kids']):
+                    i = 0
+                    while i < len(lab) and i < len(key) and lab[i] == key[i]: i += 1
+                    if i == 0: continue
+                    if i < len(lab):  # split edge
+                        mid = {'term': None, 'kids': {lab[i:]: node['kids'].pop(lab)}}
+                        node['kids'][lab[:i]] = mid; lab = lab[:i]
+                    node, key = node['kids'][lab], key[i:]
+                    break
+                else:
+                    if key:
+                        node['kids'][key] = {'term': None, 'kids': {}}; node = node['kids'][key]; key = ''
+                    if not key: break
+                    continue
+                if not key: break
+            node['term'] = uleb(0) + uleb(off)
+        nodes = []
+        def walk(n):
+            nodes.append(n)
+            for lab in sorted(n['kids']): walk(n['kids'][lab])
+        walk(root)
+        for n in nodes: n['off'] = 0
+        while True:  # iterate offsets to a fixed point (uleb sizes depend on offsets)
+            pos, changed = 0, False
+            for n in nodes:
+                if n['off'] != pos: n['off'] = pos; changed = True
+                t = n['term'] or b''
+                sz = len(uleb(len(t))) + len(t) + 1
+                for lab, k in n['kids'].items(): sz += len(lab) + 1 + len(uleb(k['off']))
+                pos += sz
+            if not changed: break
+        out = bytearray()
+        for n in nodes:
+            t = n['term'] or b''
+            out += uleb(len(t)) + t
+            assert len(n['kids']) < 256
+            out.append(len(n['kids']))
+            for lab in sorted(n['kids']): out += lab.encode() + b'\0' + uleb(n['kids'][lab]['off'])
+        return bytes(out)
+
 
     # ---- nlist ----
     strtab = bytearray(b'\0')
     def addstr(s):
         o = len(strtab); strtab.extend(s.encode()+b'\0'); return o
     nlist = []
-    for nm, va in sorted(exports):
+    for nm, va in sorted(exports + [('_jet_elf_meta', 0)] if False else exports):
         nlist.append((addstr('_'+nm), N_SECT|N_EXT, 1, 0, va))
     n_defs = len(nlist)
     for nm in sorted(import_names):
-        nlist.append((addstr('_'+nm), N_UNDF|N_EXT, 0, 0, 0))
+        nlist.append((addstr('_'+nm), N_UNDF|N_EXT, 0, 0x100 | (0x40 if nm in weak else 0), 0))
     n_undf = len(import_names)
 
     # ---- segment buffers (va-keyed) ----
@@ -261,6 +292,20 @@ def convert(elf_path, out_path, shim_install, install_name):
     ncmds_size = scsz(1) + scsz(ndata_sects) + scsz(0) + 48 + 24 + 80 + 24+len(idname) + 24+len(shimname) + 24
     ncmds = 9
     hdr_size = 32 + ncmds_size
+    # ELF program headers for the bridge's dl_iterate_phdr (static libunwind finds PT_GNU_EH_FRAME through it):
+    # {u32 'JETP', u32 phnum, u64 0, Elf64_Phdr[phnum]} right after the Mach-O header, exported as __jet_elf_meta.
+    eh = elf.header; phblob = bytes(raw[eh['e_phoff']:eh['e_phoff'] + eh['e_phnum'] * eh['e_phentsize']])
+    meta_off = (hdr_size + 7) // 8 * 8
+    meta = struct.pack('<4sIQ', b'JETP', eh['e_phnum'], 0) + phblob
+    code_start = (meta_off + len(meta) + 15) // 16 * 16
+    # The header+meta overwrite the start of the RX image: only loader-only ELF data may live there.
+    LOADER_ONLY = {'SHT_NULL', 'SHT_DYNSYM', 'SHT_STRTAB', 'SHT_HASH', 'SHT_GNU_HASH', 'SHT_GNU_versym', 'SHT_GNU_verdef',
+                   'SHT_GNU_verneed', 'SHT_NOTE', 'SHT_RELA', 'SHT_REL', 'SHT_RELR', 'SHT_ANDROID_RELA', 'SHT_ANDROID_REL',
+                   'SHT_ANDROID_RELR', 'SHT_LOOS+0x6000001', 'SHT_LOOS+0x6000002', 0x60000001, 0x60000002, 0x6fffff00}
+    for sec in elf.iter_sections():
+        if sec['sh_flags'] & 2 and sec['sh_size'] and sec['sh_addr'] < code_start and sec['sh_type'] not in LOADER_ONLY:
+            raise Refuse('Mach-O header would overwrite live section %s (%s)' % (sec.name, sec['sh_type']))
+    exports.append(('_jet_elf_meta', tlo + meta_off))
     if hdr_size > len(text_buf):
         raise Refuse('header (%d) larger than __TEXT (%d)' % (hdr_size, len(text_buf)))
 
@@ -269,6 +314,7 @@ def convert(elf_path, out_path, shim_install, install_name):
     data_filesize = len(data_buf)
     linkedit_fileoff = (data_fileoff + data_filesize + PAGE - 1) // PAGE * PAGE
 
+    export_trie = build_export_trie(exports)
     le = bytearray()
     rebase_off = linkedit_fileoff + len(le); le += rb
     bind_off   = linkedit_fileoff + len(le); le += bd
@@ -286,8 +332,8 @@ def convert(elf_path, out_path, shim_install, install_name):
     text_vmsize = (len(text_buf)+PAGE-1)//PAGE*PAGE
     out.write(struct.pack('<II16sQQQQiiII', LC_SEGMENT_64, scsz(1), b'__TEXT',
                           tlo, text_vmsize, text_fileoff, text_filesize, VM_R|VM_X, VM_R|VM_X, 1, 0))
-    out.write(struct.pack('<16s16sQQIIIIIIII', b'__text', b'__TEXT', tlo+hdr_size, len(text_buf)-hdr_size,
-                          hdr_size, 2, 0, 0, S_REGULAR|S_ATTR_CODE, 0, 0, 0))
+    out.write(struct.pack('<16s16sQQIIIIIIII', b'__text', b'__TEXT', tlo+code_start, len(text_buf)-code_start,
+                          code_start, 4, 0, 0, S_REGULAR|S_ATTR_CODE, 0, 0, 0))
     data_vmsize = max((dhi - dlo + PAGE-1)//PAGE*PAGE, PAGE if data_segs else 0)
     out.write(struct.pack('<II16sQQQQiiII', LC_SEGMENT_64, scsz(ndata_sects), b'__DATA',
                           dlo, data_vmsize, data_fileoff, data_filesize, VM_R|VM_W, VM_R|VM_W, ndata_sects, 0))
@@ -305,10 +351,11 @@ def convert(elf_path, out_path, shim_install, install_name):
     out.write(struct.pack('<II'+'I'*18, LC_DYSYMTAB, 80, 0,0, 0,n_defs, n_defs,n_undf, 0,0, 0,0, 0,0, 0,0, 0,0, 0,0))
     out.write(struct.pack('<IIIIII', LC_ID_DYLIB, 24+len(idname), 24, 0, 0x10000, 0x10000)); out.write(idname)
     out.write(struct.pack('<IIIIII', LC_LOAD_DYLIB, 24+len(shimname), 24, 0, 0x10000, 0x10000)); out.write(shimname)
-    out.write(struct.pack('<IIIIII', LC_BUILD_VERSION, 24, PLATFORM_IOS, 14<<16, 14<<16, 0))
+    out.write(struct.pack('<IIIIII', LC_BUILD_VERSION, 24, PLATFORMS[platform], (11 if platform == 'macos' else 15)<<16, 26<<16, 0))
     assert out.tell() == hdr_size, (out.tell(), hdr_size)
 
     buf = bytearray(text_buf); buf[:hdr_size] = out.getvalue()
+    buf[hdr_size:code_start] = b'\0' * (code_start - hdr_size); buf[meta_off:meta_off + len(meta)] = meta
     final = io.BytesIO(); final.write(buf)
     final.write(b'\0'*(data_fileoff - final.tell()))
     final.write(data_buf)
@@ -321,6 +368,14 @@ def convert(elf_path, out_path, shim_install, install_name):
 
 if __name__ == '__main__':
     try:
-        main(*sys.argv[1:])
+        import argparse
+        ap = argparse.ArgumentParser(description='generic ELF (Android arm64 .so) -> Mach-O dylib repack')
+        ap.add_argument('elf'); ap.add_argument('out')
+        ap.add_argument('--platform', choices=sorted(PLATFORMS), default='ios')
+        ap.add_argument('--abi-list', help='names the bridge implements as jb_<name> (gen_abi_list.py)')
+        ap.add_argument('--bridge', default='@rpath/libjetbionic.dylib'); ap.add_argument('--install-name')
+        a = ap.parse_args()
+        abi = set(open(a.abi_list).read().split()) if a.abi_list else set()
+        main(a.elf, a.out, a.bridge, a.install_name, a.platform, abi)
     except Refuse as e:
         print('REFUSED: %s' % e, file=sys.stderr); sys.exit(2)
