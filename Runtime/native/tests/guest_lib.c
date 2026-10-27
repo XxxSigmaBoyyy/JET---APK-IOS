@@ -423,3 +423,215 @@ int guest_statvfs_no_smash(void) {
     if (*(u64 *)b == 0) return 3;                                  /* f_bsize */
     return 0;
 }
+
+/* ===================== v10.2: filesystem + netdb guest tests ===================== */
+extern int *__errno(void);
+extern int mkdir(const char*, unsigned);   extern int mkdirat(int, const char*, unsigned);
+extern int unlink(const char*);            extern int unlinkat(int, const char*, int);
+extern int rmdir(const char*);             extern int remove(const char*);
+extern int rename(const char*, const char*);
+extern int renameat(int, const char*, int, const char*);
+extern int renameat2(int, const char*, int, const char*, unsigned);
+extern int symlink(const char*, const char*); extern int symlinkat(const char*, int, const char*);
+extern long readlink(const char*, char*, u64); extern long readlinkat(int, const char*, char*, u64);
+extern int link(const char*, const char*);  extern int linkat(int, const char*, int, const char*, int);
+extern int access(const char*, int);        extern int faccessat(int, const char*, int, int);
+extern int chmod(const char*, unsigned);    extern int fchmod(int, unsigned);
+extern int fchmodat(int, const char*, unsigned, int);
+extern int truncate(const char*, i64);      extern int ftruncate(int, i64);
+extern int utimensat(int, const char*, const void*, int); extern int futimens(int, const void*);
+extern int fsync(int);                      extern int fdatasync(int);
+extern int open(const char*, int, ...);     extern int close(int);
+extern long write(int, const void*, u64);
+extern int fstatat(int, const char*, void*, int);
+
+#define GE (*__errno())
+#define AT_FDCWD_ (-100)
+struct g_stat { u64 dev, ino; unsigned mode, nlink, uid, gid; u64 rdev, pad; i64 size; int blksize, pad2; i64 blocks;
+                i64 atime, atime_ns, mtime, mtime_ns, ctime, ctime_ns; unsigned unused[2]; };   /* 128 */
+struct g_ts { i64 sec, nsec; };
+
+static void pj(char *o, const char *d, const char *n) {
+    int i = 0; while (*d) o[i++] = *d++; o[i++] = '/'; while (*n) o[i++] = *n++; o[i] = 0;
+}
+static int gstreq(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
+static i64 raw_svc5(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
+    register u64 x8 __asm__("x8") = nr;
+    register u64 x0 __asm__("x0") = a0; register u64 x1 __asm__("x1") = a1;
+    register u64 x2 __asm__("x2") = a2; register u64 x3 __asm__("x3") = a3; register u64 x4 __asm__("x4") = a4;
+    __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4) : "memory");
+    return (i64)x0;
+}
+#define FAILS(n, cond) do { if (!(cond)) return (n); } while (0)
+#define ERR(n, call, e) do { GE = 0; if ((call) != -1 || GE != (e)) return (n); } while (0)
+
+/* dir: an existing empty temp directory (host path; identity-mapped). Returns 0 or the failing step. */
+int guest_fs_ops(const char *dir) {
+    char a[512], b[512], f[512], f2[512], l[512], hl[512], hl2[512], x[512], buf[64];
+    struct g_stat st;
+    pj(a, dir, "a"); pj(b, dir, "b"); pj(x, dir, "nope");
+    FAILS(1, mkdir(a, 0755) == 0);
+    ERR(2, mkdir(a, 0755), 17);                                     /* EEXIST */
+    FAILS(3, mkdirat(AT_FDCWD_, b, 0700) == 0);
+    pj(f, a, "f"); pj(f2, a, "f2"); pj(l, a, "l"); pj(hl, a, "hl"); pj(hl2, a, "hl2");
+    int fd = open(f, 0101 /*O_WRONLY|O_CREAT*/, 0644);
+    FAILS(4, fd >= 0);
+    FAILS(5, write(fd, "hello", 5) == 5);
+    FAILS(6, fsync(fd) == 0 && fdatasync(fd) == 0);
+    FAILS(7, ftruncate(fd, 3) == 0);
+    ERR(8, ftruncate(fd, -1), 22);
+    struct g_ts now2[2] = { { 0, (1 << 30) - 1 }, { 0, (1 << 30) - 1 } };   /* UTIME_NOW both */
+    FAILS(9, futimens(fd, now2) == 0);
+    FAILS(10, fchmod(fd, 0600) == 0);
+    close(fd);
+    ERR(11, fsync(fd), 9);                                          /* EBADF after close */
+    FAILS(12, truncate(f, 2) == 0 && fstatat(AT_FDCWD_, f, &st, 0) == 0 && st.size == 2);
+    FAILS(13, (st.mode & 0777) == 0600);
+    ERR(14, truncate(x, 0), 2);                                     /* ENOENT */
+    /* symlink / readlink */
+    FAILS(15, symlink("f", l) == 0);
+    for (int i = 0; i < 64; i++) buf[i] = 'Z';
+    FAILS(16, readlink(l, buf, 64) == 1 && buf[0] == 'f' && buf[1] == 'Z');
+    FAILS(17, readlinkat(AT_FDCWD_, l, buf, 64) == 1);
+    ERR(18, readlinkat(AT_FDCWD_, l, buf, 0), 22);
+    ERR(19, readlink(f, buf, 64), 22);                              /* not a link */
+    ERR(20, symlink("f", l), 17);
+    FAILS(21, symlinkat("f2", AT_FDCWD_, x) == 0 && unlink(x) == 0);
+    /* link: Linux semantics = hard link to the symlink itself */
+    FAILS(22, link(l, hl) == 0 && fstatat(AT_FDCWD_, hl, &st, 0x100) == 0 && (st.mode & 0170000) == 0120000);
+    FAILS(23, linkat(AT_FDCWD_, l, AT_FDCWD_, hl2, 0x400) == 0 && fstatat(AT_FDCWD_, hl2, &st, 0x100) == 0
+              && (st.mode & 0170000) == 0100000 && st.nlink == 2);
+    ERR(24, linkat(AT_FDCWD_, f, AT_FDCWD_, x, 0x8), 22);
+    ERR(25, link(f, hl2), 17);
+    /* access */
+    FAILS(26, access(f, 4) == 0 && access(f, 0) == 0);
+    ERR(27, access(f, 8), 22);
+    ERR(28, access(x, 0), 2);
+    FAILS(29, faccessat(AT_FDCWD_, f, 4, 0x200) == 0 && faccessat(AT_FDCWD_, l, 0, 0x100) == 0);
+    ERR(30, faccessat(AT_FDCWD_, f, 0, 0x1), 22);
+    /* chmod */
+    FAILS(31, chmod(f, 0640) == 0 && fstatat(AT_FDCWD_, f, &st, 0) == 0 && (st.mode & 0777) == 0640);
+    FAILS(32, fchmodat(AT_FDCWD_, f, 0604, 0) == 0 && fstatat(AT_FDCWD_, f, &st, 0) == 0 && (st.mode & 0777) == 0604);
+    ERR(33, fchmodat(AT_FDCWD_, f, 0600, 0x2), 22);
+    ERR(34, chmod(x, 0600), 2);
+    /* utimensat: set atime, OMIT mtime */
+    FAILS(35, fstatat(AT_FDCWD_, f, &st, 0) == 0);
+    i64 m0 = st.mtime, m0n = st.mtime_ns;
+    struct g_ts ts[2] = { { 1000000000, 5000 }, { 1234567890, (1 << 30) - 2 } };
+    FAILS(36, utimensat(AT_FDCWD_, f, ts, 0) == 0 && fstatat(AT_FDCWD_, f, &st, 0) == 0);
+    FAILS(37, st.atime == 1000000000 && st.atime_ns == 5000 && st.mtime == m0 && st.mtime_ns == m0n);
+    struct g_ts ts2[2] = { { 0, (1 << 30) - 2 }, { 1500000000, 0 } };
+    FAILS(38, utimensat(AT_FDCWD_, f, ts2, 0) == 0 && fstatat(AT_FDCWD_, f, &st, 0) == 0
+              && st.atime == 1000000000 && st.mtime == 1500000000);
+    FAILS(39, utimensat(AT_FDCWD_, f, 0, 0) == 0 && fstatat(AT_FDCWD_, f, &st, 0) == 0 && st.mtime > 1500000000);
+    ERR(40, utimensat(AT_FDCWD_, f, 0, 0x1), 22);
+    struct g_ts bad[2] = { { 0, 1000000000 }, { 0, 0 } };
+    ERR(41, utimensat(AT_FDCWD_, f, bad, 0), 22);
+    FAILS(42, utimensat(AT_FDCWD_, l, ts, 0x100) == 0);             /* NOFOLLOW on symlink */
+    /* rename family */
+    FAILS(43, rename(f, f2) == 0 && access(f, 0) == -1 && access(f2, 0) == 0);
+    ERR(44, renameat2(AT_FDCWD_, f2, AT_FDCWD_, hl2, 1), 17);       /* NOREPLACE -> EEXIST */
+    ERR(45, renameat2(AT_FDCWD_, f2, AT_FDCWD_, f, 2), 22);         /* EXCHANGE -> EINVAL */
+    ERR(46, renameat2(AT_FDCWD_, f2, AT_FDCWD_, f, 4), 22);         /* WHITEOUT -> EINVAL */
+    FAILS(47, renameat2(AT_FDCWD_, f2, AT_FDCWD_, f, 1) == 0 && access(f, 0) == 0);
+    FAILS(48, renameat2(AT_FDCWD_, f, AT_FDCWD_, f2, 0) == 0 && renameat(AT_FDCWD_, f2, AT_FDCWD_, f) == 0
+              && access(f, 0) == 0);
+    ERR(49, rename(x, f2), 2);
+    /* unlink / rmdir */
+    ERR(50, unlink(a), 21);                                         /* EISDIR (Darwin EPERM fixed up) */
+    ERR(51, unlinkat(AT_FDCWD_, a, 0), 21);
+    ERR(52, unlinkat(AT_FDCWD_, a, 0x1), 22);
+    ERR(53, rmdir(a), 39);                                          /* ENOTEMPTY */
+    ERR(54, unlinkat(AT_FDCWD_, a, 0x200), 39);
+    ERR(55, rmdir(f), 20);                                          /* ENOTDIR */
+    FAILS(56, unlinkat(AT_FDCWD_, b, 0x200) == 0 && access(b, 0) == -1);
+    FAILS(57, unlink(l) == 0 && unlinkat(AT_FDCWD_, hl, 0) == 0 && remove(hl2) == 0 && remove(f) == 0);
+    ERR(58, remove(x), 2);
+    ERR(59, unlink(f), 2);
+    /* raw SVC path (kernel ABI, -errno returns) */
+    FAILS(60, raw_svc5(34, (u64)-100, (u64)b, 0700, 0, 0) == 0);    /* mkdirat */
+    FAILS(61, raw_svc5(34, (u64)-100, (u64)b, 0700, 0, 0) == -17);
+    FAILS(62, raw_svc5(48, (u64)-100, (u64)b, 0, 0x12345, 0) == 0); /* faccessat: no flags arg */
+    FAILS(63, raw_svc5(439, (u64)-100, (u64)b, 0, 0x1, 0) == -22);  /* faccessat2 bad flags */
+    FAILS(64, raw_svc5(35, (u64)-100, (u64)b, 0, 0, 0) == -21);     /* unlinkat dir w/o REMOVEDIR */
+    FAILS(65, raw_svc5(276, (u64)-100, (u64)b, (u64)-100, (u64)x, 2) == -22); /* renameat2 EXCHANGE */
+    FAILS(66, raw_svc5(276, (u64)-100, (u64)b, (u64)-100, (u64)x, 1) == 0);   /* NOREPLACE ok */
+    FAILS(67, raw_svc5(36, (u64)"nope", (u64)-100, (u64)b, 0, 0) == 0);       /* symlinkat */
+    FAILS(68, raw_svc5(78, (u64)-100, (u64)b, (u64)buf, 64, 0) == 4);         /* readlinkat */
+    FAILS(69, raw_svc5(35, (u64)-100, (u64)b, 0, 0, 0) == 0);
+    FAILS(70, raw_svc5(35, (u64)-100, (u64)x, 0x200, 0, 0) == 0);
+    FAILS(71, raw_svc5(35, (u64)-100, (u64)a, 0x200, 0, 0) == 0);
+    FAILS(72, raw_svc5(35, (u64)-100, (u64)a, 0x200, 0, 0) == -2);
+    FAILS(73, raw_svc5(82, 9999, 0, 0, 0, 0) == -9);                 /* fsync EBADF */
+    return 0;
+}
+
+/* ---- netdb: guest bionic addrinfo (48 bytes, BSD order) ---- */
+struct g_ai { int flags, family, socktype, protocol; unsigned addrlen; int pad;
+              char *canonname; unsigned char *addr; struct g_ai *next; };
+extern int getaddrinfo(const char*, const char*, const struct g_ai*, struct g_ai**);
+extern void freeaddrinfo(struct g_ai*);
+extern int getnameinfo(const void*, unsigned, char*, u64, char*, u64, int);
+extern const char *gai_strerror(int);
+
+static void ai_zero(struct g_ai *h) { char *p = (char*)h; for (int i = 0; i < 48; i++) p[i] = 0; }
+
+int guest_netdb(void) {
+    struct g_ai h, *r = 0;
+    if (sizeof(struct g_ai) != 48 || __builtin_offsetof(struct g_ai, canonname) != 24
+        || __builtin_offsetof(struct g_ai, addr) != 32 || __builtin_offsetof(struct g_ai, next) != 40) return 1;
+    /* IPv6 numeric */
+    ai_zero(&h); h.flags = 4 | 8; h.family = 10; h.socktype = 1;
+    FAILS(2, getaddrinfo("::1", "8080", &h, &r) == 0 && r);
+    FAILS(3, r->family == 10 && r->socktype == 1 && r->addrlen == 28 && r->next == 0 && r->canonname == 0);
+    FAILS(4, r->addr && r->addr[0] == 10 && r->addr[1] == 0 && r->addr[2] == 0x1f && r->addr[3] == 0x90);
+    for (int i = 8; i < 23; i++) FAILS(5, r->addr[i] == 0);
+    FAILS(6, r->addr[23] == 1);
+    freeaddrinfo(r); r = 0;
+    /* IPv4 numeric + canonname */
+    ai_zero(&h); h.flags = 4 | 8 | 2; h.family = 2; h.socktype = 2;
+    FAILS(7, getaddrinfo("127.0.0.1", "80", &h, &r) == 0 && r);
+    FAILS(8, r->family == 2 && r->socktype == 2 && r->protocol == 17 && r->addrlen == 16);
+    FAILS(9, r->addr[0] == 2 && r->addr[1] == 0 && r->addr[2] == 0 && r->addr[3] == 80
+             && r->addr[4] == 127 && r->addr[5] == 0 && r->addr[6] == 0 && r->addr[7] == 1);
+    FAILS(10, r->canonname && gstreq(r->canonname, "127.0.0.1"));
+    /* getnameinfo round-trip on the guest sockaddr */
+    char host[64], serv[16];
+    FAILS(11, getnameinfo(r->addr, r->addrlen, host, sizeof host, serv, sizeof serv, 2 | 8) == 0
+              && gstreq(host, "127.0.0.1") && gstreq(serv, "80"));
+    FAILS(12, getnameinfo(r->addr, r->addrlen, host, 3, 0, 0, 2) == 14);          /* EAI_OVERFLOW */
+    FAILS(13, getnameinfo(r->addr, 7, host, sizeof host, 0, 0, 2) == 5);          /* bad salen -> EAI_FAMILY (bionic) */
+    freeaddrinfo(r); r = 0;
+    /* null hints -> list over socktypes, walk next */
+    FAILS(14, getaddrinfo("127.0.0.1", "443", 0, &r) == 0 && r);
+    int n = 0;
+    for (struct g_ai *p = r; p; p = p->next) {
+        n++;
+        FAILS(15, p->family == 2 && p->addrlen == 16 && p->addr[0] == 2 && p->addr[2] == 1 && p->addr[3] == 0xbb);
+        FAILS(16, (unsigned char*)p->addr == (unsigned char*)p + 48);              /* one guest-owned block */
+    }
+    FAILS(17, n >= 1);
+    freeaddrinfo(r); r = 0;
+    /* IPv6 getnameinfo */
+    unsigned char s6[28] = {0}; s6[0] = 10; s6[2] = 0x01; s6[3] = 0xbb; s6[23] = 1;
+    FAILS(18, getnameinfo(s6, 28, host, sizeof host, serv, sizeof serv, 2 | 8) == 0 && gstreq(host, "::1") && gstreq(serv, "443"));
+    /* errors: positive bionic EAI codes */
+    ai_zero(&h); h.flags = 4;
+    FAILS(19, getaddrinfo("not-an-ip", 0, &h, &r) == 8);               /* EAI_NONAME */
+    FAILS(20, getaddrinfo(0, 0, 0, &r) == 8);
+    ai_zero(&h); h.flags = 0x800;
+    FAILS(21, getaddrinfo("127.0.0.1", 0, &h, &r) == 3);               /* EAI_BADFLAGS */
+    ai_zero(&h); h.family = 1;
+    FAILS(22, getaddrinfo("127.0.0.1", 0, &h, &r) == 5);               /* EAI_FAMILY */
+    ai_zero(&h); h.socktype = 5;
+    FAILS(23, getaddrinfo("127.0.0.1", 0, &h, &r) == 10);              /* EAI_SOCKTYPE */
+    ai_zero(&h); h.next = &h;
+    FAILS(24, getaddrinfo("127.0.0.1", 0, &h, &r) == 12);              /* EAI_BADHINTS */
+    ai_zero(&h); h.flags = 4 | 8;
+    FAILS(25, getaddrinfo("127.0.0.1", "http", &h, &r) == 8);          /* NUMERICSERV non-numeric */
+    ai_zero(&h); h.flags = 4; h.family = 10;
+    FAILS(26, getaddrinfo("127.0.0.1", 0, &h, &r) != 0);               /* v4 literal w/ AF_INET6 */
+    FAILS(27, gstreq(gai_strerror(8), "hostname nor servname provided, or not known"));
+    FAILS(28, gstreq(gai_strerror(0), "Success") && gstreq(gai_strerror(99), "Unknown error"));
+    return 0;
+}

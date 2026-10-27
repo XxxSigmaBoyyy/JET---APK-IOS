@@ -4,12 +4,12 @@ CFLAGS ?= -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-unused-functi
 CFLAGS += -fno-strict-aliasing -D_GNU_SOURCE -Ithird_party
 LDFLAGS ?= -lpthread -ldl -lm -Lthird_party -lz
 
-SRCS = ctx.c decode.c elf_loader.c interp.c host_bionic.c guest_abi.c darwin_abi.c epoll_kq.c jni_bridge.c trampoline.c setjmp_guest.c asimd.c
+SRCS = ctx.c decode.c elf_loader.c interp.c host_bionic.c guest_abi.c darwin_abi.c epoll_kq.c netdb_abi.c jni_bridge.c trampoline.c setjmp_guest.c asimd.c
 OBJS = $(SRCS:%.c=build/%.o)
 
 .PHONY: all clean test test-unit test-tg test-jni ios-syntax check
 
-all: build/libjet_native.a build/test_unit build/test_tg build/test_jni build/test_mem_bitfield build/test_v9_jni_dl build/test_cxx_eh build/test_v10_trap_abi build/test_v101_guest_abi build/test_v101_darwin_abi build/test_v11_xzr_excl build/decode_sweep
+all: build/libjet_native.a build/test_unit build/test_tg build/test_jni build/test_mem_bitfield build/test_v9_jni_dl build/test_cxx_eh build/test_v10_trap_abi build/test_v101_guest_abi build/test_v101_darwin_abi build/test_v11_xzr_excl build/test_v102_fs_netdb build/decode_sweep
 
 build:
 	mkdir -p build
@@ -62,6 +62,12 @@ build/test_v10_trap_abi: tests/test_v10_trap_abi.c build/libjet_native.a tests/g
 
 build/test_v101_guest_abi: tests/test_v101_guest_abi.c build/libjet_native.a tests/guest_lib.so
 	$(CC) $(CFLAGS) tests/test_v101_guest_abi.c -I. -Lbuild -ljet_native $(LDFLAGS) -o $@
+
+build/test_v102_fs_netdb: tests/test_v102_fs_netdb.c build/libjet_native.a tests/guest_lib.so
+	$(CC) $(CFLAGS) tests/test_v102_fs_netdb.c -I. -Lbuild -ljet_native $(LDFLAGS) -o $@
+
+test-v102: build/test_v102_fs_netdb
+	./build/test_v102_fs_netdb
 
 build/test_v101_darwin_abi: tests/test_v101_darwin_abi.c build/libjet_native.a tests/guest_lib.so
 	$(CC) $(CFLAGS) tests/test_v101_darwin_abi.c -I. -Lbuild -ljet_native $(LDFLAGS) -o $@

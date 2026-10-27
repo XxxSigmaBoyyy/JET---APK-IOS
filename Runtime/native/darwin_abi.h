@@ -128,6 +128,15 @@ int      jet_xl_rlimit_res_l2d(int linux_res);         /* -1 = unsupported */
 uint64_t jet_xl_rlim_l2d(uint64_t v);
 uint64_t jet_xl_rlim_d2l(uint64_t v);
 unsigned long jet_xl_ioctl_l2d(unsigned long linux_req);
+/* v10.2 fs */
+#define JL_UTIME_NOW   ((1L << 30) - 1)
+#define JL_UTIME_OMIT  ((1L << 30) - 2)
+#define JD_UTIME_NOW   (-1L)
+#define JD_UTIME_OMIT  (-2L)
+#define JD_RENAME_EXCL 0x00000004
+long     jet_xl_utime_nsec_l2d(long linux_nsec);           /* UTIME_NOW/OMIT sentinels */
+/* renameat2 flags: 0 -> 0, RENAME_NOREPLACE(1) -> RENAME_EXCL, anything else -> -1 (EINVAL) */
+int      jet_xl_renameat2_flags_l2d(unsigned linux_flags);
 
 /* ---------------- struct translations ---------------- */
 void jet_xl_stat_d2l(const jet_darwin_stat *d, jet_guest_stat *g);

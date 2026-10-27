@@ -12,6 +12,7 @@
 #  include <sys/stat.h>
 #  include <sys/mount.h>
 #  include <sys/event.h>
+#  include <stdio.h>      /* RENAME_EXCL, renameatx_np */
 #  include <sys/socket.h>
 #  include <sys/mman.h>
 #  include <sys/resource.h>
@@ -47,6 +48,9 @@ _Static_assert(EV_ADD == JD_EV_ADD && EV_DELETE == JD_EV_DELETE && EV_ONESHOT ==
 _Static_assert(O_NONBLOCK == 0x4 && O_APPEND == 0x8 && O_CREAT == 0x200 && O_TRUNC == 0x400 &&
                O_EXCL == 0x800 && O_NOFOLLOW == 0x100 && O_DIRECTORY == 0x100000 &&
                O_CLOEXEC == 0x1000000 && O_NOCTTY == 0x20000, "O_*");
+_Static_assert(UTIME_NOW == JD_UTIME_NOW && UTIME_OMIT == JD_UTIME_OMIT, "Darwin UTIME_*");
+_Static_assert(RENAME_EXCL == JD_RENAME_EXCL, "Darwin RENAME_EXCL");
+_Static_assert(AT_SYMLINK_FOLLOW == 0x40 && AT_EACCESS == 0x10, "Darwin AT_SYMLINK_FOLLOW/EACCESS");
 _Static_assert(AT_FDCWD == JD_AT_FDCWD && AT_SYMLINK_NOFOLLOW == 0x20 && AT_REMOVEDIR == 0x80, "AT_*");
 _Static_assert(F_GETLK == 7 && F_SETLK == 8 && F_SETLKW == 9 && F_DUPFD_CLOEXEC == 67, "F_*");
 _Static_assert(F_RDLCK == 1 && F_UNLCK == 2 && F_WRLCK == 3, "lock types");
@@ -540,4 +544,16 @@ int jet_efd_close(int fd) {
     pthread_mutex_unlock(&g_efd_mu);
     close(wfd); close(fd);
     return 1;
+}
+
+/* ---------------- v10.2 fs ---------------- */
+long jet_xl_utime_nsec_l2d(long n) {
+    if (n == JL_UTIME_NOW)  return JD_UTIME_NOW;
+    if (n == JL_UTIME_OMIT) return JD_UTIME_OMIT;
+    return n;
+}
+int jet_xl_renameat2_flags_l2d(unsigned f) {
+    if (f == 0) return 0;
+    if (f == 1) return JD_RENAME_EXCL;      /* RENAME_NOREPLACE */
+    return -1;                              /* RENAME_EXCHANGE / WHITEOUT: EINVAL */
 }

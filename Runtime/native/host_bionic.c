@@ -3,6 +3,7 @@
 #include "guest_abi.h"
 #include "darwin_abi.h"
 #include "epoll_kq.h"
+#include "netdb_abi.h"
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -1190,11 +1191,6 @@ static uint64_t h_select_fn(jet_ctx *c, const jet_args *a, void *u){
     return (uint64_t)(int64_t)rc;
 }
 
-static uint64_t h_getaddrinfo(jet_ctx *c, const jet_args *a, void *u){
-    (void)u; (void)a;
-    jet_log(c, 2, "getaddrinfo stub → EAI_FAIL");
-    return (uint64_t)(int64_t)-1;
-}
 
 /* ---- statfs / statvfs ---- */
 static uint64_t h_statfs(jet_ctx *c, const jet_args *a, void *u){
@@ -1552,6 +1548,188 @@ static uint64_t h_fstatat_fn(jet_ctx *c, const jet_args *a, void *u){
 }
 static uint64_t h_access(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)access((char*)G2H(a->x[0]),(int)a->x[1]); }
 static uint64_t h_readlink(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)readlink((char*)G2H(a->x[0]),(char*)G2H(a->x[1]),(size_t)a->x[2]); }
+
+/* ---- v10.2 filesystem traps (real; were h_stub0). Flags are validated with Linux rules on
+ * every host so the guest sees Linux errors; Darwin gets AT_, UTIME_ and RENAME_ values translated. ---- */
+#define JL_AT_SYMLINK_NOFOLLOW 0x100
+#define JL_AT_REMOVEDIR        0x200
+#define JL_AT_EACCESS          0x200
+#define JL_AT_SYMLINK_FOLLOW   0x400
+#define JL_AT_EMPTY_PATH       0x1000
+#define JET_EINVAL_RET() do { errno = EINVAL; return (uint64_t)(int64_t)-1; } while (0)
+#define P(i) ((const char*)G2H(a->x[i]))
+#define RET(e) return (uint64_t)(int64_t)(e)
+
+static uint64_t h_mkdir(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; RET(mkdir(P(0), (mode_t)a->x[1])); }
+static uint64_t h_mkdirat(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u; RET(mkdirat(jet_atfd_to_host(a->x[0]), P(1), (mode_t)a->x[2]));
+}
+#if defined(__APPLE__)
+/* Darwin unlink(dir) -> EPERM; Linux -> EISDIR. */
+static int jet_unlink_fix(int r, int dfd, const char *p) {
+    struct stat st;
+    if (r < 0 && errno == EPERM && fstatat(dfd, p, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(st.st_mode)) errno = EISDIR;
+    return r;
+}
+#else
+#define jet_unlink_fix(r, dfd, p) (r)
+#endif
+static uint64_t h_unlink(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; RET(jet_unlink_fix(unlink(P(0)), AT_FDCWD, P(0))); }
+static uint64_t h_rmdir(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; RET(rmdir(P(0))); }
+static uint64_t h_remove(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; RET(remove(P(0))); }
+static uint64_t h_unlinkat(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    unsigned f = (unsigned)a->x[2];
+    if (f & ~JL_AT_REMOVEDIR) JET_EINVAL_RET();
+    int dfd = jet_atfd_to_host(a->x[0]);
+    int r = unlinkat(dfd, P(1), jet_atflags_to_host(f, 0));                     /* 0x200 -> 0x80 */
+    RET(f ? r : jet_unlink_fix(r, dfd, P(1)));
+}
+static uint64_t h_rename(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; RET(rename(P(0), P(1))); }
+static uint64_t h_renameat(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u; RET(renameat(jet_atfd_to_host(a->x[0]), P(1), jet_atfd_to_host(a->x[2]), P(3)));
+}
+static uint64_t h_renameat2(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    unsigned f = (unsigned)a->x[4];
+    int fd1 = jet_atfd_to_host(a->x[0]), fd2 = jet_atfd_to_host(a->x[2]);
+#if defined(__APPLE__)
+    int df = jet_xl_renameat2_flags_l2d(f);
+    if (df < 0) JET_EINVAL_RET();
+    if (df == 0) RET(renameat(fd1, P(1), fd2, P(3)));
+    RET(renameatx_np(fd1, P(1), fd2, P(3), (unsigned)df));          /* RENAME_EXCL */
+#else
+    if (f & ~1u) JET_EINVAL_RET();                                   /* only NOREPLACE supported */
+    if (f == 0) RET(renameat(fd1, P(1), fd2, P(3)));
+#  ifdef SYS_renameat2
+    RET(syscall(SYS_renameat2, fd1, P(1), fd2, P(3), f));
+#  else
+    errno = ENOSYS; RET(-1);
+#  endif
+#endif
+}
+static uint64_t h_symlink(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; RET(symlink(P(0), P(1))); }
+static uint64_t h_symlinkat(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u; RET(symlinkat(P(0), jet_atfd_to_host(a->x[1]), P(2)));
+}
+static uint64_t h_readlinkat(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    if ((int64_t)a->x[3] <= 0) JET_EINVAL_RET();                     /* Linux: bufsiz <= 0 */
+    RET(readlinkat(jet_atfd_to_host(a->x[0]), P(1), (char*)G2H(a->x[2]), (size_t)a->x[3]));
+}
+static uint64_t h_linkat(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    unsigned f = (unsigned)a->x[4];
+    if (f & ~(JL_AT_SYMLINK_FOLLOW | JL_AT_EMPTY_PATH)) JET_EINVAL_RET();
+#if defined(__APPLE__)
+    if (f & JL_AT_EMPTY_PATH) { errno = ENOENT; RET(-1); }          /* no fd-linking on Darwin */
+#endif
+    RET(linkat(jet_atfd_to_host(a->x[0]), P(1), jet_atfd_to_host(a->x[2]), P(3),
+               jet_atflags_to_host(f, 0)));                          /* 0x400 -> 0x40 */
+}
+static uint64_t h_link(jet_ctx *c, const jet_args *a, void *u){
+    /* Linux link() never follows a symlink source; Darwin link() may, so go via linkat(…, 0). */
+    (void)c;(void)u; RET(linkat(jet_atfd_to_host((uint64_t)-100), P(0), jet_atfd_to_host((uint64_t)-100), P(1), 0));
+}
+static uint64_t h_access2(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    if (a->x[1] & ~7ull) JET_EINVAL_RET();
+    RET(access(P(0), (int)a->x[1]));
+}
+static uint64_t h_faccessat(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    unsigned f = (unsigned)a->x[3];
+    if ((a->x[2] & ~7ull) || (f & ~(JL_AT_EACCESS | JL_AT_SYMLINK_NOFOLLOW | JL_AT_EMPTY_PATH))) JET_EINVAL_RET();
+    RET(faccessat(jet_atfd_to_host(a->x[0]), P(1), (int)a->x[2], jet_atflags_to_host(f & ~JL_AT_EMPTY_PATH, 1)));
+}
+static uint64_t h_chmod(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; RET(chmod(P(0), (mode_t)(a->x[1] & 07777))); }
+static uint64_t h_fchmod(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    if (jet_is_fake_fd((int)a->x[0])) return 0;
+    RET(fchmod((int)a->x[0], (mode_t)(a->x[1] & 07777)));
+}
+static uint64_t h_fchmodat(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    unsigned f = (unsigned)a->x[3];
+    if (f & ~JL_AT_SYMLINK_NOFOLLOW) JET_EINVAL_RET();
+    RET(fchmodat(jet_atfd_to_host(a->x[0]), P(1), (mode_t)(a->x[2] & 07777), jet_atflags_to_host(f, 0)));
+}
+static uint64_t h_truncate(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    if ((int64_t)a->x[1] < 0) JET_EINVAL_RET();
+    RET(truncate(P(0), (off_t)a->x[1]));
+}
+static uint64_t h_ftruncate(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    if (jet_is_fake_fd((int)a->x[0]) || (int64_t)a->x[1] < 0) JET_EINVAL_RET();
+    RET(ftruncate((int)a->x[0], (off_t)a->x[1]));
+}
+static int guest_times_to_host(uint64_t gt, struct timespec ts[2]) {
+    if (!gt) return 0;
+    memcpy(ts, G2H(gt), 2 * sizeof(struct timespec));               /* {i64 sec, i64 nsec} on both */
+#if defined(__APPLE__)
+    for (int i = 0; i < 2; i++) ts[i].tv_nsec = jet_xl_utime_nsec_l2d(ts[i].tv_nsec);
+#endif
+    return 1;
+}
+static uint64_t h_utimensat(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    unsigned f = (unsigned)a->x[3];
+    if (f & ~(JL_AT_SYMLINK_NOFOLLOW | JL_AT_EMPTY_PATH)) JET_EINVAL_RET();
+    struct timespec ts[2]; int have = guest_times_to_host(a->x[2], ts);
+    if (!a->x[1] || ((f & JL_AT_EMPTY_PATH) && !*P(1))) {           /* Linux: NULL path == futimens(dirfd) */
+        if (jet_is_fake_fd((int)a->x[0])) return 0;
+        RET(futimens((int)a->x[0], have ? ts : NULL));
+    }
+    RET(utimensat(jet_atfd_to_host(a->x[0]), P(1), have ? ts : NULL,
+                  jet_atflags_to_host(f & ~JL_AT_EMPTY_PATH, 0)));
+}
+static uint64_t h_futimens(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    if (jet_is_fake_fd((int)a->x[0])) return 0;
+    struct timespec ts[2]; int have = guest_times_to_host(a->x[1], ts);
+    RET(futimens((int)a->x[0], have ? ts : NULL));
+}
+static uint64_t h_fsync(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    if (jet_is_fake_fd((int)a->x[0])) return 0;
+    RET(fsync((int)a->x[0]));
+}
+static uint64_t h_fdatasync(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    if (jet_is_fake_fd((int)a->x[0])) return 0;
+#if defined(__APPLE__)
+    RET(fsync((int)a->x[0]));                                       /* fdatasync not in all SDKs */
+#else
+    RET(fdatasync((int)a->x[0]));
+#endif
+}
+#undef P
+#undef RET
+
+/* ---- v10.2 netdb (guest bionic addrinfo; see netdb_abi.c) ---- */
+static uint64_t h_getaddrinfo2(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    if (!a->x[3]) return JG_EAI_FAIL;
+    uint64_t res = 0;
+    int rc = jet_getaddrinfo_guest(a->x[0] ? (const char*)G2H(a->x[0]) : NULL,
+                                   a->x[1] ? (const char*)G2H(a->x[1]) : NULL,
+                                   a->x[2] ? (const jet_guest_addrinfo*)G2H(a->x[2]) : NULL, &res);
+    *(uint64_t*)G2H(a->x[3]) = res;
+    return (uint64_t)(int64_t)rc;
+}
+static uint64_t h_freeaddrinfo(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u; jet_freeaddrinfo_guest(a->x[0]); return 0;
+}
+static uint64_t h_getnameinfo(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    return (uint64_t)(int64_t)jet_getnameinfo_guest(a->x[0] ? G2H(a->x[0]) : NULL, (uint32_t)a->x[1],
+        a->x[2] ? (char*)G2H(a->x[2]) : NULL, (size_t)a->x[3],
+        a->x[4] ? (char*)G2H(a->x[4]) : NULL, (size_t)a->x[5], (int)a->x[6]);
+}
+static uint64_t h_gai_strerror(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u; return H2G((void*)jet_gai_strerror_guest((int)a->x[0]));
+}
 static uint64_t h_getenv(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return H2G(getenv((char*)G2H(a->x[0]))); }
 static uint64_t h_setenv(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)setenv((char*)G2H(a->x[0]),(char*)G2H(a->x[1]),(int)a->x[2]); }
 
@@ -2069,7 +2247,7 @@ int jet_host_install_bionic(jet_ctx *ctx) {
     reg(ctx,"read",h_read); reg(ctx,"__read_chk",h_read); reg(ctx,"write",h_write);
     reg(ctx,"lseek",h_lseek); reg(ctx,"lseek64",h_lseek);
     reg(ctx,"fstat",h_fstat); reg(ctx,"stat",h_stat_fn); reg(ctx,"lstat",h_lstat_fn); reg(ctx,"fstatat",h_fstatat_fn); reg(ctx,"newfstatat",h_fstatat_fn);
-    reg(ctx,"access",h_access); reg(ctx,"readlink",h_readlink);
+    reg(ctx,"access",h_access2); reg(ctx,"readlink",h_readlink);
     reg(ctx,"getenv",h_getenv); reg(ctx,"setenv",h_setenv);
 
     reg(ctx,"pthread_create",h_pthread_create); reg(ctx,"pthread_join",h_pthread_join);
@@ -2185,7 +2363,8 @@ int jet_host_install_bionic(jet_ctx *ctx) {
     reg(ctx,"poll",h_poll_fn); reg(ctx,"ppoll",h_ppoll_fn); reg(ctx,"select",h_select_fn); reg(ctx,"pselect",h_pselect_fn);
     reg(ctx,"socket",h_socket); reg(ctx,"bind",h_bind_fn); reg(ctx,"listen",h_listen_fn);
     reg(ctx,"accept",h_accept); reg(ctx,"connect",h_connect); reg(ctx,"setsockopt",h_setsockopt);
-    reg(ctx,"getsockopt",h_getsockopt); reg(ctx,"getaddrinfo",h_getaddrinfo); reg(ctx,"freeaddrinfo",h_free);
+    reg(ctx,"getsockopt",h_getsockopt); reg(ctx,"getaddrinfo",h_getaddrinfo2); reg(ctx,"freeaddrinfo",h_freeaddrinfo);
+    reg(ctx,"getnameinfo",h_getnameinfo); reg(ctx,"gai_strerror",h_gai_strerror);
     reg(ctx,"getsockname",h_getsockname); reg(ctx,"getpeername",h_getpeername);
     reg(ctx,"send",h_send); reg(ctx,"recv",h_recv); reg(ctx,"sendto",h_sendto); reg(ctx,"recvfrom",h_recvfrom);
     reg(ctx,"sendmsg",h_sendmsg); reg(ctx,"recvmsg",h_recvmsg);
@@ -2205,10 +2384,16 @@ int jet_host_install_bionic(jet_ctx *ctx) {
     reg(ctx,"fwrite",h_stub0); reg(ctx,"fprintf",h_printf); reg(ctx,"fputs",h_stub0);
     reg(ctx,"fgets",h_stub0); reg(ctx,"fflush",h_stub0); reg(ctx,"fseek",h_stub0);
     reg(ctx,"ftell",h_stub0); reg(ctx,"fileno",h_stub0);
-    reg(ctx,"getcwd",h_getcwd); reg(ctx,"mkdir",h_stub0); reg(ctx,"remove",h_stub0);
-    reg(ctx,"rename",h_stub0); reg(ctx,"unlink",h_stub0); reg(ctx,"rmdir",h_stub0);
-    reg(ctx,"chmod",h_stub0); reg(ctx,"fchmod",h_stub0); reg(ctx,"fchown",h_stub0);
-    reg(ctx,"ftruncate",h_stub0); reg(ctx,"fsync",h_stub0);
+    reg(ctx,"getcwd",h_getcwd); reg(ctx,"mkdir",h_mkdir); reg(ctx,"remove",h_remove);
+    reg(ctx,"mkdirat",h_mkdirat); reg(ctx,"unlinkat",h_unlinkat); reg(ctx,"renameat",h_renameat);
+    reg(ctx,"renameat2",h_renameat2); reg(ctx,"symlink",h_symlink); reg(ctx,"symlinkat",h_symlinkat);
+    reg(ctx,"readlinkat",h_readlinkat); reg(ctx,"link",h_link); reg(ctx,"linkat",h_linkat);
+    reg(ctx,"faccessat",h_faccessat); reg(ctx,"fchmodat",h_fchmodat); reg(ctx,"truncate",h_truncate);
+    reg(ctx,"truncate64",h_truncate); reg(ctx,"ftruncate64",h_ftruncate);
+    reg(ctx,"utimensat",h_utimensat); reg(ctx,"futimens",h_futimens); reg(ctx,"fdatasync",h_fdatasync);
+    reg(ctx,"rename",h_rename); reg(ctx,"unlink",h_unlink); reg(ctx,"rmdir",h_rmdir);
+    reg(ctx,"chmod",h_chmod); reg(ctx,"fchmod",h_fchmod); reg(ctx,"fchown",h_stub0);
+    reg(ctx,"ftruncate",h_ftruncate); reg(ctx,"fsync",h_fsync);
     reg(ctx,"opendir",h_opendir); reg(ctx,"readdir",h_readdir); reg(ctx,"closedir",h_closedir);
     reg(ctx,"statfs",h_statfs); reg(ctx,"fstatfs",h_fstatfs); reg(ctx,"statvfs",h_statvfs); reg(ctx,"fstatvfs",h_fstatvfs);
     reg(ctx,"getdents64",h_getdents64); reg(ctx,"getrlimit",h_getrlimit); reg(ctx,"setrlimit",h_setrlimit);
@@ -2231,11 +2416,11 @@ int jet_host_install_bionic(jet_ctx *ctx) {
     const char *more_stubs[] = {
         "feof","ferror","closelog","openlog","syslog",
         "strtoull_l","strtoll_l","strtold_l","strtof","strtold","strcoll","strxfrm","strspn","strcspn",
-        "strnlen","strerror_r","sscanf","vsscanf","fscanf","vasprintf","perror","utimes","utimensat",
+        "strnlen","strerror_r","sscanf","vsscanf","fscanf","vasprintf","perror","utimes",
         "wcsnrtombs","wcrtomb","wcslen","wcstoul","wcstoll","wcstod","wcstof","wmemmove","wmemcpy",
         "wmemset","wmemcmp","wctob","btowc","mbrtowc","mbrlen","mbsnrtowcs","mbsrtowcs","mbtowc",
         "frexp","fseeko","ftello","getc","putc","fputc","ungetc","freopen","fdopen","mkstemp",
-        "gai_strerror","if_indextoname","inet_ntop","inet_pton","inet_ntoa",
+        "if_indextoname","inet_ntop","inet_pton","inet_ntoa",
         "shutdown","socketpair","sched_get_priority_max",
         "sched_get_priority_min","sched_getaffinity","__sched_cpucount","abs","labs","nan",
         "freelocale","newlocale","uselocale","setlocale","localeconv","__ctype_get_mb_cur_max",
@@ -2382,6 +2567,9 @@ enum {
     JET_NR_madvise = 233,
     JET_NR_getrandom = 278,
     JET_NR_memfd_create = 279,
+    JET_NR_utimensat = 88,
+    JET_NR_renameat2 = 276,
+    JET_NR_faccessat2 = 439,
     JET_NR_futex = 98,
     JET_NR_set_tid_address = 96,
     JET_NR_set_robust_list = 99,
@@ -2670,9 +2858,24 @@ static int64_t jet_emulate_linux_syscall_raw(jet_ctx *ctx, jet_cpu *cpu,
         return (int64_t)rc;
     }
     case JET_NR_readlinkat:
-        return (int64_t)readlinkat(jet_atfd_to_host(a0), (const char*)G2H(a1), (char*)G2H(a2), (size_t)a3);
-    case JET_NR_faccessat:
-        return (int64_t)faccessat(jet_atfd_to_host(a0), (const char*)G2H(a1), (int)a2, jet_atflags_to_host(a3, 1));
+        { jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5; return (int64_t)h_readlinkat(ctx, &aa, NULL); }
+    case JET_NR_faccessat:    /* kernel faccessat has no flags argument */
+        { jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5; aa.x[3] = 0; return (int64_t)h_faccessat(ctx, &aa, NULL); }
+    case JET_NR_faccessat2:   { jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5; return (int64_t)h_faccessat(ctx, &aa, NULL); }
+    case JET_NR_mkdirat:      { jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5; return (int64_t)h_mkdirat(ctx, &aa, NULL); }
+    case JET_NR_unlinkat:     { jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5; return (int64_t)h_unlinkat(ctx, &aa, NULL); }
+    case JET_NR_symlinkat:    { jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5; return (int64_t)h_symlinkat(ctx, &aa, NULL); }
+    case JET_NR_linkat:       { jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5; return (int64_t)h_linkat(ctx, &aa, NULL); }
+    case JET_NR_renameat:     { jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5; return (int64_t)h_renameat(ctx, &aa, NULL); }
+    case JET_NR_renameat2:    { jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5; return (int64_t)h_renameat2(ctx, &aa, NULL); }
+    case JET_NR_truncate:     { jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5; return (int64_t)h_truncate(ctx, &aa, NULL); }
+    case JET_NR_ftruncate:    { jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5; return (int64_t)h_ftruncate(ctx, &aa, NULL); }
+    case JET_NR_fchmod:       { jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5; return (int64_t)h_fchmod(ctx, &aa, NULL); }
+    case JET_NR_fchmodat:     /* kernel fchmodat has no flags argument */
+        { jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5; aa.x[3] = 0; return (int64_t)h_fchmodat(ctx, &aa, NULL); }
+    case JET_NR_fsync:        { jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5; return (int64_t)h_fsync(ctx, &aa, NULL); }
+    case JET_NR_fdatasync:    { jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5; return (int64_t)h_fdatasync(ctx, &aa, NULL); }
+    case JET_NR_utimensat:    { jet_args aa = {0}; aa.x[0]=a0; aa.x[1]=a1; aa.x[2]=a2; aa.x[3]=a3; aa.x[4]=a4; aa.x[5]=a5; return (int64_t)h_utimensat(ctx, &aa, NULL); }
     case JET_NR_mmap: {
         int prot = (int)a2 & ~PROT_EXEC;
 #if defined(__APPLE__)

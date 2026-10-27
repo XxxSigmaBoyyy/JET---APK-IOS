@@ -32,7 +32,7 @@ msg=$("$XCC" --target=aarch64-linux-gnu -fuse-ld=lld -nostdlib -shared -fPIC -O0
 echo "----- guest_lib.so (aarch64-linux-gnu, lld) exit $r" >> "$LOG"; printf '%s\n' "${msg:-(clean)}" >> "$LOG"
 echo "guest_lib.so: $([ $r -eq 0 ] && echo built || echo "BUILD-FAIL exit=$r")" | tee -a "$SUM"
 
-SUITES="test_unit test_jni test_mem_bitfield test_v9_jni_dl test_cxx_eh test_v10_trap_abi test_v101_guest_abi test_v11_xzr_excl test_v101_darwin_abi test_tg"
+SUITES="test_unit test_jni test_mem_bitfield test_v9_jni_dl test_cxx_eh test_v10_trap_abi test_v101_guest_abi test_v11_xzr_excl test_v101_darwin_abi test_v102_fs_netdb test_tg"
 for t in $SUITES; do
   src="$N/tests/$t.c"; [ -f "$src" ] || { echo "$t: MISSING" | tee -a "$SUM"; continue; }
   msg=$("$CC" -arch arm64 "${CFLAGS[@]}" "$src" "$OUT/bin/libjet_native.a" "${LIBS[@]}" -o "$OUT/bin/$t" 2>&1); r=$?
