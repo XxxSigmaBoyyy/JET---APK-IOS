@@ -1,6 +1,7 @@
 #include "jet_jni_bridge.h"
 #include "JetJVM.h"
 #include "../native/jet_native.h"
+#include "../native/jet_native_status.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -112,13 +113,10 @@ static int register_natives_class(JNIEnv *env) {
 }
 
 int32_t jet_jni_bridge_init(char *err, int32_t errlen) {
+    /* libjvm is dlopen'd by jetjvm.c — do not link JNI_GetCreatedJavaVMs. */
     JavaVM *vm = (JavaVM *)jet_jvm_vm();
     if (!vm) {
-        jsize n = 0; JavaVM *vms[1];
-        if (JNI_GetCreatedJavaVMs(vms, 1, &n) != JNI_OK || n < 1) {
-            snprintf(err, errlen, "no JavaVM"); return -1;
-        }
-        vm = vms[0];
+        snprintf(err, errlen, "no JavaVM (boot JVM first)"); return -1;
     }
     g_vm = vm;
     g_ctx = jet_native_create(NULL);
