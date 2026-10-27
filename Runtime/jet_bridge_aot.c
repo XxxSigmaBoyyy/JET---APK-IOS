@@ -1,0 +1,203 @@
+// JetBridge (ABI v1) implemented on the JET AOT runtime (Jimple -> C; aot/runtime in the JET toolchain).
+// Linked into libjetruntime.a by scripts/build_host_lib.sh together with rt.c, kernel.c and one app module
+// (<name>_app.c + <name>_res.c + the generated jet_module.c). Portable C11: builds for x86_64-linux (contract test)
+// and arm64-apple-ios (embedded in JET.app). No JIT, no dlopen, no code loading at run time — the only app code
+// this library can run is the module compiled into it.
+#include "JetBridge.h"
+#include "jetrt.h"
+#include <setjmp.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---- generated per build by build_host_lib.sh (jet_module.c) ---- */
+extern const int jet_mod_present;
+extern const char jet_mod_package[], jet_mod_activity[], jet_mod_label[], jet_mod_name[];
+extern const uint32_t jet_mod_dexcrc;
+JClass *rt_find(const char *name);   /* rt.c: registry lookup without the AOT-MISSING abort */
+
+static char g_status[1024] = "JET AOT runtime linked; nothing started yet.";
+static char g_version[160];
+static char g_modules[1024];
+static int g_registered;
+static void *g_act, *g_root;
+static jmp_buf g_jmp; static int g_guard;
+static char g_fatal[512];
+
+#define STATUS(...) snprintf(g_status, sizeof g_status, __VA_ARGS__)
+
+static void on_fatal(const char *what, const char *detail) {
+    if (!g_guard) return;                       /* outside a guarded call: rt_fatal keeps its exit() behaviour */
+    snprintf(g_fatal, sizeof g_fatal, "%s: %s", what, detail ? detail : "");
+    g_guard = 0; longjmp(g_jmp, 1);
+}
+
+int32_t jet_bridge_abi_version(void) { return JET_BRIDGE_ABI_VERSION; }
+const char *jet_bridge_version(void) {
+    if (!g_version[0]) snprintf(g_version, sizeof g_version, "aot-0.1%s%s", jet_mod_present ? "+" : "", jet_mod_present ? jet_mod_name : "");
+    return g_version;
+}
+int32_t jet_bridge_has_runtime(void) { return 1; }
+const char *jet_bridge_modules(void) {
+    if (jet_mod_present && !g_modules[0])
+        snprintf(g_modules, sizeof g_modules, "%s\t%s\t%08x\t%s\n", jet_mod_package, jet_mod_activity, (unsigned) jet_mod_dexcrc, jet_mod_label);
+    return g_modules;
+}
+
+/* ---- APK scan: CRC-32 of classes.dex straight from the zip central directory (no inflate needed) ---- */
+static uint32_t le16(const unsigned char *p) { return p[0] | p[1] << 8; }
+static uint32_t le32(const unsigned char *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t) p[3] << 24; }
+/* 0 ok, ERR_INPUT not a usable zip/APK, ERR_IO unreadable */
+static int32_t dex_crc(const char *apk, uint32_t *crc, int *ndex) {
+    FILE *f = fopen(apk, "rb"); if (!f) return JET_BRIDGE_ERR_IO;
+    int32_t rc = JET_BRIDGE_ERR_INPUT; unsigned char *tail = NULL, *cd = NULL;
+    if (fseek(f, 0, SEEK_END)) goto out;
+    long size = ftell(f); if (size < 22) goto out;
+    long tl = size < 65557 ? size : 65557;
+    tail = malloc((size_t) tl); if (!tail || fseek(f, size - tl, SEEK_SET) || fread(tail, 1, (size_t) tl, f) != (size_t) tl) goto out;
+    long e = -1; for (long i = tl - 22; i >= 0; i--) if (le32(tail + i) == 0x06054b50u) { e = i; break; }
+    if (e < 0) goto out;
+    uint32_t n = le16(tail + e + 10), cds = le32(tail + e + 12), cdo = le32(tail + e + 16);
+    if (cdo == 0xffffffffu || (long) cdo + (long) cds > size) goto out;   /* zip64 / corrupt: not supported */
+    cd = malloc(cds ? cds : 1); if (!cd || fseek(f, (long) cdo, SEEK_SET) || fread(cd, 1, cds, f) != cds) goto out;
+    *ndex = 0; int found = 0;
+    for (uint32_t i = 0, p = 0; i < n && p + 46 <= cds; i++) {
+        if (le32(cd + p) != 0x02014b50u) break;
+        uint32_t nl = le16(cd + p + 28), xl = le16(cd + p + 30), cl = le16(cd + p + 32);
+        if (p + 46 + nl > cds) break;
+        const char *nm = (const char *) cd + p + 46;
+        if (nl >= 11 && !memcmp(nm, "classes", 7) && !memcmp(nm + nl - 4, ".dex", 4) && !memchr(nm, '/', nl)) {
+            (*ndex)++;
+            if (nl == 11) { *crc = le32(cd + p + 16); found = 1; }
+        }
+        p += 46 + nl + xl + cl;
+    }
+    rc = found ? 0 : JET_BRIDGE_ERR_INPUT;
+out:
+    free(tail); free(cd); fclose(f); return rc;
+}
+
+int32_t jet_translate_apk(const char *apk_path, const char *bundle_dir, jet_progress_fn progress, void *ctx) {
+    if (!apk_path || !bundle_dir || !*apk_path || !*bundle_dir) { STATUS("translate: missing argument"); return JET_BRIDGE_ERR_INPUT; }
+    if (progress) progress(0.0f, "scan", ctx);
+    uint32_t crc = 0; int ndex = 0; int32_t rc = dex_crc(apk_path, &crc, &ndex);
+    if (rc) { STATUS(rc == JET_BRIDGE_ERR_IO ? "translate: cannot read %s" : "translate: %s is not an APK (no zip central directory / classes.dex)", apk_path); return rc; }
+    if (progress) progress(0.5f, "match", ctx);
+    int match = jet_mod_present && crc == jet_mod_dexcrc;
+    char path[4096];
+    if (snprintf(path, sizeof path, "%s/app.properties", bundle_dir) >= (int) sizeof path) { STATUS("translate: bundle path too long"); return JET_BRIDGE_ERR_INPUT; }
+    FILE *f = fopen(path, "w"); if (!f) { STATUS("translate: cannot write %s", path); return JET_BRIDGE_ERR_IO; }
+    const char *base = strrchr(apk_path, '/');
+    fprintf(f, "jet.bridge=%s\njet.abi=%d\njet.translated=%s\napk=%s\ndex.crc32=%08x\ndex.count=%d\n", jet_bridge_version(),
+            JET_BRIDGE_ABI_VERSION, match ? "true" : "false", base ? base + 1 : apk_path, (unsigned) crc, ndex);
+    if (match) fprintf(f, "package=%s\nactivity=%s\nlabel=%s\naot.module=%s\n", jet_mod_package, jet_mod_activity, jet_mod_label, jet_mod_name);
+    fclose(f);
+    if (progress) progress(1.0f, "bundle", ctx);
+    if (!match) {
+        STATUS("No AOT module for this APK in this build (classes.dex crc %08x, %d dex). %s", (unsigned) crc, ndex,
+               jet_mod_present ? "This build carries only one prebuilt app." : "This is a runtime-only build.");
+        return JET_BRIDGE_ERR_UNSUPPORTED;
+    }
+    STATUS("Matched prebuilt AOT module %s (%s).", jet_mod_name, jet_mod_package);
+    return JET_BRIDGE_OK;
+}
+
+static void prop(const char *bundle, const char *key, char *out, size_t cap) {
+    out[0] = 0; char path[4096], line[1024]; size_t kl = strlen(key);
+    if (!bundle || snprintf(path, sizeof path, "%s/app.properties", bundle) >= (int) sizeof path) return;
+    FILE *f = fopen(path, "r"); if (!f) return;
+    /* tiny line reader without fgets (keeps the iOS object on the same libc subset) */
+    size_t n = 0; int c; unsigned char ch;
+    for (;;) {
+        c = fread(&ch, 1, 1, f) == 1 ? ch : -1;
+        if (c == '\n' || c < 0) {
+            line[n] = 0;
+            if (n > kl && !strncmp(line, key, kl) && line[kl] == '=') { snprintf(out, cap, "%s", line + kl + 1); break; }
+            n = 0; if (c < 0) break; continue;
+        }
+        if (n + 1 < sizeof line) line[n++] = (char) c;
+    }
+    fclose(f);
+}
+
+int32_t jet_runtime_main(const char *bundle_path, const char *activity_class, void *ui_view) {
+    (void) ui_view;
+    if (!jet_mod_present) { STATUS("Runtime-only build: no AOT app module linked."); return JET_BRIDGE_ERR_UNSUPPORTED; }
+    char act[512], tr[16];
+    prop(bundle_path, "jet.translated", tr, sizeof tr);
+    if (bundle_path && *bundle_path && strcmp(tr, "true")) { STATUS("Bundle was not translated by this runtime (jet.translated=%s).", tr[0] ? tr : "?"); return JET_BRIDGE_ERR_UNSUPPORTED; }
+    if (activity_class && *activity_class) snprintf(act, sizeof act, "%s", activity_class);
+    else { prop(bundle_path, "activity", act, sizeof act); if (!act[0]) snprintf(act, sizeof act, "%s", jet_mod_activity); }
+    rt_fatal_hook = on_fatal;
+    if (setjmp(g_jmp)) { g_act = g_root = NULL; rt_exc = NULL; STATUS("AOT fatal while starting %s: %s", act, g_fatal); return JET_BRIDGE_ERR_RUNTIME; }
+    g_guard = 1;
+    if (!g_registered) { jet_kernel_register(); jet_app_register(); rt_link(); g_registered = 1; }
+    JClass *ac = rt_find(act);
+    if (!ac) { g_guard = 0; STATUS("Activity %s is not in the AOT module.", act); return JET_BRIDGE_ERR_INPUT; }
+    void *a0 = rt_new(ac); jv a[2] = {{.l = a0}, {.l = NULL}};
+    rt_vfind(ac, "void <init>()")(a);
+    if (!rt_exc) rt_vfind(ac, "void onCreate(android.os.Bundle)")(a);
+    g_guard = 0;
+    if (rt_exc) {
+        JObj *e = rt_exc; rt_exc = NULL; g_act = g_root = NULL;
+        STATUS("%s threw %s: %s", act, e->cls->name, e->slot[0].l ? rt_cstr(e->slot[0].l) : "");
+        return JET_BRIDGE_ERR_RUNTIME;
+    }
+    g_act = a0; g_root = ((JObj *) a0)->slot[0].l;
+    if (!g_root) { g_act = NULL; STATUS("%s.onCreate set no content view.", act); return JET_BRIDGE_ERR_RUNTIME; }
+    STATUS("Running %s (AOT, %s).", act, ((JObj *) g_root)->cls->name);
+    return JET_BRIDGE_OK;
+}
+
+void jet_runtime_touch(int32_t pointer_id, int32_t action, float x, float y) { (void) pointer_id; (void) action; (void) x; (void) y; }
+
+extern JClass K_TextView, K_Button;
+typedef struct { char *b; int32_t cap, len; } Out;
+static void put(Out *o, const char *s) {
+    size_t n = strlen(s);
+    if (o->b && o->len < o->cap - 1) { size_t room = (size_t) (o->cap - 1 - o->len); memcpy(o->b + o->len, s, n < room ? n : room); o->b[o->len + (int32_t) (n < room ? n : room)] = 0; }
+    o->len += (int32_t) n;
+}
+static void walk(Out *o, void *v, int d) {
+    JObj *x = v; if (!x) return;
+    if (rt_instanceof(x, &K_TextView)) {
+        char head[64]; int btn = rt_instanceof(x, &K_Button) != 0;
+        snprintf(head, sizeof head, "%d\t%s\t%08x\t%s\t", d, btn ? "button" : "text", (unsigned) x->slot[1].i, x->slot[4].i ? "s" : "-");
+        put(o, head);
+        const char *t = x->slot[0].l ? rt_cstr(x->slot[0].l) : "";
+        for (const char *p = t; *p; p++) { char c[2] = { (*p == '\n' || *p == '\t') ? ' ' : *p, 0 }; put(o, c); }
+        put(o, "\n");
+    }
+    JArr *c = x->slot[2].l; for (int i = 0; c && i < c->len; i++) walk(o, c->d[i].l, d + 1);
+}
+int32_t jet_runtime_ui_snapshot(char *buf, int32_t cap) {
+    Out o = { buf, cap, 0 }; if (buf && cap > 0) buf[0] = 0;
+    if (!g_root) return 0;
+    walk(&o, g_root, 0); return o.len;
+}
+
+static void *findbtn(void *v, const char *label) {
+    JObj *o = v; if (!o) return NULL;
+    if (rt_instanceof(o, &K_Button) && o->slot[0].l && !strcmp(rt_cstr(o->slot[0].l), label)) return o;
+    JArr *c = o->slot[2].l; for (int i = 0; c && i < c->len; i++) { void *r = findbtn(c->d[i].l, label); if (r) return r; }
+    return NULL;
+}
+int32_t jet_runtime_click(const char *label) {
+    if (!g_root) { STATUS("click: nothing is running"); return JET_BRIDGE_ERR_STATE; }
+    if (!label) return JET_BRIDGE_ERR_INPUT;
+    void *b = findbtn(g_root, label);
+    if (!b) { STATUS("click: no button \"%s\"", label); return JET_BRIDGE_ERR_INPUT; }
+    void *l = ((JObj *) b)->slot[5].l;
+    if (!l) { STATUS("click: button \"%s\" has no listener", label); return JET_BRIDGE_ERR_INPUT; }
+    if (setjmp(g_jmp)) { g_act = g_root = NULL; rt_exc = NULL; STATUS("AOT fatal in onClick(\"%s\"): %s", label, g_fatal); return JET_BRIDGE_ERR_RUNTIME; }
+    g_guard = 1;
+    jv c[2] = {{.l = l}, {.l = b}};
+    rt_vfind(((JObj *) l)->cls, "void onClick(android.view.View)")(c);
+    g_guard = 0;
+    if (rt_exc) { JObj *e = rt_exc; rt_exc = NULL; STATUS("onClick(\"%s\") threw %s", label, e->cls->name); return JET_BRIDGE_ERR_RUNTIME; }
+    STATUS("Clicked \"%s\".", label);
+    return JET_BRIDGE_OK;
+}
+
+void jet_runtime_stop(void) { if (g_act) STATUS("Stopped."); g_act = g_root = NULL; }
+const char *jet_runtime_status(void) { return g_status; }

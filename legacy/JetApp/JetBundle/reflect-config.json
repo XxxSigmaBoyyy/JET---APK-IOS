@@ -1,0 +1,59 @@
+[
+ {
+  "name": "org.debian.eugen.headingcalculator.CalculatorDisplay",
+  "methods": [
+   {
+    "name": "<init>",
+    "parameterTypes": [
+     "android.content.Context",
+     "android.util.AttributeSet"
+    ]
+   }
+  ]
+ },
+ {
+  "name": "org.debian.eugen.headingcalculator.CalculatorKeypad",
+  "methods": [
+   {
+    "name": "<init>",
+    "parameterTypes": [
+     "android.content.Context",
+     "android.util.AttributeSet"
+    ]
+   }
+  ]
+ },
+ {
+  "name": "org.debian.eugen.headingcalculator.ExplainableButton",
+  "methods": [
+   {
+    "name": "<init>",
+    "parameterTypes": [
+     "android.content.Context",
+     "android.util.AttributeSet"
+    ]
+   }
+  ]
+ },
+ {
+  "name": "org.debian.eugen.headingcalculator.ExplainableTextView",
+  "methods": [
+   {
+    "name": "<init>",
+    "parameterTypes": [
+     "android.content.Context",
+     "android.util.AttributeSet"
+    ]
+   }
+  ]
+ },
+ {
+  "name": "org.debian.eugen.headingcalculator.MainActivity",
+  "methods": [
+   {
+    "name": "<init>",
+    "parameterTypes": []
+   }
+  ]
+ }
+]

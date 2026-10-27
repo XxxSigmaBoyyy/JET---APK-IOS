@@ -1,0 +1,117 @@
+name: iOS unsigned IPA
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # only used to attach the .ipa to a GitHub Release on v* tags (built-in GITHUB_TOKEN)
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build JET.ipa (unsigned)
+    runs-on: macos-14
+    timeout-minutes: 40
+    env:
+      SCHEME: JET
+      CONFIGURATION: Release
+      DERIVED: build/DerivedData
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Refuse committed Android packages
+        run: |
+          if git ls-files | grep -Ei '\.(apk|xapk|apks|aab|obb)$'; then
+            echo "::error::Android packages must never be committed to this repository."
+            exit 1
+          fi
+
+      - name: Refuse committed runtime binaries
+        run: |
+          if git ls-files | grep -E '^(Vendor/JetRuntime/|dist/)'; then
+            echo "::error::Vendor/JetRuntime and dist/ are build outputs and must never be committed."
+            exit 1
+          fi
+
+      - name: Select Xcode
+        run: |
+          for XCODE in /Applications/Xcode_15.4.app /Applications/Xcode_15.3.app /Applications/Xcode_15.2.app; do
+            if [ -d "$XCODE" ]; then sudo xcode-select -s "$XCODE/Contents/Developer"; break; fi
+          done
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: App icon
+        run: scripts/sync_icon.sh
+
+      - name: JET runtime (optional prebuilt, else stub)
+        env:
+          JET_RUNTIME_URL: ${{ vars.JET_RUNTIME_URL }}
+          JET_RUNTIME_SHA256: ${{ vars.JET_RUNTIME_SHA256 }}
+        run: scripts/fetch_runtime.sh
+
+      - name: Generate Xcode project
+        run: JET_RUNTIME="${JET_RUNTIME:-NO}" xcodegen generate --spec project.yml
+
+      - name: Validate Info.plist
+        run: plutil -lint JET/Resources/Info.plist
+
+      - name: Build (generic iOS device, no signing)
+        run: |
+          mkdir -p build
+          xcodebuild \
+            -project JET.xcodeproj \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$DERIVED" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build > build/xcodebuild.log 2>&1 || { grep -E 'error:' build/xcodebuild.log | head -n 60; tail -n 60 build/xcodebuild.log; exit 1; }
+          grep -E '(error|warning):' build/xcodebuild.log | sort -u | head -n 60 || true
+          test -d "$DERIVED/Build/Products/$CONFIGURATION-iphoneos/JET.app"
+
+      - name: Check linked bridge
+        run: |
+          BIN="$DERIVED/Build/Products/$CONFIGURATION-iphoneos/JET.app/JET"
+          if [ "${JET_RUNTIME:-NO}" = YES ]; then WANT='aot-0\.1'; KIND=runtime; else WANT='stub-0\.2'; KIND=stub; fi
+          strings "$BIN" | grep -E "$WANT" || { echo "::error::expected $KIND bridge in $BIN"; exit 1; }
+          echo "BRIDGE=$KIND" >> "$GITHUB_ENV"
+
+      - name: Package unsigned IPA
+        run: |
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$DERIVED/Build/Products/$CONFIGURATION-iphoneos/JET.app/Info.plist")
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          scripts/package_ipa.sh "$DERIVED/Build/Products/$CONFIGURATION-iphoneos/JET.app" "dist/JET-$VERSION-unsigned.ipa"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JET-${{ env.VERSION }}-${{ env.BRIDGE }}-unsigned-ipa
+          path: dist/*.ipa
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: build/xcodebuild.log
+          if-no-files-found: ignore
+
+      - name: Attach to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.ipa

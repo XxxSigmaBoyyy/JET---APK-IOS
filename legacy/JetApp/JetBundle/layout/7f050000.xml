@@ -1,0 +1,26 @@
+<TableLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="-1" android:layout_height="-2" android:stretchColumns="1,4" android:shrinkColumns="*" style="@7F070002">
+  <TableRow>
+    <org.debian.eugen.headingcalculator.ExplainableTextView android:text="@7F060014" android:contentDescription="@7F060013" style="@7F070004"/>
+    <TextView android:id="@7F040011" style="@7F070005"/>
+    <TextView style="@7F070001"/>
+    <org.debian.eugen.headingcalculator.ExplainableTextView android:text="@7F060012" android:contentDescription="@7F060011" style="@7F070004"/>
+    <TextView android:id="@7F04000F" style="@7F070005"/>
+    <TextView style="@7F07000A"/>
+  </TableRow>
+  <TableRow>
+    <org.debian.eugen.headingcalculator.ExplainableTextView android:text="@7F060019" android:contentDescription="@7F060018" style="@7F070004"/>
+    <TextView android:id="@7F040014" style="@7F070005"/>
+    <TextView style="@7F070001"/>
+    <org.debian.eugen.headingcalculator.ExplainableTextView android:text="@7F06001B" android:contentDescription="@7F06001A" style="@7F070004"/>
+    <TextView android:id="@7F040016" style="@7F070005"/>
+    <TextView style="@7F07000A"/>
+  </TableRow>
+  <TableRow android:layout_marginTop="10.000000dip">
+    <org.debian.eugen.headingcalculator.ExplainableTextView android:text="@7F060016" android:contentDescription="@7F060015" style="@7F070004"/>
+    <TextView android:id="@7F040013" style="@7F070005"/>
+    <TextView style="@7F070001"/>
+    <org.debian.eugen.headingcalculator.ExplainableTextView android:text="@7F06000F" android:contentDescription="@7F06000E" style="@7F070004"/>
+    <TextView android:id="@7F04000D" style="@7F070005"/>
+    <TextView style="@7F07000A"/>
+  </TableRow>
+</TableLayout>

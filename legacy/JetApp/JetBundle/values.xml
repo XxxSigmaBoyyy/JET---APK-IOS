@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="utf-8"?>
+<values package="org.debian.eugen.headingcalculator">
+<value id="0x7f010000" type="color" name="display_background" value="#FFDCF0FB"/>
+<value id="0x7f010001" type="color" name="display_selection" value="#6633B5E5"/>
+<value id="0x7f010002" type="color" name="display_text" value="#FF000000"/>
+<value id="0x7f010003" type="color" name="editable_display_text" value="#FF505050"/>
+<value id="0x7f010004" type="color" name="keypad_text" value="#FFFFFFFF"/>
+<value id="0x7f020000" type="dimen" name="digit_btn_text_size" value="40.000000sp"/>
+<value id="0x7f020001" type="dimen" name="display_text_size" value="25.000000sp"/>
+<value id="0x7f020002" type="dimen" name="keypad_btn_text_size" value="30.000000sp"/>
+<drawable id="0x7f030000" name="dark_background" kind="color" value="#FF111111"></drawable>
+<drawable id="0x7f030001" name="digit_button" kind="selector"><state when="state_pressed" drawable="@7F030007"/><state when="" drawable="@7F030006"/></drawable>
+<drawable id="0x7f030002" name="display_value" kind="selector"><state when="state_selected" drawable="@7F030009"/></drawable>
+<drawable id="0x7f030003" name="erase_button" kind="selector"><state when="state_pressed" drawable="@7F030007"/><state when="" drawable="@7F030008"/></drawable>
+<drawable id="0x7f030004" name="function_button" kind="selector"><state when="state_pressed" drawable="@7F030007"/><state when="" drawable="@7F030000"/></drawable>
+<drawable id="0x7f030005" name="ic_launcher" kind="bitmap" file="drawable/7f030005.png"/>
+<drawable id="0x7f030006" name="light_background" kind="color" value="#FF383838"></drawable>
+<drawable id="0x7f030007" name="pressed_background" kind="color" value="#FFBEBEBE"></drawable>
+<drawable id="0x7f030008" name="red_background" kind="color" value="#FF401010"></drawable>
+<drawable id="0x7f030009" name="text_selection" kind="color" value="@7F010001"></drawable>
+<value id="0x7f040000" type="id" name="backspace_btn" value="false"/>
+<value id="0x7f040001" type="id" name="clear_btn" value="false"/>
+<value id="0x7f040002" type="id" name="digit0" value="false"/>
+<value id="0x7f040003" type="id" name="digit1" value="false"/>
+<value id="0x7f040004" type="id" name="digit2" value="false"/>
+<value id="0x7f040005" type="id" name="digit3" value="false"/>
+<value id="0x7f040006" type="id" name="digit4" value="false"/>
+<value id="0x7f040007" type="id" name="digit5" value="false"/>
+<value id="0x7f040008" type="id" name="digit6" value="false"/>
+<value id="0x7f040009" type="id" name="digit7" value="false"/>
+<value id="0x7f04000a" type="id" name="digit8" value="false"/>
+<value id="0x7f04000b" type="id" name="digit9" value="false"/>
+<value id="0x7f04000c" type="id" name="display" value="false"/>
+<value id="0x7f04000d" type="id" name="ground_speed" value="false"/>
+<value id="0x7f04000e" type="id" name="keypad" value="false"/>
+<value id="0x7f04000f" type="id" name="true_airspeed" value="false"/>
+<value id="0x7f040010" type="id" name="true_airspeed_btn" value="false"/>
+<value id="0x7f040011" type="id" name="true_course" value="false"/>
+<value id="0x7f040012" type="id" name="true_course_btn" value="false"/>
+<value id="0x7f040013" type="id" name="true_heading" value="false"/>
+<value id="0x7f040014" type="id" name="wind_angle" value="false"/>
+<value id="0x7f040015" type="id" name="wind_direction_btn" value="false"/>
+<value id="0x7f040016" type="id" name="wind_speed" value="false"/>
+<value id="0x7f040017" type="id" name="wind_speed_btn" value="false"/>
+<res id="0x7f050000" type="layout" name="calculator_display" file="layout/7f050000.xml"/>
+<res id="0x7f050001" type="layout" name="calculator_keypad" file="layout/7f050001.xml"/>
+<res id="0x7f050002" type="layout" name="main" file="layout/7f050002.xml"/>
+<value id="0x7f060000" type="string" name="angle_suffix" value="°"/>
+<value id="0x7f060001" type="string" name="app_name" value="Heading Calculator"/>
+<value id="0x7f060002" type="string" name="clear_btn" value="CE"/>
+<value id="0x7f060003" type="string" name="delete_btn" value="DEL"/>
+<value id="0x7f060004" type="string" name="digit0" value="0"/>
+<value id="0x7f060005" type="string" name="digit1" value="1"/>
+<value id="0x7f060006" type="string" name="digit2" value="2"/>
+<value id="0x7f060007" type="string" name="digit3" value="3"/>
+<value id="0x7f060008" type="string" name="digit4" value="4"/>
+<value id="0x7f060009" type="string" name="digit5" value="5"/>
+<value id="0x7f06000a" type="string" name="digit6" value="6"/>
+<value id="0x7f06000b" type="string" name="digit7" value="7"/>
+<value id="0x7f06000c" type="string" name="digit8" value="8"/>
+<value id="0x7f06000d" type="string" name="digit9" value="9"/>
+<value id="0x7f06000e" type="string" name="ground_speed" value="Ground speed"/>
+<value id="0x7f06000f" type="string" name="ground_speed_abb" value="GS"/>
+<value id="0x7f060010" type="string" name="speed_suffix" value="kt"/>
+<value id="0x7f060011" type="string" name="true_airspeed" value="True airspeed"/>
+<value id="0x7f060012" type="string" name="true_airspeed_abb" value="TAS"/>
+<value id="0x7f060013" type="string" name="true_course" value="True course"/>
+<value id="0x7f060014" type="string" name="true_course_abb" value="TC"/>
+<value id="0x7f060015" type="string" name="true_heading" value="True heading"/>
+<value id="0x7f060016" type="string" name="true_heading_abb" value="TH"/>
+<value id="0x7f060017" type="string" name="undefined_field" value="NaN"/>
+<value id="0x7f060018" type="string" name="wind_direction" value="Wind direction"/>
+<value id="0x7f060019" type="string" name="wind_direction_abb" value="WD"/>
+<value id="0x7f06001a" type="string" name="wind_speed" value="Wind speed"/>
+<value id="0x7f06001b" type="string" name="wind_speed_abb" value="WS"/>
+<style id="0x7f070000" name="AppTheme" parent="0x01030006">
+</style>
+<style id="0x7f070001" name="angle_suffix" parent="0x7f070006">
+  <item name="text" value="@7F060000"/>
+</style>
+<style id="0x7f070002" name="calc_display" parent="0x00000000">
+  <item name="background" value="@7F010000"/>
+  <item name="padding" value="10.000000dip"/>
+</style>
+<style id="0x7f070003" name="calc_display_common" parent="0x00000000">
+  <item name="textSize" value="@7F020001"/>
+  <item name="textColor" value="@7F010002"/>
+  <item name="layout_width" value="-2"/>
+  <item name="layout_height" value="-2"/>
+  <item name="layout_margin" value="2.000000dip"/>
+  <item name="singleLine" value="true"/>
+</style>
+<style id="0x7f070004" name="calc_display_lab" parent="0x7f070003">
+  <item name="textStyle" value="0x00000001"/>
+  <item name="layout_gravity" value="0x00000003"/>
+</style>
+<style id="0x7f070005" name="calc_display_val" parent="0x7f070003">
+  <item name="textColor" value="@7F010003"/>
+  <item name="gravity" value="0x00000005"/>
+  <item name="background" value="@7F030002"/>
+  <item name="paddingRight" value="2.000000dip"/>
+  <item name="layout_width" value="0.000000dip"/>
+</style>
+<style id="0x7f070006" name="display_unit" parent="0x7f070003">
+  <item name="gravity" value="0x00000003"/>
+  <item name="paddingRight" value="20.000000dip"/>
+  <item name="layout_marginLeft" value="0.000000dip"/>
+</style>
+<style id="0x7f070007" name="erase_button" parent="0x7f070008">
+  <item name="background" value="@7F030003"/>
+</style>
+<style id="0x7f070008" name="keypad_button" parent="0x00000000">
+  <item name="textSize" value="@7F020002"/>
+  <item name="textColor" value="@7F010004"/>
+  <item name="background" value="@7F030004"/>
+  <item name="longClickable" value="true"/>
+  <item name="layout_width" value="0.000000dip"/>
+  <item name="layout_height" value="-1"/>
+  <item name="layout_margin" value="1.000000dip"/>
+  <item name="layout_weight" value="1.000000"/>
+</style>
+<style id="0x7f070009" name="keypad_button_digit" parent="0x7f070008">
+  <item name="textSize" value="@7F020000"/>
+  <item name="background" value="@7F030001"/>
+</style>
+<style id="0x7f07000a" name="speed_suffix" parent="0x7f070006">
+  <item name="text" value="@7F060010"/>
+</style>
+<value id="0x7f080000" type="xml" name="backup_descriptor" value="res/xv.xml"/>
+</values>

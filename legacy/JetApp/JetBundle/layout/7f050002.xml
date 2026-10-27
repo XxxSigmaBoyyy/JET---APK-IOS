@@ -1,0 +1,4 @@
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:orientation="1" android:layout_width="-1" android:layout_height="-1">
+  <org.debian.eugen.headingcalculator.CalculatorDisplay android:id="@7F04000C" android:layout_width="-1" android:layout_height="-2"/>
+  <org.debian.eugen.headingcalculator.CalculatorKeypad android:id="@7F04000E" android:layout_width="-1" android:layout_height="-1"/>
+</LinearLayout>

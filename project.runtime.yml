@@ -1,0 +1,12 @@
+# Included by project.yml when JET_RUNTIME=YES (scripts/fetch_runtime.sh sets it in CI when a prebuilt runtime is
+# present). Links Vendor/JetRuntime/lib/libjetruntime.a (arm64-apple-ios, from scripts/build_host_lib.sh) and
+# compiles JetBridgeStub.c out. Contract: docs/RUNTIME_LINK.md.
+# Device SDK only: the library has no simulator slice, so simulator builds keep the stub and still link.
+targets:
+  JET:
+    settings:
+      base:
+        HEADER_SEARCH_PATHS: ["$(inherited)", "$(PROJECT_DIR)/JET/Bridge"]
+        "GCC_PREPROCESSOR_DEFINITIONS[sdk=iphoneos*]": ["$(inherited)", "JET_RUNTIME_LINKED=1"]
+        "SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=iphoneos*]": "$(inherited) JET_RUNTIME_LINKED"
+        "OTHER_LDFLAGS[sdk=iphoneos*]": ["$(inherited)", "-force_load", "$(PROJECT_DIR)/Vendor/JetRuntime/lib/libjetruntime.a"]
