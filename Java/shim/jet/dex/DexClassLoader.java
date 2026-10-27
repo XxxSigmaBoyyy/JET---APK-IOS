@@ -285,17 +285,24 @@ public final class DexClassLoader extends ClassLoader {
     }
 
     // Dex2Asm.collectClzInfo / convertClass(Map<String, Clz>) take the package-private Clz type: call them reflectively.
-    static java.lang.reflect.Method COLLECT, CONVERT;
+    // Built once in a static initializer: lazily publishing a Method before setAccessible(true) raced across lookahead threads.
+    static final java.lang.reflect.Method COLLECT, CONVERT;
+    static {
+        try {
+            java.lang.reflect.Method m = Dex2Asm.class.getDeclaredMethod("collectClzInfo", DexFileNode.class);
+            m.setAccessible(true);
+            COLLECT = m;
+            CONVERT = Dex2Asm.class.getMethod("convertClass", DexFileNode.class, DexClassNode.class, ClassVisitorFactory.class, Map.class);
+        } catch (ReflectiveOperationException e) { throw new ExceptionInInitializerError(e); }
+    }
     @SuppressWarnings("unchecked")
     static Map<String, Object> collect(DexFileNode meta) {
         try {
-            if (COLLECT == null) { COLLECT = Dex2Asm.class.getDeclaredMethod("collectClzInfo", DexFileNode.class); COLLECT.setAccessible(true); }
             return (Map<String, Object>) COLLECT.invoke(null, meta);
         } catch (ReflectiveOperationException e) { throw new RuntimeException(e); }
     }
     static void convert(Dex2Asm d2a, DexFileNode file, DexClassNode c, ClassVisitorFactory cvf, Map<String, Object> clz) {
         try {
-            if (CONVERT == null) { CONVERT = Dex2Asm.class.getMethod("convertClass", DexFileNode.class, DexClassNode.class, ClassVisitorFactory.class, Map.class); }
             CONVERT.invoke(d2a, file, c, cvf, clz);
         } catch (java.lang.reflect.InvocationTargetException e) { Throwable t = e.getCause(); if (t instanceof RuntimeException) throw (RuntimeException) t; throw new RuntimeException(t); }
         catch (ReflectiveOperationException e) { throw new RuntimeException(e); }
