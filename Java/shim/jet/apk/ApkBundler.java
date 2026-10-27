@@ -58,7 +58,7 @@ public final class ApkBundler {
     }
 
     static String q(String v) { return '"' + Axml.esc(v == null ? "" : v, true) + '"'; }
-    static String hid(int id) { return String.format("0x%08x", id); }
+    static String hid(int id) { return "0x" + ResChunks.hex8(id, false); }
 
     // ---- values.xml ----
     Properties run(File fwDir) throws Exception {
@@ -81,7 +81,7 @@ public final class ApkBundler {
                 L.append("</style>\n");
             } else if (XMLFILE_TYPES.contains(t) && !e.complex && e.fmt().endsWith(".xml")) {
                 String path = e.fmt(); String x = Axml.toXml(read(path));
-                String fn = String.format("%s/%08x.xml", t, rid);
+                String fn = t + "/" + ResChunks.hex8(rid, false) + ".xml";
                 write(fn, x);
                 if (t.equals("layout")) { Matcher m = Pattern.compile("<([a-zA-Z_][\\w]*(?:\\.[\\w$]+)+)[\\s>/]").matcher(x); while (m.find()) customViews.add(m.group(1)); }
                 L.append("<res id=\"").append(h).append("\" type=\"").append(t).append("\" name=").append(q(n)).append(" file=\"").append(fn).append("\"/>\n");
@@ -100,7 +100,7 @@ public final class ApkBundler {
                     try {
                         byte[] data = read(path);
                         String ext = ext(path);
-                        String fn = String.format("drawable/%08x%s", rid, ext.isEmpty() ? ".bin" : ext);
+                        String fn = "drawable/" + ResChunks.hex8(rid, false) + (ext.isEmpty() ? ".bin" : ext);
                         if (path.endsWith(".9.png")) {
                             String fn9 = fn.substring(0, fn.length() - 4) + ".9.png"; write(fn9, data);
                             L.append("<drawable id=\"").append(h).append("\" name=").append(q(n)).append(" kind=\"ninepatch\" file=\"").append(fn9).append("\" density=\"").append(bestD).append("\"/>\n");
@@ -113,7 +113,7 @@ public final class ApkBundler {
             } else if (t.equals("color") && !e.complex && e.fmt().endsWith(".xml")) {
                 String path = e.fmt(); String x = null;
                 try { x = Axml.toXml(read(path)); } catch (Exception ex) { x = null; }
-                String fn = String.format("color/%08x.xml", rid), dflt = "#FF888888";
+                String fn = "color/" + ResChunks.hex8(rid, false) + ".xml", dflt = "#FF888888";
                 if (x != null && !x.isEmpty()) { write(fn, x); dflt = cslDefault(x, dflt); } else x = null;
                 L.append("<value id=\"").append(h).append("\" type=\"color\" name=").append(q(n)).append(" value=").append(q(dflt)).append(x != null ? " file=\"" + fn + "\"" : "").append("/>\n");
             } else if (t.equals("array") && e.complex) {
@@ -130,7 +130,7 @@ public final class ApkBundler {
                 String path = e.fmt();
                 try {
                     byte[] data = read(path); String ext = ext(path);
-                    String fn = String.format("%s/%08x%s", (t.equals("raw") || t.equals("font")) ? t : "raw", rid, ext.isEmpty() ? ".bin" : ext);
+                    String fn = ((t.equals("raw") || t.equals("font")) ? t : "raw") + "/" + ResChunks.hex8(rid, false) + (ext.isEmpty() ? ".bin" : ext);
                     write(fn, data);
                     L.append("<res id=\"").append(h).append("\" type=\"").append(t).append("\" name=").append(q(n)).append(" file=\"").append(fn).append("\"/>\n");
                 } catch (Exception ex) {
@@ -457,7 +457,7 @@ public final class ApkBundler {
                     L.append("</style>\n");
                 } else if (t.equals("color") && !e.complex && e.fmt().endsWith(".xml")) {
                     String x = null; try { x = Axml.toXml(read(e.fmt())); } catch (Exception ignore) {}
-                    String fn = String.format("fwcolor/%08x.xml", rid), dflt = "#FF888888";
+                    String fn = "fwcolor/" + ResChunks.hex8(rid, false) + ".xml", dflt = "#FF888888";
                     if (x != null && !x.isEmpty()) { write(fn, x); dflt = cslDefault(x, dflt); } else x = null;
                     L.append("<value id=\"").append(h).append("\" type=\"color\" name=").append(q(n)).append(" value=").append(q(dflt)).append(x != null ? " file=\"" + fn + "\"" : "").append("/>\n");
                 } else if (!e.complex) {
@@ -491,7 +491,7 @@ public final class ApkBundler {
                     D.append("<drawable id=\"").append(h).append("\" name=").append(q(name)).append(' ').append(kb[0]).append('>').append(kb[1]).append("</drawable>\n");
                 } else {
                     byte[] data = read(path); String ext = path.endsWith(".9.png") ? ".9.png" : ext(path);
-                    String fn = String.format("fwdrawable/%08x%s", rid, ext); write(fn, data);
+                    String fn = "fwdrawable/" + ResChunks.hex8(rid, false) + ext; write(fn, data);
                     D.append("<drawable id=\"").append(h).append("\" name=").append(q(name)).append(" kind=\"").append(ext.equals(".9.png") ? "ninepatch" : "bitmap").append("\" file=\"").append(fn).append("\" density=\"").append(bdens).append("\"/>\n");
                 }
             } catch (Exception ex) { System.err.println("fw drawable skip " + h + " " + ex); }

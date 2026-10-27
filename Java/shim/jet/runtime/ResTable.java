@@ -172,6 +172,13 @@ public final class ResTable {
         if (c == null) { c = style0(id); synchronized (this) { styleCache.put(id, c); } }
         return new LinkedHashMap<>(c);   // callers may mutate; styles never change after load
     }
+    /** Read-only view of the cached resolved style (no copy). */
+    public Map<String, String> styleView(int id) {
+        Map<String, String> c;
+        synchronized (this) { c = styleCache.get(id); }
+        if (c == null) { c = style0(id); synchronized (this) { styleCache.put(id, c); } }
+        return java.util.Collections.unmodifiableMap(c);
+    }
     private Map<String, String> style0(int id) {
         LinkedList<Map<String, String>> chain = new LinkedList<>();
         Integer cur = id;

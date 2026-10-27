@@ -59,7 +59,7 @@ public final class XmlAttrs implements AttributeSet {
                 // Also index hex form when the name is a real attr id we can resolve
                 if (t != null) {
                     Integer id = t.idByName("attr", n);
-                    if (id != null) own.put(String.format("0x%08x", id), v);
+                    if (id != null) own.put("0x" + jet.apk.ResChunks.hex8(id, false), v);
                 }
             }
         }

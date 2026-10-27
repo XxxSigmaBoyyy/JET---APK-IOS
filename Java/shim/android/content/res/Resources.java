@@ -155,6 +155,14 @@ public Resources(ResTable t) {
     public final Theme newTheme() { return new Theme(); }
     public final class Theme {
         final java.util.LinkedHashMap<String, String> vals = new java.util.LinkedHashMap<>();
+        /** Copy-free overlay base (obtainStyledAttributes temporaries): lookups that miss vals fall through to it. */
+        private Theme jetBase;
+        String get(String k) {
+            for (Theme th = this; th != null; th = th.jetBase) { String v = th.vals.get(k); if (v != null || th.vals.containsKey(k)) return v; }
+            return null;
+        }
+        boolean has(String k) { for (Theme th = this; th != null; th = th.jetBase) if (th.vals.containsKey(k)) return true; return false; }
+        private Theme overlay() { Theme tmp = new Theme(); tmp.jetPublish = false; tmp.jetBase = this; return tmp; }
         /** True for Context/Activity themes; false for short-lived obtainStyledAttributes overlays / ContextThemeWrapper. */
         private boolean jetPublish = true;
         public void jetSetPublish(boolean p) { jetPublish = p; }
@@ -163,7 +171,7 @@ public Resources(ResTable t) {
             // Only Context.setTheme / Activity themes publish as jetLastTheme. Temporary Theme copies used
             // inside obtainStyledAttributes must not overwrite it — otherwise Material CSL inflation sees an
             // overlay without colorPrimary and AndroidX falls back to magenta (#FFFF00FF).
-            java.util.Map<String, String> st = t.style(resid);
+            java.util.Map<String, String> st = t.styleView(resid);
             if (jetPublish) {
                 jetLastTheme = this;
                 // Only pin sticky resid for real app/material themes that define colour attrs.
@@ -173,33 +181,37 @@ public Resources(ResTable t) {
                     jetLastAppThemeResid = resid;
             }
             for (java.util.Map.Entry<String, String> e : st.entrySet())
-                if (force || !vals.containsKey(e.getKey())) vals.put(e.getKey(), e.getValue());
+                if (force || !has(e.getKey())) vals.put(e.getKey(), e.getValue());
         }
-        public void setTo(Theme other) { vals.clear(); if (other != null) vals.putAll(other.vals); }
+        public void setTo(Theme other) {
+            vals.clear(); jetBase = null;
+            if (other != null) { java.util.ArrayList<Theme> ch = new java.util.ArrayList<>(); for (Theme x = other; x != null; x = x.jetBase) ch.add(0, x); for (Theme x : ch) vals.putAll(x.vals); }
+        }
         public Resources getResources() { return Resources.this; }
         public android.graphics.drawable.Drawable getDrawable(int id) { return Resources.this.getDrawable(id); }
         public int getChangingConfigurations() { return 0; }
         public void rebase() {}
         public int[] getAttributeResolutionStack(int a, int b, int c) { return new int[0]; }
+        private String hex(int a) { return "0x" + jet.apk.ResChunks.hex8(a, false); }
         public String raw(int attr) {
-            String v = vals.get(t.attrKey(attr));
-            if (v == null) v = vals.get(String.format("0x%08x", attr)); // pre-normalisation hex keys
+            String v = get(t.attrKey(attr));
+            if (v == null) v = get(hex(attr)); // pre-normalisation hex keys
             int guard = 0;
             int last = attr;
             while (v != null && v.startsWith("?") && guard++ < 8) {
                 last = ResTable.refId(v);
-                v = vals.get(t.attrKey(last));
-                if (v == null) v = vals.get(String.format("0x%08x", last));
+                v = get(t.attrKey(last));
+                if (v == null) v = get(hex(last));
             }
             // Overlay/widget themes omit colour attrs; fall back to the published app theme.
             if (v == null && jetLastTheme != null && jetLastTheme != this) {
-                String fb = jetLastTheme.vals.get(t.attrKey(attr));
-                if (fb == null) fb = jetLastTheme.vals.get(String.format("0x%08x", attr));
+                String fb = jetLastTheme.get(t.attrKey(attr));
+                if (fb == null) fb = jetLastTheme.get(hex(attr));
                 if (fb != null) { v = fb; last = attr;
                     while (v != null && v.startsWith("?") && guard++ < 8) {
                         last = ResTable.refId(v);
-                        v = jetLastTheme.vals.get(t.attrKey(last));
-                        if (v == null) v = jetLastTheme.vals.get(String.format("0x%08x", last));
+                        v = jetLastTheme.get(t.attrKey(last));
+                        if (v == null) v = jetLastTheme.get(hex(last));
                     }
                 }
             }
@@ -207,12 +219,12 @@ public Resources(ResTable t) {
                 String ak = t.attrKey(attr);
                 java.util.Map<String, String> st = t.style(jetLastAppThemeResid);
                 v = st.get(ak);
-                if (v == null) v = st.get(String.format("0x%08x", attr));
+                if (v == null) v = st.get(hex(attr));
                 int g2 = 0;
                 while (v != null && v.startsWith("?") && g2++ < 8) {
                     int a2 = ResTable.refId(v);
                     v = st.get(t.attrKey(a2));
-                    if (v == null) v = st.get(String.format("0x%08x", a2));
+                    if (v == null) v = st.get(hex(a2));
                 }
             }
             if (v == null && (last >>> 24) == 0x01) v = jet.runtime.FrameworkThemeDefaults.get(last);
@@ -220,11 +232,11 @@ public Resources(ResTable t) {
         }
         public TypedArray obtainStyledAttributes(int[] attrs) { return new TypedArray(Resources.this, attrs, this, null); }
         public TypedArray obtainStyledAttributes(int resid, int[] attrs) {
-            Theme tmp = new Theme(); tmp.jetPublish = false; tmp.setTo(this); tmp.applyStyle(resid, true);
+            Theme tmp = overlay(); tmp.applyStyle(resid, true);
             return new TypedArray(Resources.this, attrs, tmp, null);
         }
         public TypedArray obtainStyledAttributes(android.util.AttributeSet set, int[] attrs, int defStyleAttr, int defStyleRes) {
-            Theme tmp = new Theme(); tmp.jetPublish = false; tmp.setTo(this);
+            Theme tmp = overlay();
             int ds = defStyleAttr != 0 ? ResTable.refId(raw(defStyleAttr)) : 0;
             if (ds != 0) tmp.applyStyle(ds, true); else if (defStyleRes != 0) tmp.applyStyle(defStyleRes, true);
             if (TypedArray.DBG) System.err.println("[TA] osa dsa=" + Integer.toHexString(defStyleAttr) + " raw=" + (defStyleAttr != 0 ? raw(defStyleAttr) : null) + " ds=" + Integer.toHexString(ds) + " dsr=" + Integer.toHexString(defStyleRes) + " themeN=" + vals.size() + " tmpN=" + tmp.vals.size());

@@ -83,15 +83,21 @@ public final class ResChunks {
     static String pyF(double v) { return new java.math.BigDecimal(v).setScale(6, java.math.RoundingMode.HALF_EVEN).toPlainString(); }
 
     /** androguard.core.axml.format_value + apk2bundle.fmt (sign-extended 24-bit dimension mantissa). */
+    /** Fixed-width 8-digit hex (String.format is very slow on the interpreter-only iOS JVM; bundling formats every id). */
+    public static String hex8(int v, boolean upper) {
+        char[] c = new char[8]; String d = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+        for (int i = 7; i >= 0; i--) { c[i] = d.charAt(v & 15); v >>>= 4; }
+        return new String(c);
+    }
     public static String format(int type, int data, String str) {
         long u = data & 0xffffffffL;
         String pk = (u >>> 24) == 1 ? "android:" : "";
         switch (type) {
             case TYPE_STRING: return str;
-            case TYPE_ATTRIBUTE: return "?" + pk + String.format("%08X", u);
-            case TYPE_REFERENCE: return "@" + pk + String.format("%08X", u);
+            case TYPE_ATTRIBUTE: return "?" + pk + hex8((int) u, true);
+            case TYPE_REFERENCE: return "@" + pk + hex8((int) u, true);
             case TYPE_FLOAT: return pyF(Float.intBitsToFloat(data));
-            case TYPE_INT_HEX: return String.format("0x%08X", u);
+            case TYPE_INT_HEX: return "0x" + hex8((int) u, true);
             case TYPE_INT_BOOLEAN: return data == 0 ? "false" : "true";
             case TYPE_DIMENSION: {
                 double v = complexToFloat(u);
@@ -100,7 +106,7 @@ public final class ResChunks {
             }
             case TYPE_FRACTION: return pyF(complexToFloat(u) * 100) + FRACTION_UNITS[(int) (u & 0xf)];
             default:
-                if (type >= TYPE_FIRST_COLOR && type <= TYPE_LAST_COLOR) return String.format("#%08X", u);
+                if (type >= TYPE_FIRST_COLOR && type <= TYPE_LAST_COLOR) return "#" + hex8((int) u, true);
                 if (type >= TYPE_FIRST_INT && type <= TYPE_LAST_INT) return Long.toString(u > 0x7FFFFFFFL ? (u & 0x7FFFFFFFL) - 0x80000000L : u);
                 return String.format("<0x%X, type 0x%02X>", u, type);
         }
