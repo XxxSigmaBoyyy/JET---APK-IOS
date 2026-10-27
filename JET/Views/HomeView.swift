@@ -74,6 +74,11 @@ struct HomeView: View {
             Text(pickerError ?? "")
         }
         .onOpenURL { url in handle(url) }
+        .task {
+            if SmokeTest.shared.isActive {
+                await SmokeTest.shared.start(store: store, importer: importer) { launching = $0 }
+            }
+        }
     }
 
     private var header: some View {

@@ -1,11 +1,13 @@
 import Foundation
 
-/// Swift face of the JetBridge C ABI (v1, see docs/RUNTIME_LINK.md).
+import UIKit
+
+/// Swift face of the JetBridge C ABI (v2, see docs/RUNTIME_LINK.md).
 enum JetBridge {
     enum TranslateResult: Equatable {
         case translated   // a prebuilt AOT module in this binary matches the APK
         case unsupported  // runtime linked, but this binary has no AOT module for the APK's code
-        case stub         // stub accepted the APK; nothing was translated
+        case stub         // legacy value from ABI v1 shell-preview builds (kept for stored shortcuts)
 
         /// Value stored in AppShortcut.bridgeResult.
         var storedValue: String {
@@ -79,6 +81,49 @@ enum JetBridge {
     @discardableResult
     static func click(_ label: String) -> Int32 { jet_runtime_click(label) }
 
-    static func touch(id: Int32, action: Int32, x: Float, y: Float) { jet_runtime_touch(id, action, x, y) }
+    /// Touch in viewport pixels; returns the bridge code (1 = redraw, 0 = nothing changed, < 0 = error).
+    @discardableResult
+    static func touch(id: Int32, action: Int32, x: Float, y: Float) -> Int32 { jet_runtime_touch(id, action, x, y) }
     static func stop() { jet_runtime_stop() }
+
+    // MARK: ABI v2 rendering
+
+    /// Installs the UIKit text measurer (system font, the same one JetSurfaceView draws with). Idempotent.
+    static func installTextMeasurer() {
+        jet_runtime_set_text_measurer { utf8, size, bold, width, ascent, descent in
+            let font = JetBridge.font(size: CGFloat(size), bold: bold != 0)
+            let text = utf8.map { String(cString: $0) } ?? ""
+            width?.pointee = Float(ceil((text as NSString).size(withAttributes: [.font: font]).width))
+            ascent?.pointee = Float(font.ascender)
+            descent?.pointee = Float(-font.descender)
+        }
+    }
+
+    private static var fontCache: [Int: UIFont] = [:]
+    /// System font at a pixel size (the surface draws in a pixel-scaled context).
+    static func font(size: CGFloat, bold: Bool) -> UIFont {
+        let key = Int(size * 16) * 2 + (bold ? 1 : 0)
+        if let f = fontCache[key] { return f }
+        let f = UIFont.systemFont(ofSize: max(size, 1), weight: bold ? .bold : .regular)
+        fontCache[key] = f
+        return f
+    }
+
+    static func setViewport(width: Int32, height: Int32, density: Float) { jet_runtime_set_viewport(width, height, density) }
+
+    /// Current display list (valid until the next runtime call) and window background colour.
+    static func frame() -> (ops: UnsafeBufferPointer<JetDrawOp>, background: UInt32) {
+        var ptr: UnsafePointer<JetDrawOp>?
+        var bg: UInt32 = 0xff000000
+        let n = jet_runtime_frame(&ptr, &bg)
+        return (UnsafeBufferPointer(start: n > 0 ? ptr : nil, count: Int(max(n, 0))), bg)
+    }
+
+    static var nextWakeupMs: Int32 { jet_runtime_next_wakeup_ms() }
+
+    /// Centre (pixels) of the first clickable view labelled `label` (automation / smoke tests).
+    static func find(label: String) -> CGPoint? {
+        var x: Float = 0, y: Float = 0
+        return jet_runtime_find_label(label, &x, &y) == JET_BRIDGE_OK ? CGPoint(x: CGFloat(x), y: CGFloat(y)) : nil
+    }
 }

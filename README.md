@@ -18,16 +18,16 @@ JET — оболочка для iPhone (iOS 17+), которая принима�
 - **Запуск:** нажатие на ярлык открывает приложение на весь экран внутри `JetHostView` (это `UIView`, касания передаются в мост).
 - **Настройки:** «О программе» (версия, версия моста, статус рантайма), размеры хранилища, «Очистить кэш», «Удалить все ярлыки».
 
-> **Честно о статусе.** По умолчанию (и в CI без настроенного рантайма) JetBridge — заглушка (`JET/Bridge/JetBridgeStub.c`): APK проверяется и закрепляется, но Android-код **не исполняется**, экран приложения показывает «Runtime not linked». Подключаемый рантайм JET (`libjetruntime.a`, см. ниже) сейчас умеет запускать **только** один заранее AOT-скомпилированный открытый APK (демо — Heading Calculator); любой другой APK честно получает статус «не поддерживается». На iOS нельзя JIT и загружать код, поэтому код приложения компилируется заранее и линкуется в `.ipa`.
+> **Честно о статусе (Milestone 1).** В `.ipa` теперь встроен настоящий рантайм JET (заглушки больше нет): AOT-скомпилированный код приложения (DEX → C, без JIT — на iOS он запрещён), нативный движок Android-вью (инфляция layout-ов, measure/layout по правилам AOSP: LinearLayout с весами, TableLayout/TableRow, селекторы состояний, Toast) и отрисовка через CoreGraphics в `JetSurfaceView`; касания (нажатие, клик, долгое нажатие) доходят до слушателей приложения. Пока поддерживается **одно** открытое приложение, скомпилированное в сборку: **Heading Calculator 1.3** (F-Droid, GPL-3.0, `Modules/heading/`). Импортируйте его APK с F-Droid — откроется его настоящий первый экран, и он реагирует на нажатия. Любой другой APK импортируется, но помечается «нет готового модуля»: для произвольных APK нужен интерпретатор DEX (следующий этап). На физическом iPhone сборка ещё не проверялась — проверены хост-тесты и симулятор в CI.
 
-### Рантайм JET (необязательно)
-- `scripts/build_host_lib.sh --proto ../proto [--install]` — собирает `dist/JetRuntime` (arm64-apple-ios `libjetruntime.a`, `JetBridge.h`, `manifest.json`) и прогоняет контракт-тесты C-API на Linux.
-- Локально: `--install`, затем `JET_RUNTIME=YES xcodegen generate`. В CI: переменные репозитория `JET_RUNTIME_URL` (https) и `JET_RUNTIME_SHA256`; `scripts/fetch_runtime.sh` проверяет архив. Без них собирается заглушка.
-- Контракт (функции, коды возврата, потоки, формат бандла, ограничения): [`docs/RUNTIME_LINK.md`](docs/RUNTIME_LINK.md).
-- `Vendor/JetRuntime/` и `dist/` **никогда не коммитятся**; модули собираются только из открытых APK.
+### Рантайм JET
+- `Runtime/` — рантайм (jetrt.h, rt.c, kernel.c — ядро java.lang + движок Android-вью) и мост C-API `jet_bridge_aot.c`; компилируется прямо в таргет Xcode.
+- `Modules/<name>/` — модули приложений, сгенерированные `tools/aot/gen_module.sh` **только из открытых APK** (см. NOTICE модуля). Сами APK в репозиторий не попадают.
+- `scripts/test_runtime.sh` — контракт-тест C-API и тест отрисовки/касаний на Linux/macOS (APK скачивается с F-Droid с проверкой sha256).
+- Контракт (функции, коды возврата, потоки, display list): [`docs/RUNTIME_LINK.md`](docs/RUNTIME_LINK.md).
 
 ### Установка через E-SIGN (без Mac)
-1. Откройте вкладку **Actions** этого репозитория → workflow **iOS unsigned IPA** → последний успешный запуск → артефакт **JET-…-unsigned-ipa** (zip с файлом `.ipa`). Для тегов `v*` тот же `.ipa` прикрепляется к **Releases**.
+1. Откройте вкладку **Actions** этого репозитория → workflow **iOS IPA (JET runtime)** → последний успешный запуск → артефакт **JET-…-runtime-unsigned-ipa** (zip с файлом `.ipa`). Для тегов `v*` тот же `.ipa` прикрепляется к **Releases**.
 2. Скачайте `.ipa` на iPhone (Safari → «Файлы»). Если скачался zip, распакуйте его в «Файлах».
 3. В **E-SIGN**: «Файлы»/«Импорт» → выберите `JET-…-unsigned.ipa`.
 4. Нажмите на него → **Подписать**. Выберите свой сертификат (`.p12` + `.mobileprovision`, импортированные в E-SIGN) → подпишите → **Установить**.
@@ -77,11 +77,14 @@ JET/Views                       главный экран, плитки, имп�
 JET/Theme                       стеклянные стили, фон, силуэт истребителя
 JET/Models                      ярлыки и хранилище
 JET/Pipeline                    ZIP-чтение, инспекция APK, конвейер импорта
-JET/Bridge                      C-API JetBridge + заглушка + Swift-обёртка
-Runtime/                        реализация C-API на AOT-рантайме + контракт-тест
-docs/RUNTIME_LINK.md            контракт C-API и порядок линковки
+JET/Bridge                      C-API JetBridge + Swift-обёртка
+JET/Debug                       смоук-тест по аргументам запуска (CI-симулятор)
+Runtime/                        AOT-рантайм, движок Android-вью, мост C-API, тесты
+Modules/                        AOT-модули открытых приложений (сгенерированный C)
+tools/aot/                      DEX→C (Soot Jimple → C), ресурсы → C, gen_module.sh
+docs/RUNTIME_LINK.md            контракт C-API (ABI v2)
 JET/Resources                   Info.plist, Assets.xcassets
-scripts/                        иконка, упаковка .ipa, сборка/загрузка рантайма
+scripts/                        иконка, упаковка .ipa, guard репозитория, тест рантайма
 Assets/                         слот для вашей иконки
 legacy/                         старый шаблон «одно APK → одно приложение» (в сборку не входит)
 ```
@@ -102,16 +105,21 @@ JET is an iPhone shell (iOS 17+) that takes Android `.apk` files and pins them t
 - **Launch:** tapping a shortcut opens the app fullscreen inside `JetHostView` (a `UIView`; touches are forwarded to the bridge).
 - **Settings:** About (version, bridge version, runtime status), storage sizes, Clear cache, Remove all shortcuts.
 
-> **Status, honestly.** By default (and in CI without a configured runtime) JetBridge is a stub (`JET/Bridge/JetBridgeStub.c`): APKs are inspected and pinned, but Android code **does not run**; the app screen shows "Runtime not linked". The optional JET runtime (`libjetruntime.a`, below) currently runs **only** one prebuilt AOT-compiled open-source APK (demo: Heading Calculator); any other APK is reported as unsupported. iOS allows no JIT and no code loading, so app code is compiled ahead of time and linked into the `.ipa`.
+> **Status, honestly (Milestone 1).** The `.ipa` now contains the real JET runtime (the stub is gone). It has three parts:
+> - App code compiled ahead of time (DEX → C, no JIT, which iOS forbids).
+> - A native Android view engine: layout inflation; AOSP measure/layout for LinearLayout with weights and for TableLayout/TableRow; state-list selectors; Toast.
+> - CoreGraphics rendering into `JetSurfaceView`. Touches (press, click, long press) reach the app's own listeners.
+>
+> Right now exactly **one** open-source app is compiled in: **Heading Calculator 1.3** (F-Droid, GPL-3.0, `Modules/heading/`). Import its APK from F-Droid and its real first screen opens and responds to taps. Any other APK imports but is marked "No prebuilt module"; arbitrary APKs need a DEX interpreter, which is the next milestone. Not yet verified on a physical iPhone: it is verified by host tests and by the CI simulator smoke test.
 
-### JET runtime (optional)
-- `scripts/build_host_lib.sh --proto ../proto [--install]` builds `dist/JetRuntime` (arm64-apple-ios `libjetruntime.a`, `JetBridge.h`, `manifest.json`) and runs the C API contract tests on Linux.
-- Locally: `--install`, then `JET_RUNTIME=YES xcodegen generate`. In CI: repository variables `JET_RUNTIME_URL` (https) and `JET_RUNTIME_SHA256`; `scripts/fetch_runtime.sh` verifies the archive. Without them the stub is built.
-- Contract (functions, return codes, threading, bundle format, limits): [`docs/RUNTIME_LINK.md`](docs/RUNTIME_LINK.md).
-- `Vendor/JetRuntime/` and `dist/` are **never committed**; modules are built from open-source APKs only.
+### JET runtime
+- `Runtime/` holds the runtime and the bridge. The runtime is jetrt.h, rt.c and kernel.c (java.lang core plus the Android view engine). The C-API bridge is `jet_bridge_aot.c`. All of it is compiled straight into the Xcode target.
+- `Modules/<name>/` holds the app modules. `tools/aot/gen_module.sh` generates them, **from open-source APKs only** (see each module's NOTICE). APKs themselves are never committed.
+- `scripts/test_runtime.sh` runs the C-API contract test and a render/touch test on Linux or macOS. It downloads the APK from F-Droid and checks its sha256.
+- The contract (functions, return codes, threading, display list) is in [`docs/RUNTIME_LINK.md`](docs/RUNTIME_LINK.md).
 
 ### Install with E-SIGN (no Mac needed)
-1. Open this repo's **Actions** tab → **iOS unsigned IPA** → the latest green run → artifact **JET-…-unsigned-ipa** (a zip containing the `.ipa`). For `v*` tags the same `.ipa` is attached to **Releases**.
+1. Open this repo's **Actions** tab → **iOS IPA (JET runtime)** → the latest green run → artifact **JET-…-runtime-unsigned-ipa** (a zip containing the `.ipa`). For `v*` tags the same `.ipa` is attached to **Releases**.
 2. Download the `.ipa` on your iPhone (Safari → Files). If you got a zip, unzip it in Files.
 3. In **E-SIGN**: Files/Import → choose `JET-…-unsigned.ipa`.
 4. Tap it → **Sign**. Pick your certificate (the `.p12` + `.mobileprovision` imported into E-SIGN) → sign → **Install**.
@@ -161,11 +169,14 @@ JET/Views                       home, tiles, import progress, host screen, setti
 JET/Theme                       glass styles, aurora background, fighter-jet glyph
 JET/Models                      shortcuts + on-disk store
 JET/Pipeline                    ZIP reader, APK inspector, import pipeline
-JET/Bridge                      JetBridge C API + stub + Swift wrapper
-Runtime/                        C API implementation on the AOT runtime + contract test
-docs/RUNTIME_LINK.md            C API contract and link recipe
+JET/Bridge                      JetBridge C API + Swift wrapper
+JET/Debug                       launch-argument smoke test (CI simulator)
+Runtime/                        AOT runtime, Android view engine, C API bridge, tests
+Modules/                        AOT modules of open-source apps (generated C)
+tools/aot/                      DEX->C (Soot Jimple -> C), resources -> C, gen_module.sh
+docs/RUNTIME_LINK.md            C API contract (ABI v2)
 JET/Resources                   Info.plist, Assets.xcassets
-scripts/                        icon, .ipa packaging, runtime build/fetch
+scripts/                        icon, .ipa packaging, repository guard, runtime test
 Assets/                         slot for your icon artwork
 legacy/                         old one-APK-per-app template (not part of the build)
 ```

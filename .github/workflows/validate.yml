@@ -11,12 +11,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Refuse Android packages
-        run: |
-          if git ls-files | grep -Ei '\.(apk|xapk|apks|aab|obb)$'; then
-            echo "::error::Android packages must never be committed."
-            exit 1
-          fi
+      - name: Repository guard
+        run: scripts/guard_repo.sh
       - name: YAML + scripts
         run: |
           python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ios-ipa.yml')); yaml.safe_load(open('project.yml')); print('yaml ok')"

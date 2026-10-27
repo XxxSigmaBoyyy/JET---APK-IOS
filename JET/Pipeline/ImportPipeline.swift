@@ -30,7 +30,8 @@ final class ImportJob: ObservableObject, Identifiable {
 }
 
 /// Import flow: copy the picked .apk into the sandbox, inspect it, hand it to JetBridge for translation,
-/// assemble the app folder and add a home shortcut. With the stub bridge the bundle only holds app.properties.
+/// assemble the app folder and add a home shortcut. The bridge matches the APK's classes.dex against the AOT modules
+/// compiled into this binary (iOS allows no JIT / code loading); unmatched APKs are kept but marked unsupported.
 @MainActor
 final class ImportCoordinator: ObservableObject {
     @Published private(set) var jobs: [ImportJob] = []

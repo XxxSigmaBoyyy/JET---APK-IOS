@@ -1,4 +1,4 @@
-name: iOS unsigned IPA
+name: iOS IPA (JET runtime)
 
 on:
   push:
@@ -15,8 +15,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  guard:
+    name: Repository guard + runtime host test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # fails on tracked *.apk/*.ipa/*.p12/*.mobileprovision/... and on token-like strings (reports file:line only)
+      - name: Repository guard
+        run: scripts/guard_repo.sh
+      - name: Pillow (frame rendering)
+        run: python3 -c 'import PIL' 2>/dev/null || sudo apt-get install -y -q python3-pil
+      # contract test + render/touch test of Runtime/ + Modules/ exactly as compiled into the app; the module's
+      # open-source APK is downloaded from F-Droid (sha256-checked, see Modules/*/NOTICE) and never committed
+      - name: Runtime host test
+        run: scripts/test_runtime.sh build/runtime-test
+      - name: Upload host frames
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-host-frames
+          path: |
+            build/runtime-test/*.png
+            build/runtime-test/*.ops
+          if-no-files-found: ignore
+
   build:
-    name: Build JET.ipa (unsigned)
+    name: Build JET.ipa (unsigned, runtime linked)
+    needs: guard
     runs-on: macos-latest
     timeout-minutes: 40
     env:
@@ -27,26 +53,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Refuse committed Android packages
-        run: |
-          if git ls-files | grep -Ei '\.(apk|xapk|apks|aab|obb)$'; then
-            echo "::error::Android packages must never be committed to this repository."
-            exit 1
-          fi
-
-      - name: Refuse committed runtime binaries
-        run: |
-          if git ls-files | grep -E '^(Vendor/JetRuntime/|dist/)'; then
-            echo "::error::Vendor/JetRuntime and dist/ are build outputs and must never be committed."
-            exit 1
-          fi
+      - name: Repository guard
+        run: scripts/guard_repo.sh
 
       - name: Select Xcode
         run: |
-          for XCODE in /Applications/Xcode_15.4.app /Applications/Xcode_15.3.app /Applications/Xcode_15.2.app; do
-            if [ -d "$XCODE" ]; then sudo xcode-select -s "$XCODE/Contents/Developer"; break; fi
-          done
           xcodebuild -version
+          sudo xcode-select -p
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -54,14 +67,8 @@ jobs:
       - name: App icon
         run: scripts/sync_icon.sh
 
-      - name: JET runtime (optional prebuilt, else stub)
-        env:
-          JET_RUNTIME_URL: ${{ vars.JET_RUNTIME_URL }}
-          JET_RUNTIME_SHA256: ${{ vars.JET_RUNTIME_SHA256 }}
-        run: scripts/fetch_runtime.sh
-
       - name: Generate Xcode project
-        run: JET_RUNTIME="${JET_RUNTIME:-NO}" xcodegen generate --spec project.yml
+        run: xcodegen generate --spec project.yml
 
       - name: Validate Info.plist
         run: plutil -lint JET/Resources/Info.plist
@@ -78,16 +85,17 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build > build/xcodebuild.log 2>&1 || { grep -E 'error:' build/xcodebuild.log | head -n 60; tail -n 60 build/xcodebuild.log; exit 1; }
+            build > build/xcodebuild.log 2>&1 || { grep -E 'error:' build/xcodebuild.log | head -n 80; tail -n 80 build/xcodebuild.log; exit 1; }
           grep -E '(error|warning):' build/xcodebuild.log | sort -u | head -n 60 || true
           test -d "$DERIVED/Build/Products/$CONFIGURATION-iphoneos/JET.app"
 
-      - name: Check linked bridge
+      - name: Check linked runtime
         run: |
           BIN="$DERIVED/Build/Products/$CONFIGURATION-iphoneos/JET.app/JET"
-          if [ "${JET_RUNTIME:-NO}" = YES ]; then WANT='aot-0\.1'; KIND=runtime; else WANT='stub-0\.2'; KIND=stub; fi
-          strings "$BIN" | grep -E "$WANT" || { echo "::error::expected $KIND bridge in $BIN"; exit 1; }
-          echo "BRIDGE=$KIND" >> "$GITHUB_ENV"
+          strings "$BIN" | grep -E 'aot-0\.2' || { echo "::error::JET runtime (aot-0.2) not linked into $BIN"; exit 1; }
+          if strings "$BIN" | grep -q 'stub-0\.'; then echo "::error::stub bridge still linked"; exit 1; fi
+          nm -gU "$BIN" 2>/dev/null | grep -E ' _jet_runtime_(frame|touch|main)$' || true
+          lipo -info "$BIN"
 
       - name: Package unsigned IPA
         run: |
@@ -98,7 +106,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: JET-${{ env.VERSION }}-${{ env.BRIDGE }}-unsigned-ipa
+          name: JET-${{ env.VERSION }}-runtime-unsigned-ipa
           path: dist/*.ipa
           if-no-files-found: error
 
@@ -115,3 +123,75 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.ipa
+
+  simulator-smoke:
+    name: Simulator smoke (import -> first screen -> taps)
+    needs: guard
+    runs-on: macos-latest
+    timeout-minutes: 40
+    env:
+      DERIVED: build/DerivedSim
+      BUNDLE_ID: dev.jet.app
+    steps:
+      - uses: actions/checkout@v4
+      - name: Repository guard
+        run: scripts/guard_repo.sh
+      - name: Tools
+        run: |
+          xcodebuild -version
+          brew install xcodegen
+          scripts/sync_icon.sh
+          xcodegen generate --spec project.yml
+      - name: Pick + boot an iPhone simulator
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)["devices"]
+          c = [(rt, x) for rt, xs in d.items() if "iOS" in rt for x in xs if x["name"].startswith("iPhone")]
+          c.sort(key=lambda p: (p[0], "Pro" not in p[1]["name"], p[1]["name"]))
+          print(c[-1][1]["udid"] if c else "")')
+          [ -n "$UDID" ] || { echo "::error::no iPhone simulator available"; xcrun simctl list devices available; exit 1; }
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl list devices | grep "$UDID"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+      - name: Build for the simulator
+        run: |
+          mkdir -p build
+          xcodebuild -project JET.xcodeproj -scheme JET -configuration Debug \
+            -destination "id=$UDID" -derivedDataPath "$DERIVED" \
+            CODE_SIGNING_ALLOWED=NO build > build/xcodebuild-sim.log 2>&1 || { grep -E 'error:' build/xcodebuild-sim.log | head -n 80; tail -n 60 build/xcodebuild-sim.log; exit 1; }
+          ls "$DERIVED/Build/Products/Debug-iphonesimulator/JET.app"
+      - name: Fetch the open-source test APK (F-Droid, sha256-checked, not committed)
+        run: |
+          NOTICE=Modules/heading/NOTICE
+          URL=$(sed -n 's/^apk-url: *//p' $NOTICE); SHA=$(sed -n 's/^apk-sha256: *//p' $NOTICE)
+          curl -fsSL --retry 3 -o build/test.apk "$URL"
+          echo "$SHA  build/test.apk" | shasum -a 256 -c -
+      - name: Install, import, run, tap
+        run: |
+          xcrun simctl install "$UDID" "$DERIVED/Build/Products/Debug-iphonesimulator/JET.app"
+          DATA=$(xcrun simctl get_app_container "$UDID" "$BUNDLE_ID" data)
+          mkdir -p "$DATA/Documents"; cp build/test.apk "$DATA/Documents/heading.apk"
+          xcrun simctl launch "$UDID" "$BUNDLE_ID" -JETSmokeAPK Documents/heading.apk -JETSmokeTaps "1,2,0,TAS,9,5,~TC,7"
+          OUT="$DATA/Documents/jet-smoke"
+          for i in $(seq 1 120); do [ -f "$OUT/result.txt" ] && break; sleep 1; done
+          mkdir -p build/smoke
+          xcrun simctl io "$UDID" screenshot build/smoke/simulator_screen.png || true
+          cp -R "$OUT/." build/smoke/ 2>/dev/null || true
+          echo "---- log"; cat build/smoke/log.txt || true
+          RESULT=$(cat build/smoke/result.txt 2>/dev/null || echo "FAIL no result (timeout)")
+          echo "smoke: $RESULT"
+          case "$RESULT" in PASS*) ;; *) echo "::error::simulator smoke failed: $RESULT"; exit 1 ;; esac
+      - name: Simulator log excerpt
+        if: failure()
+        run: xcrun simctl spawn "$UDID" log show --last 5m --style compact --predicate 'process == "JET"' | tail -n 200 || true
+      - name: Upload smoke results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulator-smoke
+          path: |
+            build/smoke
+            build/xcodebuild-sim.log
+          if-no-files-found: ignore

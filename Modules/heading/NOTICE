@@ -1,0 +1,13 @@
+Heading Calculator — AOT module for JET (generated C, not hand-written)
+
+name: Heading Calculator (org.debian.eugen.headingcalculator), version 1.3 (versionCode 4)
+author: Ievgenii Meshcheriakov
+license: GPL-3.0-only (as published on F-Droid). The generated files in this directory are a mechanical
+  translation of that program and are distributed under the same licence.
+source: https://f-droid.org/packages/org.debian.eugen.headingcalculator/ (source code linked from the F-Droid page)
+apk-url: https://f-droid.org/repo/org.debian.eugen.headingcalculator_4.apk
+apk-sha256: dbcfc1903051b66e7f6d3bd65a49d79527d2c143dfd870e9384bb2c9c1b8b383
+dex-crc32: d92e942c
+
+The APK itself is NOT in this repository (Android packages must never be committed). Regenerate with:
+  tools/aot/gen_module.sh --name heading --apk <apk> --jar <apk classes as jar> --bundle <JET bundle dir> --soot <dir>
