@@ -16,8 +16,22 @@ enum JetJVM {
     static func boot(classpath: [URL], options: [String] = [], log: URL?) -> (ok: Bool, ms: Double, error: String) {
         var err = [CChar](repeating: 0, count: 1024)
         let rc = jet_jvm_boot(javaHome.path, classpath.map(\.path).joined(separator: ":"),
-                              options.joined(separator: "\n"), log?.path, &err, Int32(err.count))
+                              (fontOptions() + options).joined(separator: "\n"), log?.path, &err, Int32(err.count))
         return (rc == 0, jet_jvm_boot_ms(), String(cString: err))
+    }
+
+    /// Java2D text needs a logical-font config. stage_jvm.sh bundles DejaVu in jre/lib/fonts plus
+    /// lib/fontconfig.properties.in; FontConfiguration wants absolute file names, and the bundle path is only known
+    /// now, so write the resolved file to Caches and point sun.awt.fontconfig at it.
+    static func fontOptions() -> [String] {
+        let fonts = javaHome.appendingPathComponent("lib/fonts", isDirectory: true)
+        let tmpl = javaHome.appendingPathComponent("lib/fontconfig.properties.in")
+        guard let text = try? String(contentsOf: tmpl, encoding: .utf8) else { return [] }
+        let out = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("jet-fontconfig.properties")
+        do { try text.replacingOccurrences(of: "$JRE_LIB_FONTS", with: fonts.path).write(to: out, atomically: true, encoding: .utf8) }
+        catch { return [] }
+        return ["-Dsun.awt.fontconfig=\(out.path)", "-Dsun.java2d.fontpath=append:\(fonts.path)"]
     }
 
     /// Call `static String method(String)` on `cls` ("dev/jet/Hello").

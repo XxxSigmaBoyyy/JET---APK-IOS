@@ -20,6 +20,8 @@ void *jet_jvm_vm(void); /* from jetjvm.c */
 static jet_ctx *g_ctx;
 static JavaVM *g_vm;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+/* RegisterNatives table has its own lock: on_register fires inside JNI_OnLoad while N_loadPath holds g_mu. */
+static pthread_mutex_t g_reg_mu = PTHREAD_MUTEX_INITIALIZER;
 /* One guest call at a time (the interpreter context is shared); recursive: guest -> Java -> native -> guest. */
 static pthread_mutex_t g_call_mu;
 static pthread_once_t g_call_once = PTHREAD_ONCE_INIT;
@@ -45,16 +47,16 @@ static void on_register(void *user, const char *cls, const char *name, const cha
     size_t n = strlen(cls) + strlen(name) + strlen(sig) + 2;
     char *k = malloc(n); if (!k) return;
     snprintf(k, n, "%s.%s%s", cls, name, sig);
-    pthread_mutex_lock(&g_mu);
-    for (int i = 0; i < g_nreg; i++) if (!strcmp(g_reg[i].key, k)) { g_reg[i].fn = guest_fn; free(k); pthread_mutex_unlock(&g_mu); return; }
+    pthread_mutex_lock(&g_reg_mu);
+    for (int i = 0; i < g_nreg; i++) if (!strcmp(g_reg[i].key, k)) { g_reg[i].fn = guest_fn; free(k); pthread_mutex_unlock(&g_reg_mu); return; }
     if (g_nreg == g_capreg) {
         int nc = g_capreg ? g_capreg * 2 : 256;
         reg_ent *r = realloc(g_reg, (size_t)nc * sizeof *r);
-        if (!r) { free(k); pthread_mutex_unlock(&g_mu); return; }
+        if (!r) { free(k); pthread_mutex_unlock(&g_reg_mu); return; }
         g_reg = r; g_capreg = nc;
     }
     g_reg[g_nreg].key = k; g_reg[g_nreg].fn = guest_fn; g_nreg++;
-    pthread_mutex_unlock(&g_mu);
+    pthread_mutex_unlock(&g_reg_mu);
 }
 
 static jet_lib *find_lib(const char *path) {
@@ -132,12 +134,12 @@ static jlong JNICALL N_registered(JNIEnv *env, jclass cls, jstring jc, jstring j
                *g = (*env)->GetStringUTFChars(env, js, NULL);
     size_t cl = strlen(c), nl = strlen(n);
     uint64_t fn = 0;
-    pthread_mutex_lock(&g_mu);
+    pthread_mutex_lock(&g_reg_mu);
     for (int i = 0; i < g_nreg && !fn; i++) {
         const char *k = g_reg[i].key;
         if (!strncmp(k, c, cl) && k[cl] == '.' && !strncmp(k + cl + 1, n, nl) && !strcmp(k + cl + 1 + nl, g)) fn = g_reg[i].fn;
     }
-    pthread_mutex_unlock(&g_mu);
+    pthread_mutex_unlock(&g_reg_mu);
     (*env)->ReleaseStringUTFChars(env, jc, c); (*env)->ReleaseStringUTFChars(env, jn, n); (*env)->ReleaseStringUTFChars(env, js, g);
     return (jlong)fn;
 }

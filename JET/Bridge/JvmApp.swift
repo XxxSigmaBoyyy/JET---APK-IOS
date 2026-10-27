@@ -15,8 +15,14 @@ enum JvmApp {
     static var options: [String] {
         ["-XX:+UnlockDiagnosticVMOptions", "-XX:-BytecodeVerificationRemote",
          "-Djet.android.model=\(dataDir.appendingPathComponent("android-model.jar").path)",
-         "-Djet.gfx=java2d", "-Djet.fw.sdk=28"]
+         "-Djet.gfx=java2d", "-Djet.fw.sdk=28"] + opens
     }
+
+    /// ART has no module system; stock apps (and their desugar runtime, j$.util.DesugarCollections) reflect into
+    /// java.base internals, so open the packages they touch to the class-path (unnamed) module.
+    static let opens: [String] = ["java.lang", "java.lang.reflect", "java.lang.invoke", "java.util", "java.util.concurrent",
+                                  "java.util.concurrent.atomic", "java.io", "java.nio", "java.net", "java.text", "java.time",
+                                  "sun.nio.ch"].map { "--add-opens=java.base/\($0)=ALL-UNNAMED" }
 
     static func boot(log: URL?) -> (ok: Bool, ms: Double, error: String) {
         let jars = (try? FileManager.default.contentsOfDirectory(at: JetJVM.appJars, includingPropertiesForKeys: nil))?

@@ -7,6 +7,40 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd); V=$ROOT/Vendor
 : "${JAVA_HOME:?JDK 21 needed for javac + jni.h}"
 rm -rf "$V/jre-$SDK" "$V/jni" "$V/jvm-app"; mkdir -p "$V/jre-$SDK" "$V/jni" "$V/jvm-app"
 tar -C "$V/jre-$SDK" -xJf "$TAR"
+# Fonts for Java2D text (DejaVu 2.37, free license, fetched + sha-checked, never committed). Without a
+# lib/fontconfig.properties the iOS JRE's FontConfiguration throws "Fontconfig head is null" on first text.
+DJV_SHA=7576310b219e04159d35ff61dd4a4ec4cdba4f35c00e002a136f00e96a908b0a
+DJVZ="$V/dejavu-fonts-ttf-2.37.zip"
+[[ -f "$DJVZ" ]] || curl -fsSL -o "$DJVZ" "https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-2.37.zip"
+echo "$DJV_SHA  $DJVZ" | shasum -a 256 -c - >/dev/null || { echo "dejavu-fonts-ttf-2.37.zip sha256 mismatch"; exit 1; }
+JLIB="$V/jre-$SDK/jre/lib"; mkdir -p "$JLIB/fonts"
+for f in DejaVuSans DejaVuSans-Bold DejaVuSans-Oblique DejaVuSans-BoldOblique DejaVuSerif DejaVuSerif-Bold DejaVuSerif-Italic DejaVuSerif-BoldItalic \
+         DejaVuSansMono DejaVuSansMono-Bold DejaVuSansMono-Oblique DejaVuSansMono-BoldOblique; do
+  unzip -qjo "$DJVZ" "dejavu-fonts-ttf-2.37/ttf/$f.ttf" -d "$JLIB/fonts"
+done
+unzip -qjo "$DJVZ" "dejavu-fonts-ttf-2.37/LICENSE" -d "$JLIB/fonts" && mv "$JLIB/fonts/LICENSE" "$JLIB/fonts/LICENSE-DejaVu"
+if [[ ! -f "$JLIB/fontconfig.properties" && ! -f "$JLIB/fontconfig.bfc" ]]; then
+  {
+    echo "version=1"
+    for st in plain:"":"" bold:" Bold":"-Bold" italic:" Oblique":"-Oblique" bolditalic:" Bold Oblique":"-BoldOblique"; do
+      IFS=: read -r s sfx fsfx <<<"$st"
+      ssfx=${sfx/Oblique/Italic}
+      echo "serif.$s.latin-1=DejaVu Serif$ssfx"
+      for l in sansserif dialog; do echo "$l.$s.latin-1=DejaVu Sans$sfx"; done
+      for l in monospaced dialoginput; do echo "$l.$s.latin-1=DejaVu Sans Mono$sfx"; done
+    done
+    echo "sequence.allfonts=latin-1"
+    for n in "DejaVu Sans" "DejaVu Sans Mono"; do
+      b=${n// /}
+      for v in "":"" " Bold":"-Bold" " Oblique":"-Oblique" " Bold Oblique":"-BoldOblique"; do
+        IFS=: read -r nsfx fsfx <<<"$v"; k="$n$nsfx"; echo "filename.${k// /_}=\$JRE_LIB_FONTS/$b$fsfx.ttf"
+      done
+    done
+    for v in "":"" " Bold":"-Bold" " Italic":"-Italic" " Bold Italic":"-BoldItalic"; do
+      IFS=: read -r nsfx fsfx <<<"$v"; k="DejaVu Serif$nsfx"; echo "filename.${k// /_}=\$JRE_LIB_FONTS/DejaVuSerif$fsfx.ttf"
+    done
+  } > "$JLIB/fontconfig.properties.in"
+fi
 cp "$JAVA_HOME/include/jni.h" "$JAVA_HOME/include/darwin/jni_md.h" "$V/jni/"
 
 ASM="$ROOT/tools/asm/asm-9.7.jar:$ROOT/tools/asm/asm-tree-9.7.jar"
