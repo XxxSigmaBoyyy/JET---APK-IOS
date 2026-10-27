@@ -1,0 +1,47 @@
+name: Native Darwin ABI (macOS arm64 tests + ios-arm64 compile)
+
+on:
+  push:
+    branches: [darwin-abi]
+  workflow_dispatch:
+
+concurrency:
+  group: native-darwin-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-macos:
+    name: Partner native macOS arm64 host build + unit tests (Darwin ABI)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Repository guard
+        run: scripts/guard_repo.sh
+      - name: Install LLVM + lld (cross-build aarch64-linux guest test library)
+        run: brew install llvm lld || brew install llvm
+      - name: Build Runtime/native for macOS arm64 and run unit tests natively
+        run: scripts/test_native_macos.sh build/native-macos
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-macos-logs
+          path: build/native-macos/*.txt
+
+  native-ios:
+    name: Partner native (Runtime/native) ios-arm64 compile (device + simulator)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Repository guard
+        run: scripts/guard_repo.sh
+      - name: Compile Runtime/native for iphoneos + iphonesimulator (arm64)
+        run: scripts/build_native_ios.sh build/native-ios
+      - name: Upload native compile log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-ios-build-log
+          path: build/native-ios/*.txt

@@ -93,8 +93,9 @@ void jet_host_statvfs_to_guest(const struct statvfs *h, jet_guest_statvfs *g);
 #endif
 #if defined(__APPLE__)
 /* Darwin: convert from host struct statfs (different) */
-struct statfs; /* sys/mount.h */
+#include <sys/mount.h>
 void jet_host_statfs_to_guest_apple(const struct statfs *h, jet_guest_statfs *g);
+void jet_host_statfs_to_guest_statvfs_apple(const struct statfs *h, jet_guest_statvfs *g);
 #endif
 
 /* ---- linux_dirent64 (variable; header 19 bytes + name) ---- */
@@ -212,15 +213,51 @@ _Static_assert(sizeof(jet_guest_rusage) == 144, "rusage");
 
 void jet_host_rusage_to_guest(const struct rusage *h, jet_guest_rusage *g);
 
-/* ---- sigaction (bionic kernel ABI used by rt_sigaction): 32-byte mask ---- */
+/* ---- signals (guest-emulated; NEVER written into a host sigaction) ----
+ * bionic LP64 (libc/include/bits/signal_types.h __SIGACTION_BODY):
+ *   int sa_flags; union{handler,sigaction}; sigset_t sa_mask; void (*sa_restorer)(void);
+ * sigset_t == sigset64_t == 8 bytes on LP64 (64 signals). */
+typedef uint64_t jet_guest_sigset;
+_Static_assert(sizeof(jet_guest_sigset) == 8, "bionic LP64 sigset_t");
 typedef struct {
-    uint64_t handler;
-    uint64_t flags;
-    uint64_t restorer;
-    uint8_t  mask[8]; /* glibc aarch64 often 8; bionic uses 8 for sa_mask in userland struct?
-                       * Our prior guest_sigaction used 16 — keep both helpers. */
-} jet_guest_sigaction_kern;
-/* Userspace bionic sigaction is larger; we keep emulated path in host_bionic. */
+    int32_t  sa_flags;    /* 0 */
+    int32_t  __pad;       /* 4 */
+    uint64_t handler;     /* 8  (sa_handler / sa_sigaction; glibc macro-names those) */
+    uint64_t sa_mask;     /* 16 */
+    uint64_t sa_restorer; /* 24 */
+} jet_guest_sigaction;
+_Static_assert(sizeof(jet_guest_sigaction) == 32, "bionic LP64 struct sigaction");
+_Static_assert(offsetof(jet_guest_sigaction, handler) == 8, "sa_handler@8");
+_Static_assert(offsetof(jet_guest_sigaction, sa_mask) == 16, "sa_mask@16");
+
+/* arm64 kernel struct sigaction (rt_sigaction SVC; arm64 defines SA_RESTORER). */
+typedef struct {
+    uint64_t handler;     /* 0 */
+    uint64_t sa_flags;    /* 8 */
+    uint64_t sa_restorer; /* 16 */
+    uint64_t sa_mask;     /* 24 */
+} jet_guest_kernel_sigaction;
+_Static_assert(sizeof(jet_guest_kernel_sigaction) == 32, "arm64 kernel sigaction");
+
+/* siginfo_t: 128 bytes (SI_MAX_SIZE); signo/errno/code then 8-aligned union @16. */
+typedef struct {
+    int32_t si_signo;
+    int32_t si_errno;
+    int32_t si_code;
+    int32_t __pad0;
+    union {
+        int32_t _pad[28];
+        struct { int32_t pid; uint32_t uid; } kill;
+        struct { int32_t tid; int32_t overrun; uint64_t sigval; } timer;
+        struct { uint64_t addr; } fault;          /* si_addr @16 */
+        struct { int64_t band; int32_t fd; } poll;
+    } _sifields;
+} jet_guest_siginfo;
+_Static_assert(sizeof(jet_guest_siginfo) == 128, "siginfo_t");
+_Static_assert(offsetof(jet_guest_siginfo, _sifields) == 16, "si_addr@16");
+
+/* Build a guest siginfo (e.g. for a future emulated SIGSEGV delivery). */
+void jet_guest_siginfo_fill(jet_guest_siginfo *si, int signo, int code, uint64_t addr);
 
 /* ---- stack_t ---- */
 typedef struct {

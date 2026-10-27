@@ -6,7 +6,7 @@ CFLAGS="-O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function
 LDFLAGS="-lpthread -ldl -lm -Lthird_party -lz"
 mkdir -p build
 
-SRCS="ctx.c decode.c elf_loader.c interp.c host_bionic.c guest_abi.c jni_bridge.c trampoline.c setjmp_guest.c asimd.c"
+SRCS="ctx.c decode.c elf_loader.c interp.c host_bionic.c guest_abi.c darwin_abi.c epoll_kq.c jni_bridge.c trampoline.c setjmp_guest.c asimd.c"
 OBJS=""
 for s in $SRCS; do
   o="build/${s%.c}.o"
@@ -41,6 +41,8 @@ echo "CC test_v10_trap_abi"
 $CC $CFLAGS tests/test_v10_trap_abi.c -I. build/libjet_native.a $LDFLAGS -o build/test_v10_trap_abi
 echo "CC test_v11_xzr_excl"
 $CC $CFLAGS tests/test_v11_xzr_excl.c -I. build/libjet_native.a $LDFLAGS -o build/test_v11_xzr_excl
+echo "CC test_v101_darwin_abi"
+$CC $CFLAGS tests/test_v101_darwin_abi.c -I. build/libjet_native.a $LDFLAGS -o build/test_v101_darwin_abi
 echo "CC test_v101_guest_abi"
 $CC $CFLAGS tests/test_v101_guest_abi.c -I. build/libjet_native.a $LDFLAGS -o build/test_v101_guest_abi
 echo "BUILD OK"

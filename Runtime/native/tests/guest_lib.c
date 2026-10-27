@@ -344,3 +344,82 @@ int guest_fstat_no_smash(void) {
     }
     return 0; /* clean */
 }
+
+/* ---- v10.1: signal / statvfs / SVC canaries (bionic LP64 layouts) ---- */
+extern int sigaction(int sig, const void *act, void *oact);
+extern int sigemptyset(void *set);
+extern int sigaddset(void *set, int sig);
+extern int sigismember(const void *set, int sig);
+extern int sigprocmask(int how, const void *set, void *old);
+extern int statvfs(const char *path, void *buf);
+
+static i64 raw_svc(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) {
+    register u64 x8 __asm__("x8") = nr;
+    register u64 x0 __asm__("x0") = a0;
+    register u64 x1 __asm__("x1") = a1;
+    register u64 x2 __asm__("x2") = a2;
+    register u64 x3 __asm__("x3") = a3;
+    __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3) : "memory");
+    return (i64)x0;
+}
+static int bytes_are(const unsigned char *p, int from, int to, unsigned char v) {
+    for (int i = from; i < to; i++) if (p[i] != v) return i;
+    return -1;
+}
+struct g_sa  { int flags; int pad; u64 handler; u64 mask; u64 restorer; };   /* 32 */
+struct g_ksa { u64 handler; u64 flags; u64 restorer; u64 mask; };           /* 32 */
+
+/* returns 0 ok, else a failure code */
+int guest_sigaction_no_smash(void) {
+    struct g_sa act = { 0x04000004, 0, 0x1234, 1ull << 9, 0x5678 };
+    unsigned char oact[48];
+    for (int i = 0; i < 48; i++) oact[i] = 0xA5;
+    if (sigaction(10, &act, 0) != 0) return 1;
+    if (sigaction(10, 0, oact) != 0) return 2;
+    if (bytes_are(oact, 32, 48, 0xA5) >= 0) return 3;              /* overrun */
+    struct g_sa *o = (struct g_sa *)oact;
+    if (o->flags != 0x04000004 || o->handler != 0x1234 || o->mask != (1ull << 9)
+        || o->restorer != 0x5678) return 4;                        /* field order */
+    return 0;
+}
+int guest_sigset_no_smash(void) {
+    unsigned char set[16], old[16];
+    for (int i = 0; i < 16; i++) { set[i] = 0xA5; old[i] = 0xA5; }
+    if (sigemptyset(set) != 0) return 1;
+    if (bytes_are(set, 0, 8, 0) >= 0) return 2;
+    if (bytes_are(set, 8, 16, 0xA5) >= 0) return 3;                /* 16-byte write */
+    if (sigaddset(set, 64) != 0 || set[7] != 0x80) return 4;
+    if (!sigismember(set, 64) || sigismember(set, 1)) return 5;
+    if (sigprocmask(0, set, old) != 0) return 6;
+    if (bytes_are(old, 8, 16, 0xA5) >= 0) return 7;
+    if (sigprocmask(2, 0, old) != 0 || old[7] != 0x80) return 8;   /* blocked 64 stuck */
+    sigemptyset(set); sigprocmask(2, set, 0);
+    return 0;
+}
+int guest_svc_rt_sigaction(void) {
+    struct g_ksa k = { 0xabc, 0x4000000, 0xdef, 1ull << 1 };
+    unsigned char ok[40];
+    for (int i = 0; i < 40; i++) ok[i] = 0xA5;
+    if (raw_svc(134, 12, (u64)&k, 0, 16) != -22) return 1;         /* sigsetsize != 8 */
+    if (raw_svc(134, 12, (u64)&k, 0, 8) != 0) return 2;
+    if (raw_svc(134, 12, 0, (u64)ok, 8) != 0) return 3;
+    if (bytes_are(ok, 32, 40, 0xA5) >= 0) return 4;
+    struct g_ksa *o = (struct g_ksa *)ok;
+    if (o->handler != 0xabc || o->flags != 0x4000000 || o->restorer != 0xdef || o->mask != 2) return 5;
+    struct g_sa u; if (sigaction(12, 0, &u) || u.handler != 0xabc || u.mask != 2) return 6; /* shared */
+    return 0;
+}
+i64 guest_svc_errno(int which) {
+    if (which == 0) return raw_svc(999, 0, 0, 0, 0);                              /* -ENOSYS 38 */
+    if (which == 1) return raw_svc(56, (u64)-100, (u64)"/nonexistent/jet", 0, 0);   /* -ENOENT 2 */
+    if (which == 2) return raw_svc(57, 1000000, 0, 0, 0);                         /* close: -EBADF 9 */
+    return 0;
+}
+int guest_statvfs_no_smash(void) {
+    unsigned char b[144];
+    for (int i = 0; i < 144; i++) b[i] = 0xA5;
+    if (statvfs("/", b) != 0) return 1;
+    if (bytes_are(b, 112, 144, 0xA5) >= 0) return 2;
+    if (*(u64 *)b == 0) return 3;                                  /* f_bsize */
+    return 0;
+}

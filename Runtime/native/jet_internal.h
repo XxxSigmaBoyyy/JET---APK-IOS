@@ -319,7 +319,8 @@ struct jet_ctx {
     struct {
         uint64_t handler;                 /* sa_handler / sa_sigaction bits */
         uint64_t flags;
-        uint8_t  mask[16];
+        uint64_t restorer;
+        uint8_t  mask[16];                /* only low 8 bytes visible to LP64 guest */
         int      set;
     } guest_sig_action[64];
     uint64_t guest_ss_sp;
