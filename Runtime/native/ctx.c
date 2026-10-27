@@ -36,23 +36,48 @@ jet_cpu *jet_cpu_create(jet_ctx *ctx) {
     c->stack_base = H2G(stack);
     c->stack_size = ss;
     c->sp = c->stack_base + ss - 64;
-    if (ctx->tls_total) {
-        size_t ts = ctx->tls_total + 16;
-        void *tls = calloc(1, ts);
-        if (!tls) { munmap(stack, ss); free(c); return NULL; }
-        c->tls_alloc = tls;
-        uint8_t *base = (uint8_t *)tls + 16;
-        size_t off = 0;
-        for (int m = 1; m <= ctx->tls_nmods; m++) {
-            size_t al = ctx->tls_mod_align[m] ? ctx->tls_mod_align[m] : 8;
-            off = (off + al - 1) & ~(al - 1);
-            if (ctx->tls_mod_image[m] && ctx->tls_mod_size[m])
-                memcpy(base + off, ctx->tls_mod_image[m], ctx->tls_mod_size[m]);
-            off += ctx->tls_mod_size[m];
-        }
-        c->tpidr_el0 = H2G(base);
+    /* Always install a bionic-compatible TCB so MRS TPIDR_EL0 / LDR [tp,#0x28]
+     * stack-canary sequences work even when the SO has no PT_TLS (tgfoss:
+     * ~1200 canary sites). Guest x18 is ordinary interpreter state — never
+     * alias it to the host's reserved x18 (Apple) or to TPIDR. */
+    if (jet_cpu_setup_tls(ctx, c) != 0) {
+        munmap(stack, ss); free(c); return NULL;
     }
     return c;
+}
+
+/* Build [bionic TCB | ELF TLS modules] and point TPIDR_EL0 at the TCB. */
+int jet_cpu_setup_tls(jet_ctx *ctx, jet_cpu *c) {
+    size_t mod_bytes = ctx->tls_total;
+    size_t ts = JET_BIONIC_TCB_SIZE + mod_bytes + 64; /* padding */
+    void *tls = calloc(1, ts);
+    if (!tls) return -1;
+    free(c->tls_alloc);
+    c->tls_alloc = tls;
+    uint8_t *base = (uint8_t *)tls;
+    /* Slot 0: self pointer (some code expects *TP == TP). */
+    ((uint64_t *)base)[JET_TLS_SLOT_DTV] = H2G(base);
+    /* Slot 5: stack guard canary — must be nonzero & stable for the thread. */
+    /* Must match __stack_chk_guard — some TUs use the global, others TLS. */
+    ((uint64_t *)base)[JET_TLS_SLOT_STACK_GUARD] = (uint64_t)jet_stack_chk_guard;
+    /* ELF TLS modules follow the 8-word bionic TCB. Prefer the absolute
+     * TPIDR-relative offset recorded at load (already includes TCB). */
+    for (int m = 1; m <= ctx->tls_nmods; m++) {
+        size_t off = JET_BIONIC_TCB_SIZE;
+        int found = 0;
+        for (jet_lib *L = ctx->libs; L; L = L->next) {
+            if (L->tls_modid == m) { off = L->tls_offset; found = 1; break; }
+        }
+        if (!found) {
+            size_t al = ctx->tls_mod_align[m] ? ctx->tls_mod_align[m] : 8;
+            off = (off + al - 1) & ~(al - 1);
+        }
+        if (off + ctx->tls_mod_size[m] > ts) continue;
+        if (ctx->tls_mod_image[m] && ctx->tls_mod_size[m])
+            memcpy(base + off, ctx->tls_mod_image[m], ctx->tls_mod_size[m]);
+    }
+    c->tpidr_el0 = H2G(base);
+    return 0;
 }
 
 void jet_cpu_destroy(jet_ctx *ctx, jet_cpu *cpu) {
@@ -202,26 +227,10 @@ jet_lib *jet_native_load(jet_ctx *ctx, const char *path, char *err, size_t errle
     if (!lib) return NULL;
     lib->next = ctx->libs;
     ctx->libs = lib;
-    /* Recreate main CPU TLS now that modules are known — only if first lib
-     * and main_cpu had empty TLS. For simplicity rebuild TLS on main_cpu. */
-    if (ctx->tls_nmods > 0 && ctx->main_cpu && !ctx->main_cpu->tpidr_el0) {
-        size_t ts = ctx->tls_total + 16;
-        void *tls = calloc(1, ts);
-        if (tls) {
-            uint8_t *base = (uint8_t *)tls + 16;
-            size_t off = 0;
-            for (int m = 1; m <= ctx->tls_nmods; m++) {
-                size_t al = ctx->tls_mod_align[m] ? ctx->tls_mod_align[m] : 8;
-                off = (off + al - 1) & ~(al - 1);
-                if (ctx->tls_mod_image[m] && ctx->tls_mod_size[m])
-                    memcpy(base + off, ctx->tls_mod_image[m], ctx->tls_mod_size[m]);
-                /* record per-lib offset */
-                for (jet_lib *L = ctx->libs; L; L = L->next)
-                    if (L->tls_modid == m) L->tls_offset = off;
-                off += ctx->tls_mod_size[m];
-            }
-            ctx->main_cpu->tpidr_el0 = H2G(base);
-        }
+    /* Rebuild main CPU TLS after load so ELF module images land after the
+     * bionic TCB (and so a late PT_TLS still gets a canary-equipped TPIDR). */
+    if (ctx->main_cpu) {
+        jet_cpu_setup_tls(ctx, ctx->main_cpu);
     }
     if (jet_elf_run_init(ctx, lib) != 0) {
         if (err && errlen) snprintf(err, errlen, "%s", ctx->last_error);
@@ -249,6 +258,7 @@ uint64_t jet_native_sym(jet_lib *lib, const char *name) {
 static void setup_call(jet_ctx *ctx, jet_cpu *cpu, uint64_t guest_fn,
                        const jet_args *a, uint32_t nstack) {
     memset(cpu->x, 0, sizeof cpu->x);
+    memset(cpu->v, 0, sizeof cpu->v);
     cpu->nzcv = 0;
     cpu->stop = 0;
     cpu->jumping = 0;
@@ -256,6 +266,7 @@ static void setup_call(jet_ctx *ctx, jet_cpu *cpu, uint64_t guest_fn,
     cpu->err_msg[0] = 0;
     if (a) {
         for (int i = 0; i < 8; i++) cpu->x[i] = a->x[i];
+        cpu->x[8] = a->x8; /* AAPCS64 indirect result */
         for (int i = 0; i < 8; i++) {
             uint64_t bits; memcpy(&bits, &a->d[i], 8);
             cpu->v[i][0] = bits; cpu->v[i][1] = 0;
@@ -279,13 +290,24 @@ int jet_native_call_ex(jet_ctx *ctx, uint64_t guest_fn, const jet_args *a,
     jet_cpu *cpu = jet_cpu_current(ctx);
     if (!cpu) return -1;
     ctx->last_error[0] = 0;
-    /* save SP so nested calls work */
+    /* Full register snapshot so host→guest trampolines can nest without
+     * destroying the outer guest frame (callee-saved x19-x28/d8-d15, x8 IPRIN,
+     * guest x18, NZCV, PC/LR). */
+    uint64_t saved_x[31];
+    uint64_t saved_v[32][2];
     uint64_t saved_sp = cpu->sp;
+    uint64_t saved_pc = cpu->pc;
+    uint32_t saved_nzcv = cpu->nzcv;
     uint64_t saved_tpidr = cpu->tpidr_el0;
+    int saved_stop = cpu->stop, saved_jumping = cpu->jumping;
+    int saved_err = cpu->err_code;
+    char saved_errmsg[sizeof cpu->err_msg];
+    memcpy(saved_x, cpu->x, sizeof saved_x);
+    memcpy(saved_v, cpu->v, sizeof saved_v);
+    memcpy(saved_errmsg, cpu->err_msg, sizeof saved_errmsg);
+
     setup_call(ctx, cpu, guest_fn, a, nstack);
     cpu->tpidr_el0 = saved_tpidr; /* keep TLS */
-    /* but setup_call reset SP based on... it uses current sp then subtracts.
-     * Re-apply saved_sp as base: */
     cpu->sp = saved_sp;
     if (a && a->stack && nstack) {
         cpu->sp -= (uint64_t)nstack * 8;
@@ -294,13 +316,26 @@ int jet_native_call_ex(jet_ctx *ctx, uint64_t guest_fn, const jet_args *a,
             st8(cpu->sp + 8ull * i, a->stack[i]);
     }
     cpu->sp &= ~0xfull;
+    /* Re-apply x8 after setup_call (already set inside), keep SP 16-aligned. */
+    if (a) cpu->x[8] = a->x8;
     cpu->x[30] = jet_stub_addr(ctx, JET_STUB_RETURN);
     cpu->pc = guest_fn;
 
     int rc = jet_interp_run(ctx, cpu);
     if (ret_x0) *ret_x0 = cpu->x[0];
     if (ret_d0) memcpy(ret_d0, &cpu->v[0][0], 8);
+
+    /* Restore outer guest frame. */
+    memcpy(cpu->x, saved_x, sizeof saved_x);
+    memcpy(cpu->v, saved_v, sizeof saved_v);
     cpu->sp = saved_sp;
+    cpu->pc = saved_pc;
+    cpu->nzcv = saved_nzcv;
+    cpu->tpidr_el0 = saved_tpidr;
+    cpu->stop = saved_stop;
+    cpu->jumping = saved_jumping;
+    cpu->err_code = saved_err;
+    memcpy(cpu->err_msg, saved_errmsg, sizeof saved_errmsg);
     return rc;
 }
 

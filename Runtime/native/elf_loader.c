@@ -261,7 +261,7 @@ static int apply_rela(jet_ctx *ctx, jet_lib *lib, const Elf64_Rela *r,
         return 0;
     }
     case R_AARCH64_TLS_TPREL64:
-        /* TPREL: offset from TPIDR_EL0. Our layout: module image at tls_offset. */
+        /* TPREL: offset from TPIDR_EL0. tls_offset includes bionic TCB prefix. */
         *where = (uint64_t)lib->tls_offset + (sym ? sym->st_value : 0) +
                  (uint64_t)r->r_addend;
         return 0;
@@ -524,9 +524,10 @@ jet_lib *jet_elf_load(jet_ctx *ctx, const char *path, char *err, size_t errlen) 
         ctx->tls_mod_align[mid] = lib->tls_image_align ? lib->tls_image_align : 8;
         ctx->tls_mod_image[mid] = img;
         size_t al = ctx->tls_mod_align[mid];
-        ctx->tls_total = (ctx->tls_total + al - 1) & ~(al - 1);
-        lib->tls_offset = ctx->tls_total;
-        ctx->tls_total += lib->tls_image_size;
+        size_t off = JET_BIONIC_TCB_SIZE + ctx->tls_total;
+        off = (off + al - 1) & ~(al - 1);
+        lib->tls_offset = off; /* absolute offset from TPIDR_EL0 */
+        ctx->tls_total = off + lib->tls_image_size - JET_BIONIC_TCB_SIZE;
         break;
     }
 

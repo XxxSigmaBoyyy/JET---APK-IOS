@@ -1,8 +1,10 @@
 /* Acceptance test: load stock Telegram FOSS libtmessages.49.so and run JNI_OnLoad. */
 #include "jet_native.h"
+#include "jet_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <stdint.h>
 
 static const char *TG_SO =
@@ -100,6 +102,25 @@ int main(int argc, char **argv) {
                 crc, (unsigned long long)r, jet_native_last_error(ctx));
     }
 
+    /* Telegram stores the VM in global javaVm via ConnectionsManager::useJavaVM.
+     * Real app calls this from Java before native_init; do it here so ThreadProc
+     * AttachCurrentThread works. */
+    {
+        uint64_t usejvm = jet_native_sym(lib,
+            "_ZN18ConnectionsManager9useJavaVMEP7_JavaVMb");
+        fprintf(stderr, "useJavaVM sym=0x%llx guest_vm=%p\n",
+                (unsigned long long)usejvm, (void*)ctx->guest_javavm);
+        if (usejvm && ctx->guest_javavm) {
+            jet_args ua = {0};
+            ua.x[0] = (uint64_t)(uintptr_t)ctx->guest_javavm; /* JavaVM* */
+            ua.x[1] = 1; /* bool use: GetEnv + cache classes */
+            uint64_t ur = 0;
+            int urc = jet_native_call(ctx, usejvm, &ua, &ur, NULL);
+            fprintf(stderr, "call useJavaVM rc=%d err='%s'\n",
+                    urc, jet_native_last_error(ctx));
+        }
+    }
+
     /* Stretch: ConnectionsManager.native_init */
     fprintf(stderr, "native_init fn=0x%llx env=0x%llx\n",
             (unsigned long long)g_cm_native_init,
@@ -152,6 +173,93 @@ int main(int argc, char **argv) {
         int crc = jet_native_call_ex(ctx, g_cm_native_init, &a, 16, &r, NULL);
         fprintf(stderr, "call native_init rc=%d ret=%llu err='%s'\n",
                 crc, (unsigned long long)r, jet_native_last_error(ctx));
+        fprintf(stderr, "post-init last_error='%s'\n", jet_native_last_error(ctx));
+    }
+
+    /* Extra natives: NativeByteBuffer + Utilities AES/hash */
+    {
+        /* Drop residual exit(1) from network/init paths. */
+        ctx->last_error[0] = 0;
+        uint64_t nbb = 0, nbb_reuse = 0, aes = 0, pbk = 0;
+        for (int i = 0; i < ctx->nreg_log; i++) {
+            const char *n = ctx->reg_log[i].name;
+            const char *c = ctx->reg_log[i].cls;
+            if (!n || !c) continue;
+            if (strstr(c, "NativeByteBuffer") && strcmp(n, "native_getFreeBuffer") == 0)
+                nbb = ctx->reg_log[i].fn;
+            if (strstr(c, "NativeByteBuffer") && strcmp(n, "native_reuse") == 0)
+                nbb_reuse = ctx->reg_log[i].fn;
+        }
+        aes = jet_native_sym(lib, "Java_org_telegram_messenger_Utilities_aesIgeEncryption");
+        pbk = jet_native_sym(lib, "Java_org_telegram_messenger_Utilities_pbkdf2");
+        uint64_t env = jet_jni_guest_env(ctx);
+        if (nbb) {
+            jet_args a = {0}; a.x[0]=env; a.x[1]=0; a.x[2]=64;
+            uint64_t r=0;
+            int rc2 = jet_native_call(ctx, nbb, &a, &r, NULL);
+            fprintf(stderr, "call NativeByteBuffer.native_getFreeBuffer(64) rc=%d ret=0x%llx err='%s'\n",
+                    rc2, (unsigned long long)r, jet_native_last_error(ctx));
+            if (rc2 == 0 && r && nbb_reuse) {
+                jet_args b = {0}; b.x[0]=env; b.x[1]=0; b.x[2]=r;
+                uint64_t rr=0;
+                int rc3 = jet_native_call(ctx, nbb_reuse, &b, &rr, NULL);
+                fprintf(stderr, "call NativeByteBuffer.native_reuse rc=%d err='%s'\n",
+                        rc3, jet_native_last_error(ctx));
+            }
+        } else {
+            fprintf(stderr, "NativeByteBuffer.native_getFreeBuffer not registered\n");
+        }
+        ctx->last_error[0] = 0;
+        if (aes) {
+            /* aesIgeEncryption(JNIEnv*,jobject, ByteBuffer, byte[] key, byte[] iv, boolean, boolean, int, int)
+             * Export is the Java_* form; pass fake direct-buffer wrap + key/iv arrays. */
+            enum { K=32, IV=32, N=64 };
+            uint8_t *key = calloc(1, 8+K); *(int64_t*)key = K;
+            uint8_t *iv  = calloc(1, 8+IV); *(int64_t*)iv = IV;
+            uint8_t *raw = calloc(1, N);
+            for (int i=0;i<N;i++) raw[i]=(uint8_t)i;
+            /* direct buffer wrap: [addr, cap] */
+            uint64_t *wrap = calloc(1, 32);
+            wrap[0] = (uint64_t)(uintptr_t)raw; wrap[1] = N;
+            jet_args a = {0};
+            a.x[0]=env; a.x[1]=0;
+            a.x[2]=(uint64_t)(uintptr_t)wrap; /* ByteBuffer */
+            a.x[3]=(uint64_t)(uintptr_t)key;
+            a.x[4]=(uint64_t)(uintptr_t)iv;
+            a.x[5]=1; /* encrypt */
+            a.x[6]=0; /* changeByteBuffer=false → use offset/length */
+            a.x[7]=0; /* length? depends on sig — may be on stack */
+            uint64_t stack[4]={0,0,(uint64_t)N,0};
+            a.stack = stack;
+            uint64_t r=0;
+            int rc2 = jet_native_call_ex(ctx, aes, &a, 4, &r, NULL);
+            fprintf(stderr, "call Utilities.aesIgeEncryption rc=%d ret=%llu err='%s'\n",
+                    rc2, (unsigned long long)r, jet_native_last_error(ctx));
+        }
+        ctx->last_error[0] = 0;
+        if (pbk) {
+            /* pbkdf2(byte[] password, byte[] salt, int iterations, byte[] dst, boolean isSha512?) */
+            enum { P=8, S=8, D=64 };
+            uint8_t *pw = calloc(1, 8+P); *(int64_t*)pw = P; memcpy(pw+8, "password", P);
+            uint8_t *salt = calloc(1, 8+S); *(int64_t*)salt = S; memcpy(salt+8, "saltsalt", S);
+            uint8_t *dst = calloc(1, 8+D); *(int64_t*)dst = D;
+            jet_args a = {0};
+            a.x[0]=env; a.x[1]=0;
+            a.x[2]=(uint64_t)(uintptr_t)pw;
+            a.x[3]=(uint64_t)(uintptr_t)salt;
+            a.x[4]=(uint64_t)(uintptr_t)dst;
+            a.x[5]=1000; /* iterations */
+            a.x[6]=0;
+            uint64_t r=0;
+            int rc2 = jet_native_call(ctx, pbk, &a, &r, NULL);
+            fprintf(stderr, "call Utilities.pbkdf2 rc=%d ret=%llu err='%s'\n",
+                    rc2, (unsigned long long)r, jet_native_last_error(ctx));
+            if (rc2 == 0) {
+                fprintf(stderr, "  pbkdf2 dst:");
+                for (int i=0;i<16;i++) fprintf(stderr, " %02x", dst[8+i]);
+                fprintf(stderr, "\n");
+            }
+        }
     }
 
     fprintf(stderr, "\n=== SUMMARY ===\n");

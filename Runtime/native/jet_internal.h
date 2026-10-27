@@ -29,6 +29,14 @@ typedef __int128          s128;
 #define JET_TRAMP_POOL    256
 #define JET_GUEST_STACK_DEFAULT (8ull << 20)
 
+/* Bionic arm64 TCB: TPIDR_EL0 points here. 8 words reserved so that
+ * TLS_SLOT_STACK_GUARD (slot 5) lives at TPIDR+0x28 — required by
+ * -fstack-protector-strong in NDK-built SOs (~1200 sites in libtmessages). */
+#define JET_BIONIC_TLS_SLOTS   8
+#define JET_BIONIC_TCB_SIZE    (JET_BIONIC_TLS_SLOTS * 8)
+#define JET_TLS_SLOT_DTV       0
+#define JET_TLS_SLOT_STACK_GUARD 5
+
 /* AArch64 HWCAP bits we advertise (Linux uapi). */
 #define JET_HWCAP_FP    (1ull << 0)
 #define JET_HWCAP_ASIMD (1ull << 1)
@@ -106,7 +114,7 @@ typedef enum {
     OP_LD1, OP_ST1, OP_LDUR_FP, OP_STUR_FP,
     OP_AND_V, OP_ORR_V, OP_EOR_V, OP_BIC_V,
     OP_ADD_V, OP_SUB_V, OP_MUL_V,
-    OP_DUP, OP_INS, OP_UMOV, OP_SMOV,
+    OP_DUP, OP_INS, OP_UMOV, OP_SMOV, OP_EXT_V,
     OP_CNT, OP_REV64_V, OP_REV32_V, OP_REV16_V,
     OP_ZIP1, OP_ZIP2, OP_UZP1, OP_UZP2, OP_TRN1, OP_TRN2,
     OP_TBL, OP_TBX,
@@ -275,6 +283,8 @@ void jet_set_error(jet_ctx *ctx, const char *fmt, ...);
 
 jet_cpu *jet_cpu_current(jet_ctx *ctx);
 jet_cpu *jet_cpu_create(jet_ctx *ctx);
+int jet_cpu_setup_tls(jet_ctx *ctx, jet_cpu *c);
+extern uintptr_t jet_stack_chk_guard; /* same value in TLS slot 5 */
 void     jet_cpu_destroy(jet_ctx *ctx, jet_cpu *cpu);
 
 /* Interpreter entry: run until PC hits return stub or fatal. */
@@ -318,10 +328,10 @@ static inline void st2(uint64_t a, uint16_t v){ *(volatile uint16_t*)G2H(a)=v; }
 static inline void st4(uint64_t a, uint32_t v){ *(volatile uint32_t*)G2H(a)=v; }
 static inline void st8(uint64_t a, uint64_t v){ *(volatile uint64_t*)G2H(a)=v; }
 
-#endif /* JET_INTERNAL_H */
-
 /* Linux SVC emulation (host_bionic.c) — portable, no raw syscall() on Darwin. */
 int64_t jet_emulate_linux_syscall(jet_ctx *ctx, jet_cpu *cpu,
                                   uint64_t nr, uint64_t a0, uint64_t a1,
                                   uint64_t a2, uint64_t a3, uint64_t a4,
                                   uint64_t a5);
+
+#endif /* JET_INTERNAL_H */

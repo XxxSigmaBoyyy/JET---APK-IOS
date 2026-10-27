@@ -108,6 +108,27 @@ int main(void) {
     fprintf(stderr, "INFO: %d calls of guest_add in %.2f ms (~%.1f MIPS est.)\n",
             N, t1-t0, mips);
 
+    /* FP LDR/STR D width: must not clobber adjacent u64 with 1000.0 (TG CM bug). */
+    uint64_t fp_probe = jet_native_sym(lib, "guest_fp_d_store_probe");
+    CHECK(fp_probe != 0, "sym guest_fp_d_store_probe");
+    uint64_t slots[2] = {0, 0};
+    a.x[0] = (uint64_t)(uintptr_t)slots; r = 0;
+    CHECK(jet_native_call(ctx, fp_probe, &a, &r, NULL) == 0, "call fp_d_store_probe");
+    CHECK(r == 0xDEADBEEFCAFEBABEull,
+          "fp D-store adjacent kept sentinel (got 0x%llx)", (unsigned long long)r);
+    CHECK(slots[1] == 0xDEADBEEFCAFEBABEull, "slots[1] intact");
+    CHECK(slots[1] != 0x408f400000000000ull, "slots[1] is not 1000.0 bit pattern");
+
+    /* AAPCS64 x8 indirect result: guest returns 24-byte struct via x8. */
+    uint64_t ret_big = jet_native_sym(lib, "guest_return_big");
+    CHECK(ret_big != 0, "sym guest_return_big");
+    struct { uint64_t a,b,c; } big = {0};
+    a.x[0]=11; a.x[1]=22; a.x[2]=33; a.x8 = (uint64_t)(uintptr_t)&big; r=0;
+    CHECK(jet_native_call(ctx, ret_big, &a, &r, NULL) == 0, "call guest_return_big");
+    CHECK(big.a==11 && big.b==22 && big.c==33,
+          "x8 indirect result {%llu,%llu,%llu}",
+          (unsigned long long)big.a, (unsigned long long)big.b, (unsigned long long)big.c);
+
     jet_native_destroy(ctx);
     if (g_fail) { fprintf(stderr, "\n%d FAILURES\n", g_fail); return 1; }
     fprintf(stderr, "\nALL PASS\n");

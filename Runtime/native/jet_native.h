@@ -20,11 +20,16 @@ typedef struct jet_lib jet_lib;
 
 /* AAPCS64 call descriptor: integer args in x[0..7], FP/SIMD in d[0..7],
  * overflow (stack) args via `stack` (8-byte slots laid out per Linux AAPCS64).
+ * `x8` is the indirect result register (IPRIN): address of the hidden return
+ * slot for large structs / std::string returned by value. Host shims that
+ * return >16-byte aggregates must write through G2H(a->x8). All host<->guest
+ * trampolines must forward x8.
  * For host trap functions `stack` points at the guest SP at the call, so the
  * host may read as many stack slots as its signature needs. When calling INTO
  * the guest, use jet_native_call_ex to say how many stack slots to copy. */
 typedef struct {
     uint64_t x[8];
+    uint64_t x8;              /* AAPCS64 indirect result (must be forwarded) */
     double   d[8];
     const uint64_t *stack;
 } jet_args;

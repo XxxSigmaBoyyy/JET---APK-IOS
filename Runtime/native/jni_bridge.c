@@ -39,6 +39,12 @@ enum {
     JNI_IDX_RegisterNatives = 215,
     JNI_IDX_UnregisterNatives = 216,
     JNI_IDX_GetJavaVM = 219,
+    JNI_IDX_CallStaticObjectMethod = 114,
+    JNI_IDX_CallStaticObjectMethodV = 115,
+    JNI_IDX_CallStaticObjectMethodA = 116,
+    JNI_IDX_NewDirectByteBuffer = 229,
+    JNI_IDX_GetDirectBufferAddress = 230,
+    JNI_IDX_GetDirectBufferCapacity = 231,
     JNI_IDX_GetObjectRefType = 232
 };
 
@@ -187,8 +193,10 @@ static uint64_t jni_trap(jet_ctx *ctx, const jet_args *a, void *user) {
     case JNI_IDX_GetStringUTFLength:
         return (uint64_t)strlen((char*)G2H(a->x[1]));
     case JNI_IDX_GetArrayLength: {
-        /* fake: first 8 bytes of array object store length — or treat as pointer to len */
-        return 0;
+        /* Our NewByteArray layout: int64 length, then bytes. */
+        if (!a->x[1]) return 0;
+        int64_t *p = (int64_t*)G2H(a->x[1]);
+        return (uint64_t)(int64_t)p[0];
     }
     case JNI_IDX_NewByteArray: {
         jsize n = (jsize)a->x[1];
@@ -252,6 +260,63 @@ static uint64_t jni_trap(jet_ctx *ctx, const jet_args *a, void *user) {
         uint64_t *out = (uint64_t*)G2H(a->x[1]);
         if (out) *out = H2G(ctx->guest_javavm);
         return 0;
+    }
+    case JNI_IDX_CallStaticObjectMethod:
+    case JNI_IDX_CallStaticObjectMethodV:
+    case JNI_IDX_CallStaticObjectMethodA: {
+        /* Common path: ByteBuffer.allocateDirect(I)Ljava/nio/ByteBuffer;.
+         * Cap comes from the first vararg: for the non-V entry that's x3;
+         * for V, AAPCS64 va_list.__stack (or __gr_top+__gr_offs) holds it. */
+        int64_t cap = 4096;
+        if (idx == JNI_IDX_CallStaticObjectMethod) {
+            cap = (int64_t)a->x[3];
+        } else if (idx == JNI_IDX_CallStaticObjectMethodV && a->x[3]) {
+            /* typedef struct { void *stack; void *gr_top; void *vr_top; int gr_offs, vr_offs; } */
+            struct { void *stack; void *gr_top; void *vr_top; int gr_offs; int vr_offs; } *vl =
+                (void*)G2H(a->x[3]);
+            if (vl) {
+                if (vl->gr_offs < 0 && vl->gr_top) {
+                    /* still in reg save area */
+                    int64_t *slot = (int64_t*)((uint8_t*)vl->gr_top + vl->gr_offs);
+                    cap = slot[0];
+                } else if (vl->stack) {
+                    cap = *(int64_t*)vl->stack;
+                }
+            }
+        } else if (idx == JNI_IDX_CallStaticObjectMethodA && a->x[3]) {
+            /* jvalue* */
+            cap = *(int64_t*)G2H(a->x[3]);
+        }
+        if (cap <= 0 || cap > (1<<26)) cap = 4096;
+        void *buf = calloc(1, (size_t)cap);
+        void *wrap = calloc(1, 32);
+        if (wrap) {
+            ((uint64_t*)wrap)[0] = H2G(buf);
+            ((int64_t*)wrap)[1] = cap;
+        }
+        jet_log(ctx, 2, "CallStaticObjectMethod* mid=%llx allocateDirect-ish cap=%lld wrap=%p buf=%p",
+                (unsigned long long)a->x[2], (long long)cap, wrap, buf);
+        return H2G(wrap);
+    }
+    case JNI_IDX_NewDirectByteBuffer: {
+        /* NewDirectByteBuffer(env, address, capacity) */
+        void *wrap = calloc(1, 32);
+        /* store address/capacity at start so GetDirectBufferAddress can recover */
+        if (wrap) {
+            ((uint64_t*)wrap)[0] = a->x[1];
+            ((int64_t*)wrap)[1] = (int64_t)a->x[2];
+        }
+        jet_log(ctx, 2, "NewDirectByteBuffer addr=%llx cap=%lld -> %p",
+                (unsigned long long)a->x[1], (long long)a->x[2], wrap);
+        return H2G(wrap);
+    }
+    case JNI_IDX_GetDirectBufferAddress: {
+        uint64_t *wrap = a->x[1] ? (uint64_t*)G2H(a->x[1]) : NULL;
+        return wrap ? wrap[0] : 0;
+    }
+    case JNI_IDX_GetDirectBufferCapacity: {
+        int64_t *wrap = a->x[1] ? (int64_t*)G2H(a->x[1]) : NULL;
+        return wrap ? (uint64_t)wrap[1] : (uint64_t)-1;
     }
     default:
         jet_log(ctx, 1, "JNI stub idx=%d x0=%llx x1=%llx x2=%llx x3=%llx", idx,

@@ -106,7 +106,9 @@ static uint64_t h_android_log_write(jet_ctx *ctx, const jet_args *a, void *u) {
 static uint64_t h_android_log_assert(jet_ctx *ctx, const jet_args *a, void *u) {
     (void)u;
     jet_log(ctx, 0, "android_assert(%s): %s", (char*)G2H(a->x[0]), (char*)G2H(a->x[1]));
-    abort();
+    jet_cpu *cpu = jet_cpu_current(ctx);
+    if (cpu) { snprintf(cpu->err_msg, sizeof cpu->err_msg, "android_assert");
+               cpu->err_code = 5; cpu->stop = 1; }
     return 0;
 }
 
@@ -170,9 +172,36 @@ static uint64_t h_strtod(jet_ctx *c, const jet_args *a, void *u){
 }
 static uint64_t h_atoi(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)atoi((char*)G2H(a->x[0])); }
 static uint64_t h_strerror(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return H2G(strerror((int)a->x[0])); }
-static uint64_t h_abort(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)a;(void)u; abort(); return 0; }
-static uint64_t h_exit_fn(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; exit((int)a->x[0]); return 0; }
-static uint64_t h__exit(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; _exit((int)a->x[0]); return 0; }
+static uint64_t h_abort(jet_ctx *c, const jet_args *a, void *u){
+    (void)a;(void)u;
+    jet_cpu *cpu = jet_cpu_current(c);
+    jet_log(c,0,"guest abort() pc=%llx lr=%llx x0=%llx x1=%llx sp=%llx last_trap=%s",
+            (unsigned long long)(cpu?cpu->pc:0),
+            (unsigned long long)(cpu?cpu->x[30]:0),
+            (unsigned long long)(cpu?cpu->x[0]:0),
+            (unsigned long long)(cpu?cpu->x[1]:0),
+            (unsigned long long)(cpu?cpu->sp:0),
+            c->last_trap_name[0]?c->last_trap_name:"-");
+    if (cpu) {
+        snprintf(cpu->err_msg, sizeof cpu->err_msg,
+                 "abort() lr=%llx x0=%llx last=%s",
+                 (unsigned long long)cpu->x[30],
+                 (unsigned long long)cpu->x[0],
+                 c->last_trap_name[0]?c->last_trap_name:"-");
+        cpu->err_code = 5; cpu->stop = 1;
+    }
+    return 0;
+}
+static uint64_t h_exit_fn(jet_ctx *c, const jet_args *a, void *u){
+    (void)u;
+    jet_log(c, 0, "guest exit(%d) — soft-stop (not killing host)", (int)a->x[0]);
+    jet_cpu *cpu = pthread_getspecific(c->cpu_key);
+    if (cpu) { cpu->stop = 1; cpu->err_code = 0; snprintf(c->last_error, sizeof c->last_error, "exit(%d)", (int)a->x[0]); }
+    return 0;
+}
+static uint64_t h__exit(jet_ctx *c, const jet_args *a, void *u){
+    return h_exit_fn(c, a, u);
+}
 
 /* snprintf / vsnprintf — Linux AAPCS64 va_list */
 static uint64_t h_vsnprintf(jet_ctx *c, const jet_args *a, void *u){
@@ -360,11 +389,87 @@ static uint64_t h_prctl(jet_ctx *c, const jet_args *a, void *u){
     return 0;
 }
 
+/* Fake FD allocator so socket/epoll/eventfd never collide with stdin/out/err.
+ * Network I/O is intentionally stubbed: connect fails, epoll_wait/poll idle. */
+static int jet_fake_fd_next = 100;
+static uint8_t jet_fake_fd_map[4096]; /* fd -> 1 if fake */
+static int jet_fake_fd_alloc(void) {
+    int fd = jet_fake_fd_next++;
+    if (jet_fake_fd_next >= 4000) jet_fake_fd_next = 100;
+    if (fd >= 0 && fd < 4096) jet_fake_fd_map[fd] = 1;
+    return fd;
+}
+static int jet_is_fake_fd(int fd) {
+    return fd >= 0 && fd < 4096 && jet_fake_fd_map[fd];
+}
+static uint64_t h_socket(jet_ctx *c, const jet_args *a, void *u) {
+    (void)u; (void)a;
+    int fd = jet_fake_fd_alloc();
+    jet_log(c, 3, "socket() -> fake fd %d", fd);
+    return (uint64_t)(int64_t)fd;
+}
+static uint64_t h_epoll_create(jet_ctx *c, const jet_args *a, void *u) {
+    (void)u; (void)a;
+    int fd = jet_fake_fd_alloc();
+    jet_log(c, 3, "epoll_create -> fake fd %d", fd);
+    return (uint64_t)(int64_t)fd;
+}
+static uint64_t h_epoll_create1(jet_ctx *c, const jet_args *a, void *u) {
+    return h_epoll_create(c, a, u);
+}
+static uint64_t h_eventfd(jet_ctx *c, const jet_args *a, void *u) {
+    (void)u; (void)a;
+    return (uint64_t)(int64_t)jet_fake_fd_alloc();
+}
+static uint64_t h_pipe_fn(jet_ctx *c, const jet_args *a, void *u) {
+    (void)u;
+    int *p = a->x[0] ? (int*)G2H(a->x[0]) : NULL;
+    if (p) { p[0] = jet_fake_fd_alloc(); p[1] = jet_fake_fd_alloc(); }
+    return 0;
+}
+static uint64_t h_connect(jet_ctx *c, const jet_args *a, void *u) {
+    (void)u; (void)a;
+    jet_log(c, 2, "connect(fd=%d) stub → EINPROGRESS", (int)a->x[0]);
+    errno = EINPROGRESS;
+    return (uint64_t)(int64_t)-1;
+}
+static uint64_t h_bind_fn(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u;(void)a; return 0; }
+static uint64_t h_listen_fn(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u;(void)a; return 0; }
+static uint64_t h_setsockopt(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u;(void)a; return 0; }
+static uint64_t h_getsockopt(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u;(void)a; return 0; }
+static uint64_t h_epoll_ctl(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u;(void)a; return 0; }
+static uint64_t h_epoll_wait(jet_ctx *c, const jet_args *a, void *u){
+    (void)u; (void)a; (void)c;
+    /* Idle briefly so network thread doesn't hot-spin the host. */
+    struct timespec ts = {0, 50 * 1000 * 1000}; /* 50ms */
+    nanosleep(&ts, NULL);
+    return 0; /* no events */
+}
+static uint64_t h_poll_fn(jet_ctx *c, const jet_args *a, void *u){
+    (void)u; (void)c;
+    int timeout = (int)a->x[2];
+    if (timeout != 0) {
+        struct timespec ts = {0, 20 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+static uint64_t h_getaddrinfo(jet_ctx *c, const jet_args *a, void *u){
+    (void)u; (void)a;
+    jet_log(c, 2, "getaddrinfo stub → EAI_FAIL");
+    return (uint64_t)(int64_t)-1; /* EAI_FAIL-ish */
+}
+
 /* file IO */
 static uint64_t h_open(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)open((char*)G2H(a->x[0]),(int)a->x[1],(mode_t)a->x[2]); }
-static uint64_t h_close(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)close((int)a->x[0]); }
-static uint64_t h_read(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)read((int)a->x[0],G2H(a->x[1]),(size_t)a->x[2]); }
-static uint64_t h_write(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)write((int)a->x[0],G2H(a->x[1]),(size_t)a->x[2]); }
+static uint64_t h_close(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;
+    int fd=(int)a->x[0];
+    if (jet_is_fake_fd(fd)) { jet_fake_fd_map[fd]=0; return 0; }
+    return (uint64_t)(int64_t)close(fd);
+}
+static uint64_t h_read(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; if (jet_is_fake_fd((int)a->x[0])) { errno=EAGAIN; return (uint64_t)(int64_t)-1; } return (uint64_t)(int64_t)read((int)a->x[0],G2H(a->x[1]),(size_t)a->x[2]); }
+static uint64_t h_write(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; if (jet_is_fake_fd((int)a->x[0])) return a->x[2]; return (uint64_t)(int64_t)write((int)a->x[0],G2H(a->x[1]),(size_t)a->x[2]); }
 static uint64_t h_lseek(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)lseek((int)a->x[0],(off_t)a->x[1],(int)a->x[2]); }
 static uint64_t h_fstat(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)fstat((int)a->x[0],(struct stat*)G2H(a->x[1])); }
 static uint64_t h_stat_fn(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)stat((char*)G2H(a->x[0]),(struct stat*)G2H(a->x[1])); }
@@ -377,6 +482,21 @@ static uint64_t h_setenv(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)
 struct thr_arg { jet_ctx *ctx; uint64_t guest_fn; uint64_t guest_arg; };
 static void *thr_entry(void *p) {
     struct thr_arg *ta = p;
+    /* Network/worker threads (ConnectionsManager::ThreadProc etc.) exercise a
+     * long tail of epoll/DNS/TLS ASIMD. For harness stability we park the host
+     * thread and do not enter the guest — native_init only needs create→ok.
+     * Set JET_RUN_GUEST_THREADS=1 to run guest start_routine for real. */
+    const char *run = getenv("JET_RUN_GUEST_THREADS");
+    if (!run || run[0] != '1') {
+        jet_log(ta->ctx, 1,
+                "pthread_create: parking host thread (guest_fn=%llx) — network stub; "
+                "export JET_RUN_GUEST_THREADS=1 to run",
+                (unsigned long long)ta->guest_fn);
+        for (;;) {
+            struct timespec ts = {60, 0};
+            nanosleep(&ts, NULL);
+        }
+    }
     jet_cpu *cpu = jet_cpu_create(ta->ctx);
     pthread_setspecific(ta->ctx->cpu_key, cpu);
     jet_args a = {0}; a.x[0] = ta->guest_arg;
@@ -404,7 +524,7 @@ static uint64_t h_pthread_self(jet_ctx *c, const jet_args *a, void *u){ (void)c;
 static uint64_t h_pthread_detach(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)pthread_detach((pthread_t)a->x[0]); }
 static uint64_t h_pthread_mutex_init(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)pthread_mutex_init((pthread_mutex_t*)G2H(a->x[0]), a->x[1]?(pthread_mutexattr_t*)G2H(a->x[1]):NULL); }
 static uint64_t h_pthread_mutex_destroy(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)pthread_mutex_destroy((pthread_mutex_t*)G2H(a->x[0])); }
-static uint64_t h_pthread_mutex_lock(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)pthread_mutex_lock((pthread_mutex_t*)G2H(a->x[0])); }
+static uint64_t h_pthread_mutex_lock(jet_ctx *c, const jet_args *a, void *u){ (void)u; if (!a->x[0]) { jet_log(c,1,"pthread_mutex_lock(NULL)"); return (uint64_t)(int64_t)-1; } return (uint64_t)(int64_t)pthread_mutex_lock((pthread_mutex_t*)G2H(a->x[0])); }
 static uint64_t h_pthread_mutex_unlock(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)pthread_mutex_unlock((pthread_mutex_t*)G2H(a->x[0])); }
 static uint64_t h_pthread_mutex_trylock(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)pthread_mutex_trylock((pthread_mutex_t*)G2H(a->x[0])); }
 static uint64_t h_pthread_cond_init(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)pthread_cond_init((pthread_cond_t*)G2H(a->x[0]), a->x[1]?(pthread_condattr_t*)G2H(a->x[1]):NULL); }
@@ -525,8 +645,32 @@ static uint64_t h_dlerror(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)a
 static uint64_t h_dladdr(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)u; return (uint64_t)(int64_t)dladdr(G2H(a->x[0]),(Dl_info*)G2H(a->x[1])); }
 
 /* stubs for GLES / EGL / OpenSLES / android / jnigraphics — return 0 / no-op */
+
 uint64_t jet_host_stub0(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)a;(void)u; return 0; }
 static uint64_t h_stub0(jet_ctx *c,const jet_args *a,void *u){ return jet_host_stub0(c,a,u); }
+
+/* bionic syscall(number, ...): Linux AArch64 numbers in x0, args in x1.. */
+static uint64_t h_syscall(jet_ctx *c, const jet_args *a, void *u) {
+    (void)u;
+    jet_cpu *cpu = jet_cpu_current(c);
+    int64_t r = jet_emulate_linux_syscall(c, cpu, a->x[0],
+                                          a->x[1], a->x[2], a->x[3],
+                                          a->x[4], a->x[5], a->x[6]);
+    if (r < 0 && r >= -4095) {
+        /* Match glibc/bionic: set errno and return -1. */
+        errno = (int)(-r);
+        return (uint64_t)(int64_t)-1;
+    }
+    return (uint64_t)r;
+}
+static uint64_t h_fcntl(jet_ctx *c, const jet_args *a, void *u) {
+    (void)c;(void)u;
+    return (uint64_t)(int64_t)fcntl((int)a->x[0], (int)a->x[1], a->x[2]);
+}
+static uint64_t h_ioctl(jet_ctx *c, const jet_args *a, void *u) {
+    (void)c;(void)u;
+    return (uint64_t)(int64_t)ioctl((int)a->x[0], (unsigned long)a->x[1], (void*)G2H(a->x[2]));
+}
 static uint64_t h_stub1(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)a;(void)u; return 1; }
 static uint64_t h_system_property_get(jet_ctx *c,const jet_args *a,void *u){
     (void)c;(void)u;
@@ -551,9 +695,18 @@ static uint64_t h_towlower(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)
 static uint64_t h_towupper(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)u; return (uint64_t)towupper((wint_t)a->x[0]); }
 
 /* stack chk */
-static uintptr_t jet_stack_chk_guard = 0x12345678abcdefull;
+uintptr_t jet_stack_chk_guard = 0x12345678abcdefull;
 static uint64_t h_stack_chk_fail(jet_ctx *c,const jet_args *a,void *u){
-    (void)a;(void)u; jet_log(c,0,"__stack_chk_fail"); abort(); return 0;
+    (void)a;(void)u;
+    jet_cpu *cpu = jet_cpu_current(c);
+    jet_log(c,0,"__stack_chk_fail pc=%llx lr=%llx",
+            (unsigned long long)(cpu?cpu->pc:0),
+            (unsigned long long)(cpu?cpu->x[30]:0));
+    if (cpu) {
+        snprintf(cpu->err_msg, sizeof cpu->err_msg, "__stack_chk_fail");
+        cpu->err_code = 4; cpu->stop = 1;
+    }
+    return 0;
 }
 
 /* __cxa_atexit / finalize */
@@ -741,15 +894,16 @@ int jet_host_install_bionic(jet_ctx *ctx) {
     reg(ctx,"OPENSSL_memory_get_size",h_stub0);
 
     /* misc frequently needed */
-    reg(ctx,"syscall",h_stub0);
+    reg(ctx,"syscall",h_syscall);
     reg(ctx,"sched_yield",h_stub0);
-    reg(ctx,"poll",h_stub0); reg(ctx,"select",h_stub0);
-    reg(ctx,"socket",h_stub0); reg(ctx,"bind",h_stub0); reg(ctx,"listen",h_stub0);
-    reg(ctx,"accept",h_stub0); reg(ctx,"connect",h_stub0); reg(ctx,"setsockopt",h_stub0);
-    reg(ctx,"getsockopt",h_stub0); reg(ctx,"getaddrinfo",h_stub0); reg(ctx,"freeaddrinfo",h_free);
-    reg(ctx,"ioctl",h_stub0); reg(ctx,"fcntl",h_stub0);
-    reg(ctx,"pipe",h_stub0); reg(ctx,"eventfd",h_stub0);
-    reg(ctx,"epoll_create",h_stub0); reg(ctx,"epoll_ctl",h_stub0); reg(ctx,"epoll_wait",h_stub0);
+    reg(ctx,"poll",h_poll_fn); reg(ctx,"select",h_stub0);
+    reg(ctx,"socket",h_socket); reg(ctx,"bind",h_bind_fn); reg(ctx,"listen",h_listen_fn);
+    reg(ctx,"accept",h_stub0); reg(ctx,"connect",h_connect); reg(ctx,"setsockopt",h_setsockopt);
+    reg(ctx,"getsockopt",h_getsockopt); reg(ctx,"getaddrinfo",h_getaddrinfo); reg(ctx,"freeaddrinfo",h_free);
+    reg(ctx,"ioctl",h_ioctl); reg(ctx,"fcntl",h_fcntl);
+    reg(ctx,"pipe",h_pipe_fn); reg(ctx,"eventfd",h_eventfd);
+    reg(ctx,"epoll_create",h_epoll_create); reg(ctx,"epoll_create1",h_epoll_create1);
+    reg(ctx,"epoll_ctl",h_epoll_ctl); reg(ctx,"epoll_wait",h_epoll_wait);
     reg(ctx,"sem_init",h_stub0); reg(ctx,"sem_destroy",h_stub0);
     reg(ctx,"sem_wait",h_stub0); reg(ctx,"sem_post",h_stub0); reg(ctx,"sem_trywait",h_stub0);
     reg(ctx,"sem_timedwait",h_stub0);
@@ -973,10 +1127,13 @@ int64_t jet_emulate_linux_syscall(jet_ctx *ctx, jet_cpu *cpu,
     case JET_NR_sched_yield:
         return (int64_t)sched_yield();
     case JET_NR_close:
+        if (jet_is_fake_fd((int)a0)) { jet_fake_fd_map[(int)a0]=0; return 0; }
         return (int64_t)close((int)a0);
     case JET_NR_read:
+        if (jet_is_fake_fd((int)a0)) { errno = EAGAIN; return -1; }
         return (int64_t)read((int)a0, G2H(a1), (size_t)a2);
     case JET_NR_write:
+        if (jet_is_fake_fd((int)a0)) return (int64_t)a2; /* pretend written */
         return (int64_t)write((int)a0, G2H(a1), (size_t)a2);
     case JET_NR_lseek:
         return (int64_t)lseek((int)a0, (off_t)a1, (int)a2);
@@ -1040,6 +1197,17 @@ int64_t jet_emulate_linux_syscall(jet_ctx *ctx, jet_cpu *cpu,
         return (int64_t)ioctl((int)a0, (unsigned long)a1, (void*)G2H(a2));
     case JET_NR_fcntl:
         return (int64_t)fcntl((int)a0, (int)a1, a2);
+    case JET_NR_epoll_create1: {
+        int fd = jet_fake_fd_alloc();
+        return (int64_t)fd;
+    }
+    case JET_NR_epoll_ctl:
+        return 0;
+    case JET_NR_epoll_pwait: {
+        struct timespec ts = {0, 50 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+        return 0;
+    }
     case JET_NR_exit:
     case JET_NR_exit_group:
         jet_log(ctx, 0, "guest exit(%d) via SVC", (int)a0);

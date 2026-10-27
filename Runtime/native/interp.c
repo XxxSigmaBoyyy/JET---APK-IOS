@@ -887,50 +887,93 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
     }
 
     case OP_LDR_FP: case OP_LDUR_FP: {
-        uint64_t base = (i->rn == 31) ? c->sp : (i->opc == 1 && i->op == OP_LDR_FP && i->imm && !i->rn ? 0 : jet_x(c, i->rn));
-        /* literal form: opc marker was 1 and rn unused */
-        uint64_t addr;
+        /* FP LDR size:
+         *  - literal (0x1C......): size 0=S(4) 1=D(8) 2=Q(16)
+         *  - otherwise: size 0=B 1=H 2=S 3=D, size 4 (opc=2 remapped)=Q
+         * LDR of <16 bytes must zero the high bits of Vd (ARM Armv8). */
+        int is_lit = ((i->raw & 0x3F000000u) == 0x1C000000u);
+        uint64_t base, addr;
         int wb = 0;
-        if ((i->raw & 0x3F000000u) == 0x1C000000u || i->opc == 1) {
-            /* FP load-literal (opc==1 set by decode) */
+        if (is_lit) {
             addr = pc + (int64_t)i->imm;
+            base = 0;
         } else if (i->op == OP_LDUR_FP) {
-            addr = ((i->rn==31)?c->sp:jet_x(c,i->rn)) + (int64_t)i->imm;
-        } else if (i->opc == 1) { addr = (i->rn==31)?c->sp:jet_x(c,i->rn); wb=1; }
-        else if (i->opc == 3) { base=(i->rn==31)?c->sp:jet_x(c,i->rn); addr=base+(int64_t)i->imm; wb=1; }
-        else { base=(i->rn==31)?c->sp:jet_x(c,i->rn); addr = base + (i->uimm ? i->uimm : (uint64_t)(int64_t)i->imm); }
-        int sz = i->size; /* 0=32 1=64 2=128? or 4 for Q */
-        if (sz == 4 || ((i->raw >> 30) == 0 && ((i->raw >> 22) & 3) >= 2 && bit_fp128(i))) {
-            c->v[i->rd][0] = ld8(addr); c->v[i->rd][1] = ld8(addr+8);
-        } else if (sz == 1 || (i->size == 1)) {
-            c->v[i->rd][0] = ld8(addr); c->v[i->rd][1] = 0;
-        } else if (sz == 0) {
-            c->v[i->rd][0] = ld4(addr); c->v[i->rd][1] = 0;
+            base = (i->rn == 31) ? c->sp : jet_x(c, i->rn);
+            addr = base + (int64_t)i->imm;
+        } else if (i->opc == 1) { /* post-index */
+            base = (i->rn == 31) ? c->sp : jet_x(c, i->rn);
+            addr = base; wb = 1;
+        } else if (i->opc == 3) { /* pre-index */
+            base = (i->rn == 31) ? c->sp : jet_x(c, i->rn);
+            addr = base + (int64_t)i->imm; wb = 1;
+        } else if (i->opc == 4) { /* register offset — fall back to uimm/imm */
+            base = (i->rn == 31) ? c->sp : jet_x(c, i->rn);
+            addr = base + (i->uimm ? i->uimm : (uint64_t)(int64_t)i->imm);
         } else {
-            c->v[i->rd][0] = ld8(addr); c->v[i->rd][1] = ld8(addr+8);
+            base = (i->rn == 31) ? c->sp : jet_x(c, i->rn);
+            addr = base + (i->uimm ? i->uimm : (uint64_t)(int64_t)i->imm);
+        }
+        int nbytes;
+        if (is_lit) {
+            nbytes = (i->size == 0) ? 4 : (i->size == 1) ? 8 : 16;
+        } else {
+            switch (i->size) {
+            case 4: nbytes = 16; break;
+            case 3: nbytes = 8; break;
+            case 2: nbytes = 4; break;
+            case 1: nbytes = 2; break;
+            default: nbytes = 1; break;
+            }
+        }
+        c->v[i->rd][0] = 0; c->v[i->rd][1] = 0;
+        if (nbytes == 16) {
+            c->v[i->rd][0] = ld8(addr); c->v[i->rd][1] = ld8(addr + 8);
+        } else if (nbytes == 8) {
+            c->v[i->rd][0] = ld8(addr);
+        } else if (nbytes == 4) {
+            c->v[i->rd][0] = ld4(addr);
+        } else if (nbytes == 2) {
+            c->v[i->rd][0] = ld2(addr);
+        } else {
+            c->v[i->rd][0] = ld1(addr);
         }
         if (wb) {
-            uint64_t nb = ((i->rn==31)?c->sp:jet_x(c,i->rn)) + (int64_t)i->imm;
-            if (i->rn==31) c->sp=nb; else jet_set_x(c,i->rn,nb);
+            uint64_t nb = base + (int64_t)i->imm;
+            if (i->rn == 31) c->sp = nb; else jet_set_x(c, i->rn, nb);
         }
         (void)base;
         return 0;
     }
     case OP_STR_FP: case OP_STUR_FP: {
+        /* Same size mapping as LDR_FP (non-literal). Q is size==4. */
         uint64_t base = (i->rn == 31) ? c->sp : jet_x(c, i->rn);
-        uint64_t addr; int wb=0;
+        uint64_t addr; int wb = 0;
         if (i->op == OP_STUR_FP) addr = base + (int64_t)i->imm;
-        else if (i->opc == 1) { addr = base; wb=1; }
-        else if (i->opc == 3) { addr = base + (int64_t)i->imm; wb=1; }
+        else if (i->opc == 1) { addr = base; wb = 1; }
+        else if (i->opc == 3) { addr = base + (int64_t)i->imm; wb = 1; }
         else addr = base + (i->uimm ? i->uimm : (uint64_t)(int64_t)i->imm);
-        int sz = i->size;
-        if (sz == 4 || sz > 3) { st8(addr, c->v[i->rd][0]); st8(addr+8, c->v[i->rd][1]); }
-        else if (sz == 1) st8(addr, c->v[i->rd][0]);
-        else if (sz == 0) st4(addr, (uint32_t)c->v[i->rd][0]);
-        else { st8(addr, c->v[i->rd][0]); st8(addr+8, c->v[i->rd][1]); }
+        int nbytes;
+        switch (i->size) {
+        case 4: nbytes = 16; break;
+        case 3: nbytes = 8; break;
+        case 2: nbytes = 4; break;
+        case 1: nbytes = 2; break;
+        default: nbytes = 1; break;
+        }
+        if (nbytes == 16) {
+            st8(addr, c->v[i->rd][0]); st8(addr + 8, c->v[i->rd][1]);
+        } else if (nbytes == 8) {
+            st8(addr, c->v[i->rd][0]);
+        } else if (nbytes == 4) {
+            st4(addr, (uint32_t)c->v[i->rd][0]);
+        } else if (nbytes == 2) {
+            st2(addr, (uint16_t)c->v[i->rd][0]);
+        } else {
+            st1(addr, (uint8_t)c->v[i->rd][0]);
+        }
         if (wb) {
             uint64_t nb = base + (int64_t)i->imm;
-            if (i->rn==31) c->sp=nb; else jet_set_x(c,i->rn,nb);
+            if (i->rn == 31) c->sp = nb; else jet_set_x(c, i->rn, nb);
         }
         return 0;
     }
@@ -1061,16 +1104,22 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
         return 0;
     }
     case OP_DUP: {
-        int imm5 = i->uimm;
+        int imm5 = (int)i->uimm;
         int esize, index;
         if (imm5 & 1) { esize=8; index=imm5>>1; }
         else if (imm5 & 2) { esize=16; index=imm5>>2; }
         else if (imm5 & 4) { esize=32; index=imm5>>3; }
         else { esize=64; index=imm5>>4; }
-        uint8_t src[16], out[16];
-        memcpy(src, &c->v[i->rn][0], 16);
+        uint8_t out[16] = {0};
         uint8_t elem[8] = {0};
-        memcpy(elem, src + index * (esize/8), esize/8);
+        if (i->opc == 1) {
+            uint64_t g = jet_x(c, i->rn);
+            memcpy(elem, &g, esize/8);
+        } else {
+            uint8_t src[16];
+            memcpy(src, &c->v[i->rn][0], 16);
+            memcpy(elem, src + index * (esize/8), esize/8);
+        }
         int n = (i->regsize?128:64)/esize;
         for (int k=0;k<n;k++) memcpy(out + k*(esize/8), elem, esize/8);
         if (!i->regsize) memset(out+8,0,8);
@@ -1123,6 +1172,92 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
                 : jet_x(c, i->rm);
             if (i->rn == 31) c->sp = base + off; else jet_set_x(c, i->rn, base + off);
         }
+        return 0;
+    }
+
+    case OP_EXT_V: {
+        int nbytes = i->regsize ? 16 : 8;
+        int idx = (int)i->imm;
+        uint8_t a[16], b[16], out[16];
+        memcpy(a, &c->v[i->rn][0], 8); memcpy(a+8, &c->v[i->rn][1], 8);
+        memcpy(b, &c->v[i->rm][0], 8); memcpy(b+8, &c->v[i->rm][1], 8);
+        for (int k = 0; k < nbytes; k++) {
+            int s = k + idx;
+            out[k] = (s < nbytes) ? a[s] : b[s - nbytes];
+        }
+        if (!i->regsize) memset(out+8, 0, 8);
+        memcpy(&c->v[i->rd][0], out, 8); memcpy(&c->v[i->rd][1], out+8, 8);
+        return 0;
+    }
+    case OP_USHR: case OP_SSHR: case OP_SHL: {
+        /* immh:immb in i->imm. esize from highest set bit of immh. */
+        unsigned immhb = (unsigned)i->imm;
+        unsigned immh = (immhb >> 3) & 0xf;
+        int esize, shift, elements, reg_bytes = i->regsize ? 16 : 8;
+        if (immh & 0x8) { esize = 64; }
+        else if (immh & 0x4) { esize = 32; }
+        else if (immh & 0x2) { esize = 16; }
+        else if (immh & 0x1) { esize = 8; }
+        else { /* reserved */ return 0; }
+        elements = (reg_bytes * 8) / esize;
+        if (i->op == OP_SHL) shift = (int)immhb - esize;
+        else shift = (esize * 2) - (int)immhb; /* SSHR/USHR */
+        if (shift < 0) shift = 0;
+        if (shift > esize) shift = esize;
+        uint8_t src[16], dst[16];
+        memcpy(src, &c->v[i->rn][0], 8); memcpy(src+8, &c->v[i->rn][1], 8);
+        memset(dst, 0, 16);
+        for (int e = 0; e < elements; e++) {
+            uint64_t val = 0;
+            int off = e * (esize/8);
+            memcpy(&val, src + off, esize/8);
+            if (esize < 64) val &= (esize==8)?0xffull:(esize==16)?0xffffull:0xffffffffull;
+            if (i->op == OP_SHL) {
+                val <<= shift;
+            } else if (i->op == OP_SSHR) {
+                int64_t s;
+                if (esize==8) s = (int8_t)val;
+                else if (esize==16) s = (int16_t)val;
+                else if (esize==32) s = (int32_t)val;
+                else s = (int64_t)val;
+                val = (uint64_t)(s >> shift);
+            } else {
+                val >>= shift;
+            }
+            if (esize < 64) val &= (esize==8)?0xffull:(esize==16)?0xffffull:0xffffffffull;
+            memcpy(dst + off, &val, esize/8);
+        }
+        memcpy(&c->v[i->rd][0], dst, 8); memcpy(&c->v[i->rd][1], dst+8, 8);
+        if (!i->regsize) c->v[i->rd][1] = 0;
+        return 0;
+    }
+    case OP_TBL: case OP_TBX: {
+        /* Table lookup: Vd.16B = TBL {Vn..}, Vm.16B indices. opc = nregs-1. */
+        int nregs = (int)i->opc + 1;
+        if (nregs < 1) nregs = 1;
+        if (nregs > 4) nregs = 4;
+        uint8_t table[64];
+        memset(table, 0, sizeof table);
+        for (int r = 0; r < nregs; r++) {
+            int vt = (i->rn + r) & 31;
+            memcpy(table + r*16, &c->v[vt][0], 8);
+            memcpy(table + r*16 + 8, &c->v[vt][1], 8);
+        }
+        uint8_t idx[16], out[16];
+        memcpy(idx, &c->v[i->rm][0], 8); memcpy(idx+8, &c->v[i->rm][1], 8);
+        if (i->op == OP_TBX) {
+            memcpy(out, &c->v[i->rd][0], 8); memcpy(out+8, &c->v[i->rd][1], 8);
+        } else memset(out, 0, 16);
+        int nbytes = i->regsize ? 16 : 8;
+        int lim = nregs * 16;
+        for (int k = 0; k < nbytes; k++) {
+            unsigned ii = idx[k];
+            if (ii < (unsigned)lim) out[k] = table[ii];
+            else if (i->op == OP_TBL) out[k] = 0;
+            /* TBX: leave out[k] unchanged when out of range */
+        }
+        memcpy(&c->v[i->rd][0], out, 8);
+        c->v[i->rd][1] = i->regsize ? *(uint64_t*)(out+8) : 0;
         return 0;
     }
 
@@ -1185,6 +1320,7 @@ static int dispatch_stub(jet_ctx *ctx, jet_cpu *c, int idx) {
     }
     jet_args a = {0};
     for (int i = 0; i < 8; i++) a.x[i] = c->x[i];
+    a.x8 = c->x[8]; /* forward AAPCS64 indirect result to host shim */
     for (int i = 0; i < 8; i++) memcpy(&a.d[i], &c->v[i][0], 8);
     a.stack = (const uint64_t *)G2H(c->sp);
     if (t->name) {
@@ -1197,6 +1333,10 @@ static int dispatch_stub(jet_ctx *ctx, jet_cpu *c, int idx) {
                 (unsigned long long)c->x[30]);
     }
     uint64_t ret = t->fn(ctx, &a, t->user);
+    if (c->stop) {
+        /* Host trap requested stop (abort/stack_chk/etc.) — do not resume at LR. */
+        return 1;
+    }
     if (t->flags & JET_HOST_RET_F64) {
         c->v[0][0] = ret; c->v[0][1] = 0;
     } else if (t->flags & JET_HOST_RET_F32) {

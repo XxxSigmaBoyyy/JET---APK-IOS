@@ -292,12 +292,15 @@ int jet_decode(uint32_t w, jet_insn *o) {
         o->rn = bits(w, 9, 5);
         o->sf = (size == 3) ? 1 : 0;
         if (V) {
-            /* FP/SIMD LDR/STR */
+            /* FP/SIMD LDR/STR
+             * size/opc: 0/0 B, 1/0 H, 2/0 S, 3/0 D; size=0 opc=2/3 => Q.
+             * Remap Q to size==4 on every addressing mode (unsigned, unscaled,
+             * pre/post, reg-offset) so execute sees a consistent width. */
             int is_load = (opc == 1 || opc == 3);
+            if (size == 0 && (opc == 2 || opc == 3)) o->size = 4;
             /* bit24=1 → unsigned imm; else unscaled / pre / post / reg */
             if ((w & 0x01000000u) == 0x01000000u) {
                 /* unsigned imm */
-                if (size == 0 && (opc == 2 || opc == 3)) o->size = 4;
                 o->uimm = bits(w, 21, 10) << ((o->size == 4) ? 4 : size);
                 o->op = is_load ? OP_LDR_FP : OP_STR_FP;
                 o->opc = 0; /* unsigned */
@@ -563,13 +566,56 @@ int jet_decode(uint32_t w, jet_insn *o) {
     if ((w & 0xBFE0FC00u) == 0x0EA01C00u) { o->op = OP_ORR_V; goto vec_3; }
     if ((w & 0xBFE0FC00u) == 0x2E201C00u) { o->op = OP_EOR_V; goto vec_3; }
     if ((w & 0xBFE0FC00u) == 0x0E601C00u) { o->op = OP_BIC_V; goto vec_3; }
-    if ((w & 0xBFE0FC00u) == 0x0E208400u) { o->op = OP_ADD_V; goto vec_3; }
-    if ((w & 0xBFE0FC00u) == 0x2E208400u) { o->op = OP_SUB_V; goto vec_3; }
+    if ((w & 0xBF20FC00u) == 0x0E208400u) { o->op = OP_ADD_V; goto vec_3; }
+    if ((w & 0xBF20FC00u) == 0x2E208400u) { o->op = OP_SUB_V; goto vec_3; }
     if (0) {
     vec_3:
         o->regsize = bit(w, 30);
         o->size = bits(w, 23, 22);
         o->rd = bits(w,4,0); o->rn = bits(w,9,5); o->rm = bits(w,20,16);
+        return 0;
+    }
+
+    /* ASIMD shift by immediate: SSHR/USHR/SHL.
+     * Must be matched before MOVI (overlapping bit11:10=01). */
+    if ((w & 0xBF80FC00u) == 0x2F000400u) { /* USHR U=1 opcode=000001 (Q ignored) */
+        o->op = OP_USHR;
+        o->regsize = bit(w, 30);
+        o->rd = bits(w, 4, 0); o->rn = bits(w, 9, 5);
+        o->imm = bits(w, 22, 16); /* immh:immb */
+        o->size = bits(w, 22, 19); /* immh */
+        return 0;
+    }
+    if ((w & 0xBF80FC00u) == 0x0F000000u) { /* SSHR U=0 (Q ignored → 0x0F) */
+        o->op = OP_SSHR;
+        o->regsize = bit(w, 30);
+        o->rd = bits(w, 4, 0); o->rn = bits(w, 9, 5);
+        o->imm = bits(w, 22, 16);
+        o->size = bits(w, 22, 19);
+        return 0;
+    }
+    if ((w & 0xBF80FC00u) == 0x0F005400u || (w & 0xBF80FC00u) == 0x2F005400u) {
+        o->op = OP_SHL;
+        o->regsize = bit(w, 30);
+        o->rd = bits(w, 4, 0); o->rn = bits(w, 9, 5);
+        o->imm = bits(w, 22, 16);
+        o->size = bits(w, 22, 19);
+        return 0;
+    }
+    /* EXT Vd.16B, Vn.16B, Vm.16B, #index */
+    if ((w & 0xBFE08400u) == 0x2E000000u) {
+        o->op = OP_EXT_V;
+        o->regsize = bit(w, 30);
+        o->rd = bits(w, 4, 0); o->rn = bits(w, 9, 5); o->rm = bits(w, 20, 16);
+        o->imm = bits(w, 14, 11); /* imm4 */
+        return 0;
+    }
+    /* TBL / TBX — bit12=0 TBL, =1 TBX; bits14:13 = len (nregs-1). */
+    if ((w & 0xBFE0EC00u) == 0x0E000000u) {
+        o->op = bit(w, 12) ? OP_TBX : OP_TBL;
+        o->regsize = bit(w, 30);
+        o->rd = bits(w, 4, 0); o->rn = bits(w, 9, 5); o->rm = bits(w, 20, 16);
+        o->opc = (uint8_t)bits(w, 14, 13);
         return 0;
     }
 
@@ -604,11 +650,20 @@ int jet_decode(uint32_t w, jet_insn *o) {
         o->opc = 0; /* from vector element */
         return 0;
     }
-    /* DUP element / general */
-    if ((w & 0xBF3FEC00u) == 0x0E000C00u) {
+    /* DUP (element): Vd.T, Vn.ts[index] — bits15:10=000001 */
+    if ((w & 0xBFE0FC00u) == 0x0E000400u) {
         o->op = OP_DUP; o->regsize = bit(w,30);
         o->rd = bits(w,4,0); o->rn = bits(w,9,5);
         o->uimm = bits(w, 20, 16); /* imm5 */
+        o->opc = 0; /* from vector */
+        return 0;
+    }
+    /* DUP (general): Vd.T, Rn — bits15:10=000011 */
+    if ((w & 0xBFE0FC00u) == 0x0E000C00u) {
+        o->op = OP_DUP; o->regsize = bit(w,30);
+        o->rd = bits(w,4,0); o->rn = bits(w,9,5);
+        o->uimm = bits(w, 20, 16); /* imm5 → size */
+        o->opc = 1; /* from GPR */
         return 0;
     }
 
@@ -626,9 +681,13 @@ int jet_decode(uint32_t w, jet_insn *o) {
         return 0;
     }
 
-    /* LD1/ST1 multiple / single — very common in memcpy.
-     * Minimal: LD1 {Vt}.16B, [Xn] and post-index forms. */
-    if ((w & 0xBFE00000u) == 0x0C400000u || (w & 0xBFE00000u) == 0x0C000000u) {
+    /* LD1/ST1 multiple: Q=bit30 (masked), post-index=bit23, L=bit22.
+     * After clearing Q, patterns are 0x0C000000 (ST), 0x0C400000 (LD),
+     * 0x0C800000 (ST post/reg), 0x0CC00000 (LD post/reg). */
+    {
+        uint32_t ld1m = w & 0xBFE00000u;
+        if (ld1m == 0x0C000000u || ld1m == 0x0C400000u ||
+            ld1m == 0x0C800000u || ld1m == 0x0CC00000u) {
         int L = bit(w, 22);
         o->op = L ? OP_LD1 : OP_ST1;
         o->regsize = bit(w, 30);
@@ -639,6 +698,7 @@ int jet_decode(uint32_t w, jet_insn *o) {
         o->size = bits(w, 11, 10);
         o->uimm = bit(w, 23); /* 0=no offset info in this form */
         return 0;
+        }
     }
 
     (void)op0;

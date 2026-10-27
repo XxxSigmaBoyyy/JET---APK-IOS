@@ -4,13 +4,32 @@
 static jet_ctx *g_active_ctx;
 void jet_tramp_set_active(jet_ctx *ctx) { g_active_ctx = ctx; }
 
+/* Capture host x8 (AAPCS64 IPRIN) before the C prologue can clobber it.
+ * On Apple the host ABI reserves x18, but guest x18 is interpreter state and
+ * is restored by jet_native_call_ex's full register snapshot — do not alias. */
+static inline uint64_t tramp_read_x8(void) {
+    uint64_t v;
+#if defined(__aarch64__)
+    __asm__ volatile("mov %0, x8" : "=r"(v));
+#else
+    v = 0; /* non-a64 host (qemu-user builds run guest a64 under interpreter) */
+#endif
+    return v;
+}
+static inline void tramp_fill_args(jet_args *a,
+        uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+        uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
+    a->x[0]=a0; a->x[1]=a1; a->x[2]=a2; a->x[3]=a3;
+    a->x[4]=a4; a->x[5]=a5; a->x[6]=a6; a->x[7]=a7;
+    a->x8 = tramp_read_x8();
+}
+
 static uint64_t tramp_0(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                           uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[0].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[0].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -19,8 +38,7 @@ static uint64_t tramp_1(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[1].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[1].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -29,8 +47,7 @@ static uint64_t tramp_2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[2].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[2].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -39,8 +56,7 @@ static uint64_t tramp_3(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[3].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[3].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -49,8 +65,7 @@ static uint64_t tramp_4(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[4].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[4].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -59,8 +74,7 @@ static uint64_t tramp_5(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[5].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[5].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -69,8 +83,7 @@ static uint64_t tramp_6(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[6].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[6].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -79,8 +92,7 @@ static uint64_t tramp_7(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[7].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[7].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -89,8 +101,7 @@ static uint64_t tramp_8(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[8].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[8].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -99,8 +110,7 @@ static uint64_t tramp_9(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[9].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[9].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -109,8 +119,7 @@ static uint64_t tramp_10(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[10].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[10].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -119,8 +128,7 @@ static uint64_t tramp_11(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[11].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[11].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -129,8 +137,7 @@ static uint64_t tramp_12(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[12].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[12].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -139,8 +146,7 @@ static uint64_t tramp_13(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[13].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[13].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -149,8 +155,7 @@ static uint64_t tramp_14(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[14].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[14].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -159,8 +164,7 @@ static uint64_t tramp_15(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[15].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[15].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -169,8 +173,7 @@ static uint64_t tramp_16(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[16].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[16].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -179,8 +182,7 @@ static uint64_t tramp_17(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[17].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[17].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -189,8 +191,7 @@ static uint64_t tramp_18(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[18].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[18].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -199,8 +200,7 @@ static uint64_t tramp_19(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[19].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[19].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -209,8 +209,7 @@ static uint64_t tramp_20(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[20].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[20].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -219,8 +218,7 @@ static uint64_t tramp_21(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[21].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[21].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -229,8 +227,7 @@ static uint64_t tramp_22(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[22].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[22].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -239,8 +236,7 @@ static uint64_t tramp_23(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[23].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[23].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -249,8 +245,7 @@ static uint64_t tramp_24(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[24].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[24].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -259,8 +254,7 @@ static uint64_t tramp_25(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[25].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[25].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -269,8 +263,7 @@ static uint64_t tramp_26(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[26].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[26].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -279,8 +272,7 @@ static uint64_t tramp_27(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[27].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[27].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -289,8 +281,7 @@ static uint64_t tramp_28(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[28].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[28].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -299,8 +290,7 @@ static uint64_t tramp_29(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[29].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[29].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -309,8 +299,7 @@ static uint64_t tramp_30(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[30].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[30].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -319,8 +308,7 @@ static uint64_t tramp_31(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[31].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[31].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -329,8 +317,7 @@ static uint64_t tramp_32(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[32].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[32].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -339,8 +326,7 @@ static uint64_t tramp_33(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[33].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[33].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -349,8 +335,7 @@ static uint64_t tramp_34(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[34].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[34].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -359,8 +344,7 @@ static uint64_t tramp_35(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[35].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[35].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -369,8 +353,7 @@ static uint64_t tramp_36(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[36].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[36].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -379,8 +362,7 @@ static uint64_t tramp_37(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[37].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[37].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -389,8 +371,7 @@ static uint64_t tramp_38(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[38].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[38].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -399,8 +380,7 @@ static uint64_t tramp_39(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[39].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[39].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -409,8 +389,7 @@ static uint64_t tramp_40(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[40].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[40].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -419,8 +398,7 @@ static uint64_t tramp_41(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[41].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[41].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -429,8 +407,7 @@ static uint64_t tramp_42(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[42].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[42].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -439,8 +416,7 @@ static uint64_t tramp_43(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[43].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[43].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -449,8 +425,7 @@ static uint64_t tramp_44(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[44].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[44].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -459,8 +434,7 @@ static uint64_t tramp_45(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[45].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[45].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -469,8 +443,7 @@ static uint64_t tramp_46(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[46].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[46].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -479,8 +452,7 @@ static uint64_t tramp_47(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[47].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[47].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -489,8 +461,7 @@ static uint64_t tramp_48(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[48].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[48].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -499,8 +470,7 @@ static uint64_t tramp_49(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[49].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[49].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -509,8 +479,7 @@ static uint64_t tramp_50(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[50].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[50].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -519,8 +488,7 @@ static uint64_t tramp_51(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[51].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[51].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -529,8 +497,7 @@ static uint64_t tramp_52(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[52].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[52].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -539,8 +506,7 @@ static uint64_t tramp_53(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[53].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[53].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -549,8 +515,7 @@ static uint64_t tramp_54(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[54].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[54].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -559,8 +524,7 @@ static uint64_t tramp_55(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[55].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[55].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -569,8 +533,7 @@ static uint64_t tramp_56(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[56].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[56].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -579,8 +542,7 @@ static uint64_t tramp_57(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[57].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[57].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -589,8 +551,7 @@ static uint64_t tramp_58(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[58].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[58].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -599,8 +560,7 @@ static uint64_t tramp_59(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[59].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[59].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -609,8 +569,7 @@ static uint64_t tramp_60(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[60].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[60].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -619,8 +578,7 @@ static uint64_t tramp_61(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[61].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[61].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -629,8 +587,7 @@ static uint64_t tramp_62(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[62].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[62].guest_fn, &a, &r, NULL);
     return r;
 }
@@ -639,8 +596,7 @@ static uint64_t tramp_63(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     jet_ctx *c = g_active_ctx;
     if (!c || !c->tramps[63].used) return 0;
     jet_args a = {0};
-    a.x[0]=a0; a.x[1]=a1; a.x[2]=a2; a.x[3]=a3;
-    a.x[4]=a4; a.x[5]=a5; a.x[6]=a6; a.x[7]=a7;
+    tramp_fill_args(&a, a0, a1, a2, a3, a4, a5, a6, a7);
     uint64_t r=0; jet_native_call(c, c->tramps[63].guest_fn, &a, &r, NULL);
     return r;
 }
