@@ -61,3 +61,19 @@ NDK images are 4 KiB-aligned, arm64 Darwin pages are 16 KiB. The converter keeps
 __TEXT/__DATA boundary at the 16 KiB floor of the first RW byte. If any SHF_EXECINSTR section would land in that
 RW page the library is refused (route b2: arm64 interpreter). File-less tail becomes a S_ZEROFILL __bss section.
 Verified on stock Telegram FOSS libtmessages.49.so: __DATA @0x3334000, 112261 rebases, 413 imports, 340 Java_* exports.
+
+## Export to E-SIGN (b1) — design
+iOS will not execute newly-written RX pages. Translated APK `.so` → `.dylib` must be signed with the
+user's cert before `dlopen`. Flow (all generic, APK-derived):
+
+1. **Import APK** in JET (or a desktop/CI helper): unzip `lib/arm64-v8a/*.so`.
+2. **elf2macho** each `.so` with `--platform ios --abi-list Runtime/bionic/abi_list.flat`.
+3. **Package** a thin plugin IPA / tipa: `Payload/JETPlugin-<pkg>.app/` containing
+   `Frameworks/libjetbionic.dylib` + `Frameworks/<translated>.dylib` + `Info.plist` (generic).
+4. **User re-signs** with E-SIGN (on-device, their cert) — same as any sideloaded tipa.
+5. **JET loads** the signed plugin via `dlopen` of the translated dylibs (rpath → plugin Frameworks).
+
+Fallback **b2** (no re-sign): arm64 user-mode interpreter executes the original ELF `.so` text
+in softmmu (no JIT / no RX alloc). Same bionic bridge called through a FFI stub.
+
+Cold-start timing: wall ms from APK open → first Activity frame callback, logged to timing.txt.
