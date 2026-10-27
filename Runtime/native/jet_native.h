@@ -113,6 +113,12 @@ void jet_jni_on_register_natives(jet_ctx *ctx, jet_register_cb cb, void *user);
 int         jet_native_set_cwd(jet_ctx *ctx, const char *path);
 const char *jet_native_get_cwd(jet_ctx *ctx);
 
+/* ClassLoader (host jobject) used by guest FindClass / JNI_OnLoad. */
+int  jet_native_set_class_loader(jet_ctx *ctx, void *class_loader);
+void *jet_native_get_class_loader(jet_ctx *ctx);
+/* Attach a ClassLoader to a loaded library (used during its JNI_OnLoad). */
+void jet_native_lib_set_class_loader(jet_lib *lib, void *class_loader);
+
 /* Test helpers */
 const char *jet_jni_slot_name(int idx);
 uint64_t    jet_jni_call_env(jet_ctx *ctx, int idx, const jet_args *a);

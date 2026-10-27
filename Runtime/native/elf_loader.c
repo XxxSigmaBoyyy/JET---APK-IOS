@@ -14,6 +14,8 @@
 #define PT_DYNAMIC 2
 #define PT_TLS 7
 #define PT_GNU_RELRO 0x6474e552
+#define PT_GNU_EH_FRAME 0x6474e550
+#define PT_PHDR 6
 #define SHT_RELA 4
 #define SHT_RELR 19 /* or 0x6fffff00 variants; we use DT tags */
 #define DT_NULL 0
@@ -385,7 +387,7 @@ jet_lib *jet_elf_load(jet_ctx *ctx, const char *path, char *err, size_t errlen) 
     if (err && errlen) snprintf(err, errlen, fmt, ##__VA_ARGS__); \
     jet_set_error(ctx, fmt, ##__VA_ARGS__); \
     if (fd >= 0) close(fd); if (file) munmap(file, (size_t)st.st_size); \
-    if (lib) { if (lib->base) munmap(lib->base, lib->map_size); free(lib->path); free(lib);} \
+    if (lib) { if (lib->base) munmap(lib->base, lib->map_size); free(lib->phdrs); free(lib->path); free(lib);} \
     return NULL; } while (0)
 
     int fd = -1; uint8_t *file = NULL; struct stat st; jet_lib *lib = NULL;
@@ -437,6 +439,14 @@ jet_lib *jet_elf_load(jet_ctx *ctx, const char *path, char *err, size_t errlen) 
             memcpy(dst, file + ph[i].p_offset, (size_t)ph[i].p_filesz);
         /* BSS already zero from MAP_ANONYMOUS */
     }
+
+    /* Persist full program header table for dl_iterate_phdr / unwinder. */
+    lib->phnum = eh->e_phnum;
+    lib->phdrs = calloc(eh->e_phnum ? eh->e_phnum : 1, sizeof(Elf64_Phdr));
+    if (lib->phdrs && eh->e_phnum)
+        memcpy(lib->phdrs, ph, (size_t)eh->e_phnum * sizeof(Elf64_Phdr));
+    static uint64_t g_dlpi_gen;
+    lib->dlpi_adds = ++g_dlpi_gen;
 
     /* DYNAMIC */
     const Elf64_Dyn *dyn = NULL;
@@ -636,10 +646,11 @@ void jet_elf_run_fini(jet_ctx *ctx, jet_lib *lib) {
 }
 
 uint64_t jet_host_tlsdesc(jet_ctx *ctx, const jet_args *a, void *user) {
-    /* AAPCS64 TLSDESC: resolver(struct tlsdesc *desc) returns TPIDR + desc->arg.
-     * On AArch64 the call is special: x0 = &descriptor. */
-    (void)user;
-    jet_cpu *cpu = jet_cpu_current(ctx);
+    /* AArch64 TLSDESC ABI: resolver(struct tlsdesc *desc) returns the
+     * TPIDR-relative OFFSET of the object (not the absolute address).
+     * Caller does:  blr resolver; mrs xN, tpidr_el0; add x0, xN, x0.
+     * Returning TP+arg here double-adds and corrupts __cxa_get_globals TLS. */
+    (void)user; (void)ctx;
     uint64_t *desc = (uint64_t *)G2H(a->x[0]);
-    return cpu->tpidr_el0 + desc[1];
+    return desc[1];
 }

@@ -536,17 +536,34 @@ static uint64_t h_pthread_cond_signal(jet_ctx *c, const jet_args *a, void *u){ (
 static uint64_t h_pthread_cond_broadcast(jet_ctx *c, const jet_args *a, void *u){ (void)c;(void)u; return (uint64_t)(int64_t)pthread_cond_broadcast((pthread_cond_t*)G2H(a->x[0])); }
 static uint64_t h_pthread_once(jet_ctx *c, const jet_args *a, void *u){
     (void)u;
-    /* pthread_once_t *once, void (*init)(void) — init is guest */
-    static pthread_mutex_t once_mu = PTHREAD_MUTEX_INITIALIZER;
-    pthread_mutex_lock(&once_mu);
+    /* Bionic: pthread_once_t is int (0=never, 1=done). Never hold a host
+     * mutex across the guest init — nested once deadlocks. Track the once
+     * control being initialized on this thread so nested sees "in progress"
+     * and returns 0 (glibc/bionic both define that nested once on the same
+     * control is undefined; returning is the practical choice). */
+    static __thread volatile int *tls_in_once;
     volatile int *flag = (volatile int*)G2H(a->x[0]);
-    if (*flag == 0) {
-        jet_args aa={0};
-        jet_native_call(c, a->x[1], &aa, NULL, NULL);
-        *flag = 1;
+    uint64_t init_fn = a->x[1];
+    for (;;) {
+        int cur = __atomic_load_n(flag, __ATOMIC_ACQUIRE);
+        if (cur == 1) return 0;
+        if (tls_in_once == flag) return 0; /* nested on same control */
+        if (cur == 0) {
+            int expected = 0;
+            if (__atomic_compare_exchange_n(flag, &expected, 2 /*running*/,
+                    0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                tls_in_once = flag;
+                jet_args aa = {0};
+                jet_native_call(c, init_fn, &aa, NULL, NULL);
+                tls_in_once = NULL;
+                __atomic_store_n(flag, 1, __ATOMIC_RELEASE);
+                return 0;
+            }
+            continue;
+        }
+        /* running on another thread — wait */
+        while (__atomic_load_n(flag, __ATOMIC_ACQUIRE) == 2) { }
     }
-    pthread_mutex_unlock(&once_mu);
-    return 0;
 }
 static uint64_t h_pthread_key_create(jet_ctx *c, const jet_args *a, void *u){
     (void)u;
@@ -639,12 +656,134 @@ static uint64_t h_deflateInit2_(jet_ctx *c,const jet_args *a,void *u){ (void)c;(
 static uint64_t h_deflate(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)u; return (uint64_t)(int64_t)deflate((z_stream*)G2H(a->x[0]),(int)a->x[1]); }
 static uint64_t h_deflateEnd(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)u; return (uint64_t)(int64_t)deflateEnd((z_stream*)G2H(a->x[0])); }
 
+/* gettext family — return the msgid pointer (no catalog). */
+static uint64_t h_gettext(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u; return a->x[0]; /* char *gettext(const char *) */
+}
+static uint64_t h_dgettext(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u; return a->x[1]; /* dgettext(domain, msgid) */
+}
+static uint64_t h_dcgettext(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u; return a->x[1];
+}
+static uint64_t h_ngettext(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u; return a->x[2]==1 ? a->x[0] : a->x[1];
+}
+static uint64_t h_textdomain(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u;(void)a; return 0;
+}
+static uint64_t h_bindtextdomain(jet_ctx *c, const jet_args *a, void *u){
+    (void)c;(void)u; return a->x[1];
+}
+
 /* dl* */
 static uint64_t h_dlopen(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)u; return H2G(dlopen((char*)G2H(a->x[0]),(int)a->x[1])); }
 static uint64_t h_dlsym(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)u; return H2G(dlsym(G2H(a->x[0]),(char*)G2H(a->x[1]))); }
 static uint64_t h_dlclose(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)u; return (uint64_t)(int64_t)dlclose(G2H(a->x[0])); }
 static uint64_t h_dlerror(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)a;(void)u; return H2G(dlerror()); }
 static uint64_t h_dladdr(jet_ctx *c,const jet_args *a,void *u){ (void)c;(void)u; return (uint64_t)(int64_t)dladdr(G2H(a->x[0]),(Dl_info*)G2H(a->x[1])); }
+
+/* Linux dl_phdr_info (LP64) — guest AArch64 uses the same layout. */
+struct jet_dl_phdr_info {
+    uint64_t dlpi_addr;
+    const char *dlpi_name;
+    const void *dlpi_phdr;
+    uint16_t dlpi_phnum;
+    uint64_t dlpi_adds;
+    uint64_t dlpi_subs;
+    size_t   dlpi_tls_modid;
+    void    *dlpi_tls_data;
+};
+
+static uint64_t h_dl_iterate_phdr(jet_ctx *c, const jet_args *a, void *u) {
+    (void)u;
+    uint64_t cb = a->x[0];
+    uint64_t data = a->x[1];
+    if (!cb) return (uint64_t)(int64_t)-1;
+    int rc = 0;
+    for (jet_lib *L = c->libs; L; L = L->next) {
+        struct jet_dl_phdr_info info;
+        memset(&info, 0, sizeof info);
+        info.dlpi_addr = L->load_bias;
+        info.dlpi_name = L->path ? L->path : "";
+        info.dlpi_phdr = L->phdrs;
+        info.dlpi_phnum = L->phnum;
+        info.dlpi_adds = L->dlpi_adds;
+        info.dlpi_subs = 0;
+        info.dlpi_tls_modid = (size_t)L->tls_modid;
+        /* Per-thread TLS image for this module (TPIDR + tls_offset). */
+        {
+            jet_cpu *cpu = jet_cpu_current(c);
+            if (cpu && L->tls_modid > 0 && L->tls_image_size)
+                info.dlpi_tls_data = (void*)(uintptr_t)(cpu->tpidr_el0 + L->tls_offset);
+            else
+                info.dlpi_tls_data = NULL;
+        }
+        jet_args ca = {0};
+        ca.x[0] = H2G(&info);
+        ca.x[1] = sizeof(info);
+        ca.x[2] = data;
+        uint64_t r = 0;
+        if (jet_native_call(c, cb, &ca, &r, NULL) != 0) {
+            jet_log(c, 1, "dl_iterate_phdr callback failed: %s", c->last_error);
+            return (uint64_t)(int64_t)-1;
+        }
+        rc = (int)(int64_t)r;
+        if (rc != 0) return (uint64_t)(int64_t)rc;
+    }
+    return 0;
+}
+
+/* glibc 2.35+ _dl_find_object — used by libgcc_s unwinder instead of (or with)
+ * dl_iterate_phdr. AArch64 struct (DLFO_STRUCT_HAS_EH_DBASE/COUNT = 0): */
+struct jet_dl_find_object {
+    uint64_t flags;
+    void    *map_start;
+    void    *map_end;
+    void    *link_map;   /* unused; leave NULL */
+    void    *eh_frame;
+    uint64_t reserved[7];
+};
+
+static uint64_t h_dl_find_object(jet_ctx *c, const jet_args *a, void *u) {
+    (void)u;
+    uint64_t addr = a->x[0];
+    struct jet_dl_find_object *out = a->x[1]
+        ? (struct jet_dl_find_object *)G2H(a->x[1]) : NULL;
+    if (!out) return (uint64_t)(int64_t)-1;
+    typedef struct {
+        uint32_t p_type, p_flags;
+        uint64_t p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align;
+    } Ph;
+    for (jet_lib *L = c->libs; L; L = L->next) {
+        if (!L->phdrs || !L->phnum) continue;
+        Ph *ph = (Ph *)L->phdrs;
+        uint64_t lo = UINT64_MAX, hi = 0;
+        void *eh = NULL;
+        for (int i = 0; i < L->phnum; i++) {
+            if (ph[i].p_type == 1 /* PT_LOAD */) {
+                uint64_t s = L->load_bias + ph[i].p_vaddr;
+                uint64_t e = s + ph[i].p_memsz;
+                if (s < lo) lo = s;
+                if (e > hi) hi = e;
+            } else if (ph[i].p_type == 0x6474e550u /* PT_GNU_EH_FRAME */) {
+                eh = (void *)(uintptr_t)(L->load_bias + ph[i].p_vaddr);
+            }
+        }
+        if (lo == UINT64_MAX) {
+            lo = L->load_bias;
+            hi = L->load_bias + L->map_size;
+        }
+        if (addr >= lo && addr < hi) {
+            memset(out, 0, sizeof *out);
+            out->map_start = (void *)(uintptr_t)lo;
+            out->map_end = (void *)(uintptr_t)hi;
+            out->eh_frame = eh;
+            return 0;
+        }
+    }
+    return (uint64_t)(int64_t)-1;
+}
 
 /* stubs for GLES / EGL / OpenSLES / android / jnigraphics — return 0 / no-op */
 
@@ -887,8 +1026,12 @@ int jet_host_install_bionic(jet_ctx *ctx) {
     reg(ctx,"inflateInit2_",h_inflateInit2_); reg(ctx,"inflate",h_inflate); reg(ctx,"inflateEnd",h_inflateEnd);
     reg(ctx,"deflateInit2_",h_deflateInit2_); reg(ctx,"deflate",h_deflate); reg(ctx,"deflateEnd",h_deflateEnd);
 
+    reg(ctx,"gettext",h_gettext); reg(ctx,"dgettext",h_dgettext);
+    reg(ctx,"dcgettext",h_dcgettext); reg(ctx,"ngettext",h_ngettext);
+    reg(ctx,"textdomain",h_textdomain); reg(ctx,"bindtextdomain",h_bindtextdomain);
     reg(ctx,"dlopen",h_dlopen); reg(ctx,"dlsym",h_dlsym); reg(ctx,"dlclose",h_dlclose);
-    reg(ctx,"dlerror",h_dlerror); reg(ctx,"dladdr",h_dladdr); reg(ctx,"dl_iterate_phdr",h_stub0);
+    reg(ctx,"dlerror",h_dlerror); reg(ctx,"dladdr",h_dladdr); reg(ctx,"dl_iterate_phdr",h_dl_iterate_phdr);
+    reg(ctx,"_dl_find_object",h_dl_find_object);
 
     /* GLES / EGL / Android graphics — stubs */
     const char *stubs[] = {

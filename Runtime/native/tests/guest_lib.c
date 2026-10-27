@@ -219,3 +219,26 @@ u64 guest_fmov_d1_lane(u64 hi) {
     );
     return out;
 }
+
+
+/* C++-style throw/catch across frames via setjmp/longjmp (guest uses its own
+ * control flow; host provides setjmp/longjmp traps). Verifies multi-frame
+ * unwinding of the guest stack under the interpreter — same requirement as
+ * real __cxa_throw once libstdc++ PAC/CFA path is fully green. */
+static int guest_throw_deep(void *jb, int n) {
+    if (n <= 0) {
+        longjmp(jb, 99);
+        return -1;
+    }
+    return guest_throw_deep(jb, n - 1) + 1;
+}
+int guest_throw_catch(int depth) {
+    unsigned char buf[1024];
+    for (int i = 0; i < 1024; i++) buf[i] = 0;
+    int r = setjmp(buf);
+    if (r == 0) {
+        guest_throw_deep(buf, depth);
+        return -1; /* unreachable if throw works */
+    }
+    return r; /* expect 99 */
+}

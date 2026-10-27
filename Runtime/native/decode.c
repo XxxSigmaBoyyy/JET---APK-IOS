@@ -679,8 +679,12 @@ int jet_decode(uint32_t w, jet_insn *o) {
     }
 
     /* ASIMD shift by immediate: SSHR/USHR/SHL.
-     * Must be matched before MOVI (overlapping bit11:10=01). */
-    if ((w & 0xBF80FC00u) == 0x2F000400u) { /* USHR U=1 opcode=000001 (Q ignored) */
+     * Must be matched before MOVI (overlapping bit11:10=01) but ONLY when
+     * immh != 0 — immh==0 is the ASIMD modified-immediate / MOVI space.
+     * Without this guard, `movi v31.4s, #0` (used to zero unwind frame
+     * state, incl. AArch64 RA_SIGN how) is stolen as SSHR and leave 0xff
+     * in the RA state → libgcc abort on DW_CFA_AARCH64_negate_ra_state. */
+    if ((w & 0xBF80FC00u) == 0x2F000400u && bits(w, 22, 19) != 0) {
         o->op = OP_USHR;
         o->regsize = bit(w, 30);
         o->rd = bits(w, 4, 0); o->rn = bits(w, 9, 5);
@@ -688,7 +692,7 @@ int jet_decode(uint32_t w, jet_insn *o) {
         o->size = bits(w, 22, 19); /* immh */
         return 0;
     }
-    if ((w & 0xBF80FC00u) == 0x0F000400u) { /* SSHR U=0 opcode=000001 */
+    if ((w & 0xBF80FC00u) == 0x0F000400u && bits(w, 22, 19) != 0) {
         o->op = OP_SSHR;
         o->regsize = bit(w, 30);
         o->rd = bits(w, 4, 0); o->rn = bits(w, 9, 5);
@@ -696,7 +700,8 @@ int jet_decode(uint32_t w, jet_insn *o) {
         o->size = bits(w, 22, 19);
         return 0;
     }
-    if ((w & 0xBF80FC00u) == 0x0F005400u || (w & 0xBF80FC00u) == 0x2F005400u) {
+    if (((w & 0xBF80FC00u) == 0x0F005400u || (w & 0xBF80FC00u) == 0x2F005400u)
+        && bits(w, 22, 19) != 0) {
         o->op = OP_SHL;
         o->regsize = bit(w, 30);
         o->rd = bits(w, 4, 0); o->rn = bits(w, 9, 5);

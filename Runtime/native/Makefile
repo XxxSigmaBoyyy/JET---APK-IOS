@@ -9,7 +9,7 @@ OBJS = $(SRCS:%.c=build/%.o)
 
 .PHONY: all clean test test-unit test-tg test-jni ios-syntax check
 
-all: build/libjet_native.a build/test_unit build/test_tg build/test_jni build/decode_sweep
+all: build/libjet_native.a build/test_unit build/test_tg build/test_jni build/test_mem_bitfield build/test_v9_jni_dl build/test_cxx_eh build/decode_sweep
 
 build:
 	mkdir -p build
@@ -48,7 +48,23 @@ test-jni: build/test_jni
 build/decode_sweep: tests/decode_sweep.c build/libjet_native.a
 	$(CC) $(CFLAGS) tests/decode_sweep.c -I. -Lbuild -ljet_native $(LDFLAGS) -o $@
 
-test: test-unit test-tg test-jni
+build/test_mem_bitfield: tests/test_mem_bitfield.c build/libjet_native.a
+	$(CC) $(CFLAGS) tests/test_mem_bitfield.c -I. -Lbuild -ljet_native $(LDFLAGS) -o $@
+
+build/test_v9_jni_dl: tests/test_v9_jni_dl.c build/libjet_native.a
+	$(CC) $(CFLAGS) tests/test_v9_jni_dl.c -I. -Lbuild -ljet_native $(LDFLAGS) -o $@
+
+build/test_cxx_eh: tests/test_cxx_eh.c build/libjet_native.a tests/guest_lib.so
+	$(CC) $(CFLAGS) tests/test_cxx_eh.c -I. -Lbuild -ljet_native $(LDFLAGS) -o $@
+
+test-mem: build/test_mem_bitfield
+	./build/test_mem_bitfield
+
+test-v9: build/test_v9_jni_dl build/test_cxx_eh
+	./build/test_v9_jni_dl
+	./build/test_cxx_eh
+
+test: test-unit test-tg test-jni test-mem test-v9
 
 
 # Ensure core sources are free of Linux-only headers in the public path.

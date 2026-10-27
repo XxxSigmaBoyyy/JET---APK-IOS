@@ -248,7 +248,7 @@ void jet_native_unload(jet_lib *lib) {
     while (*pp && *pp != lib) pp = &(*pp)->next;
     if (*pp == lib) *pp = lib->next;
     if (lib->base) munmap(lib->base, lib->map_size);
-    free(lib->path); free(lib);
+    free(lib->phdrs); free(lib->path); free(lib);
 }
 
 uint64_t jet_native_sym(jet_lib *lib, const char *name) {
@@ -361,4 +361,33 @@ int jet_native_call_host(jet_ctx *ctx, const char *sym, const jet_args *a, uint6
         }
     }
     return -1;
+}
+
+
+int jet_native_set_class_loader(jet_ctx *ctx, void *class_loader) {
+    if (!ctx) return -1;
+    ctx->default_class_loader = class_loader;
+    return 0;
+}
+void *jet_native_get_class_loader(jet_ctx *ctx) {
+    return ctx ? jet_loader_current(ctx) : NULL;
+}
+void jet_native_lib_set_class_loader(jet_lib *lib, void *class_loader) {
+    if (lib) lib->class_loader = class_loader;
+}
+void jet_loader_push(jet_ctx *ctx, void *loader) {
+    if (!ctx) return;
+    if (ctx->loader_sp < JET_LOADER_STACK)
+        ctx->loader_stack[ctx->loader_sp++] = loader;
+}
+void jet_loader_pop(jet_ctx *ctx) {
+    if (!ctx || ctx->loader_sp <= 0) return;
+    ctx->loader_sp--;
+}
+void *jet_loader_current(jet_ctx *ctx) {
+    if (!ctx) return NULL;
+    if (ctx->loader_sp > 0) return ctx->loader_stack[ctx->loader_sp - 1];
+    if (ctx->onload_lib && ctx->onload_lib->class_loader)
+        return ctx->onload_lib->class_loader;
+    return ctx->default_class_loader;
 }

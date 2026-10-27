@@ -10,9 +10,9 @@ static uint64_t jni_host_dispatch(jet_ctx *ctx, const jet_args *a, int idx) {
             a->x[1]?(const char*)G2H(a->x[1]):NULL, (jobject)(uintptr_t)a->x[2],
             a->x[3]?(const jbyte*)G2H(a->x[3]):NULL, (jsize)a->x[4]);
     }
-    case 6: {
-        typedef jclass (*fn)(void*, const char*);
-        return (uint64_t)(uintptr_t)((fn)f[6])(e, a->x[1]?(const char*)G2H(a->x[1]):NULL);
+    case 6: { /* FindClass — ClassLoader of current native / OnLoad */
+        const char *name = a->x[1] ? (const char*)G2H(a->x[1]) : NULL;
+        return host_find_class_loader(ctx, name);
     }
     case 7: case 8:
         return (uint64_t)(uintptr_t)((fn_l1p)f[idx])(e, (jobject)(uintptr_t)a->x[1]);
@@ -311,23 +311,8 @@ static uint64_t jni_host_dispatch(jet_ctx *ctx, const jet_args *a, int idx) {
         typedef void (*fn)(void*, jarray, jsize, jsize, void*);
         ((fn)f[214])(e,(jarray)(uintptr_t)a->x[1],(jsize)a->x[2],(jsize)a->x[3], a->x[4]?G2H(a->x[4]):NULL); return 0; }
 
-    case 215: { /* RegisterNatives — also capture for jet */
-        typedef jint (*fn)(void*, jclass, const void*, jint);
-        /* Guest JNINativeMethod uses guest pointers; translate to host-side temp. */
-        int n = (int)a->x[3];
-        const guest_JNINativeMethod *gm = a->x[2]?(const guest_JNINativeMethod*)G2H(a->x[2]):NULL;
-        /* Still invoke host with guest fnPtrs as-is (partner bridges them). */
-        jint rc = ((fn)f[215])(e, (jclass)(uintptr_t)a->x[1], gm, (jint)n);
-        if (gm && n > 0 && n < 4096) {
-            for (int i = 0; i < n; i++) {
-                if (!gm[i].name || !gm[i].sig || !gm[i].fnPtr) continue;
-                const char *name = (const char*)G2H(gm[i].name);
-                const char *sig  = (const char*)G2H(gm[i].sig);
-                if (ctx->reg_cb) ctx->reg_cb(ctx->reg_cb_user, "?", name, sig, gm[i].fnPtr);
-            }
-        }
-        return (uint64_t)(int64_t)rc;
-    }
+    case 215: /* RegisterNatives — ALWAYS intercept; never forward arm64 ptrs */
+        return host_register_natives(ctx, a);
     case 216: {
         typedef jint (*fn)(void*, jclass);
         return (uint64_t)(int64_t)((fn)f[216])(e, (jclass)(uintptr_t)a->x[1]);

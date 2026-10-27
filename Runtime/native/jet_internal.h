@@ -185,12 +185,18 @@ typedef struct jet_lib {
     uint32_t    gnu_maskwords;
     uint32_t    gnu_shift2;
     int         has_gnu_hash;
+    /* Program headers (full copy for dl_iterate_phdr / unwinder) */
+    void       *phdrs;         /* Elf64_Phdr[phnum] */
+    uint16_t    phnum;
+    uint64_t    dlpi_adds;     /* load generation counters */
     /* TLS */
     size_t      tls_image_size;
     size_t      tls_image_align;
     const void *tls_image;     /* init image (file) */
     size_t      tls_offset;    /* offset within thread TLS block (module) */
     int         tls_modid;
+    /* Class loader for this library (host jobject), used during JNI_OnLoad */
+    void       *class_loader;
     /* init/fini */
     uint64_t   *init_array;
     size_t      init_count;
@@ -207,6 +213,8 @@ typedef struct {
     int      used;
     jet_ctx *ctx;
     uint64_t guest_fn;
+    void    *class_loader;   /* host jobject ClassLoader for FindClass */
+    char     class_name[256];
 } jet_tramp_slot;
 
 struct jet_ctx {
@@ -246,6 +254,12 @@ struct jet_ctx {
     uint64_t        jni_pending_obj; /* guest ref returned by ExceptionOccurred */
     int             jni_pending_is_throwable;
     char            guest_cwd[512];  /* emulated process cwd */
+    void           *default_class_loader; /* host jobject, settable via API */
+    /* Per-thread-ish stack of class loaders for FindClass (host jobject). */
+#define JET_LOADER_STACK 32
+    void           *loader_stack[JET_LOADER_STACK];
+    int             loader_sp;
+    jet_lib        *onload_lib;      /* library currently in JNI_OnLoad */
     jet_register_cb reg_cb;
     void           *reg_cb_user;
     /* captured RegisterNatives for tests */
@@ -346,6 +360,12 @@ uint64_t jet_tramp_invoke(jet_ctx *ctx, uint64_t guest_fn, const jet_args *a);
 /* Guest setjmp helpers (registered as internal traps). */
 int jet_host_install_setjmp(jet_ctx *ctx);
 void jet_tramp_set_active(jet_ctx *ctx);
+void jet_loader_push(jet_ctx *ctx, void *loader);
+void jet_loader_pop(jet_ctx *ctx);
+void *jet_loader_current(jet_ctx *ctx);
+jet_trampoline jet_native_trampoline_ex(jet_ctx *ctx, uint64_t guest_fn,
+                                        void *class_loader, const char *class_name);
+
 
 /* Memory helpers (identity map: guest VA == host pointer).
  * jet_mem_guard_depth marks interpreter guarded load/store sites so soft-fault

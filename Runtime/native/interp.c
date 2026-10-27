@@ -166,12 +166,15 @@ static uint64_t bitfield_move(int sf, int opc /*0=SBFM 1=BFM 2=UBFM*/,
         int pos = bits - (int)r;
         uint64_t bot = src & mask;
         if (opc == 0) {
-            /* ASR alias when imms==011111/111111 */
-            return mask_sf(sf, (uint64_t)((int64_t)(src << (bits - (int)r)) >> (bits - (int)r)));
+            /* SBFIZ: take width bits of src, sign-extend, place at `pos` (=lsb).
+             * ASR never reaches here (imms=bits-1 => s>=r). */
+            if (bot & (1ull << (width - 1))) bot |= ~mask;
+            return mask_sf(sf, bot << pos);
         } else if (opc == 2) {
-            /* LSL alias when imms == 31/63 - immr, or LSR */
+            /* UBFIZ / LSL alias: zero-extend width bits, place at pos */
             return mask_sf(sf, bot << pos);
         } else {
+            /* BFI: insert width bits at pos into dst */
             uint64_t dmask = mask << pos;
             return mask_sf(sf, (dst & ~dmask) | (bot << pos));
         }
@@ -1206,12 +1209,18 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
         } else if (i->opc == 3) { /* pre-index */
             base = (i->rn == 31) ? c->sp : jet_x(c, i->rn);
             addr = base + (int64_t)i->imm; wb = 1;
-        } else if (i->opc == 4) { /* register offset — fall back to uimm/imm */
+        } else if (i->opc == 4) { /* register offset */
             base = (i->rn == 31) ? c->sp : jet_x(c, i->rn);
-            addr = base + (i->uimm ? i->uimm : (uint64_t)(int64_t)i->imm);
+            uint64_t idx = jet_x(c, i->rm);
+            int opt = i->cond;
+            int sh = i->uimm ? i->size : 0; /* S bit stashed in uimm for FP path */
+            if (opt == 3 || opt == 7) { if (sh) idx <<= i->size; }
+            else idx = extend_reg(1, idx, opt, (unsigned)sh);
+            addr = base + idx;
         } else {
             base = (i->rn == 31) ? c->sp : jet_x(c, i->rn);
-            addr = base + (i->uimm ? i->uimm : (uint64_t)(int64_t)i->imm);
+            /* opc 0: unsigned (uimm) or unscaled (imm); decode zeroes the unused */
+            addr = base + (i->uimm ? (uint64_t)i->uimm : (uint64_t)(int64_t)i->imm);
         }
         int nbytes;
         if (is_lit) {
@@ -1251,7 +1260,14 @@ static int exec_one(jet_ctx *ctx, jet_cpu *c, const jet_insn *i) {
         if (i->op == OP_STUR_FP) addr = base + (int64_t)i->imm;
         else if (i->opc == 1) { addr = base; wb = 1; }
         else if (i->opc == 3) { addr = base + (int64_t)i->imm; wb = 1; }
-        else addr = base + (i->uimm ? i->uimm : (uint64_t)(int64_t)i->imm);
+        else if (i->opc == 4) {
+            uint64_t idx = jet_x(c, i->rm);
+            int opt = i->cond;
+            int sh = i->uimm ? i->size : 0;
+            if (opt == 3 || opt == 7) { if (sh) idx <<= i->size; }
+            else idx = extend_reg(1, idx, opt, (unsigned)sh);
+            addr = base + idx;
+        } else addr = base + (i->uimm ? (uint64_t)i->uimm : (uint64_t)(int64_t)i->imm);
         int nbytes;
         switch (i->size) {
         case 4: nbytes = 16; break;

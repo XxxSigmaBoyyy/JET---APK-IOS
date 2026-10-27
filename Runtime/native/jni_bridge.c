@@ -576,6 +576,129 @@ static uint64_t host_call_family(jet_ctx *ctx, const jet_args *a, int idx,
     }
 }
 
+
+/* ---- ClassLoader-aware FindClass + RegisterNatives intercept ---- */
+
+static void slash_to_dot(const char *in, char *out, size_t n) {
+    size_t i = 0;
+    for (; in && in[i] && i + 1 < n; i++)
+        out[i] = (in[i] == '/') ? '.' : in[i];
+    out[i < n ? i : n - 1] = 0;
+}
+
+/* Resolve jclass → binary name via Class.getName (dotted). */
+static int host_class_get_name(jet_ctx *ctx, jobject cls, char *out, size_t n) {
+    void **f = host_fns(ctx); void *e = host_env(ctx);
+    if (!f || !e || !cls || !out || n == 0) return -1;
+    typedef jclass (*fn_fc)(void*, const char*);
+    typedef jmethodID (*fn_mid)(void*, jclass, const char*, const char*);
+    typedef jobject (*fn_call)(void*, jobject, jmethodID, ...);
+    typedef jobject (*fn_callA)(void*, jobject, jmethodID, const jvalue*);
+    typedef const char *(*fn_utf)(void*, jstring, jboolean*);
+    typedef void (*fn_rel)(void*, jstring, const char*);
+    jclass class_cls = ((fn_fc)f[6])(e, "java/lang/Class");
+    if (!class_cls) return -1;
+    jmethodID mid = ((fn_mid)f[33])(e, class_cls, "getName", "()Ljava/lang/String;");
+    if (!mid) return -1;
+    jobject jname = ((fn_callA)f[36])(e, cls, mid, NULL); /* CallObjectMethodA */
+    if (!jname) return -1;
+    jboolean copy = 0;
+    const char *utf = ((fn_utf)f[169])(e, (jstring)jname, &copy);
+    if (!utf) return -1;
+    snprintf(out, n, "%s", utf);
+    ((fn_rel)f[170])(e, (jstring)jname, utf);
+    /* Convert dots to slashes for JNI-style names in callback */
+    for (char *p = out; *p; p++) if (*p == '.') *p = '/';
+    return 0;
+}
+
+static uint64_t host_find_class_loader(jet_ctx *ctx, const char *name) {
+    void **f = host_fns(ctx); void *e = host_env(ctx);
+    if (!f || !e || !name) return 0;
+    typedef jclass (*fn_fc)(void*, const char*);
+    typedef jmethodID (*fn_mid)(void*, jclass, const char*, const char*);
+    typedef jobject (*fn_callA)(void*, jobject, jmethodID, const jvalue*);
+    typedef jstring (*fn_ns)(void*, const char*);
+    typedef void (*fn_del)(void*, jobject);
+
+    /* Arrays / descriptors: fall back to system FindClass */
+    if (name[0] == '[' || name[0] == '(') {
+        return (uint64_t)(uintptr_t)((fn_fc)f[6])(e, name);
+    }
+    void *loader = jet_loader_current(ctx);
+    if (!loader) {
+        return (uint64_t)(uintptr_t)((fn_fc)f[6])(e, name);
+    }
+    /* ClassLoader.loadClass(String) with dotted name */
+    jclass cl_cls = ((fn_fc)f[6])(e, "java/lang/ClassLoader");
+    if (!cl_cls) return (uint64_t)(uintptr_t)((fn_fc)f[6])(e, name);
+    jmethodID mid = ((fn_mid)f[33])(e, cl_cls, "loadClass",
+                                    "(Ljava/lang/String;)Ljava/lang/Class;");
+    if (!mid) return (uint64_t)(uintptr_t)((fn_fc)f[6])(e, name);
+    char dotted[512];
+    slash_to_dot(name, dotted, sizeof dotted);
+    jstring jn = ((fn_ns)f[167])(e, dotted); /* NewStringUTF */
+    if (!jn) return (uint64_t)(uintptr_t)((fn_fc)f[6])(e, name);
+    jvalue args[1]; args[0].l = jn;
+    jobject cls = ((fn_callA)f[36])(e, (jobject)loader, mid, args);
+    /* Clear exception from failed loadClass and fall back */
+    typedef jboolean (*fn_chk)(void*);
+    typedef void (*fn_clear)(void*);
+    if (!cls && ((fn_chk)f[228])(e)) {
+        ((fn_clear)f[17])(e);
+        cls = (jobject)((fn_fc)f[6])(e, name);
+    }
+    return (uint64_t)(uintptr_t)cls;
+}
+
+/* Intercept RegisterNatives: never forward guest arm64 fnPtrs to the JVM. */
+static uint64_t host_register_natives(jet_ctx *ctx, const jet_args *a) {
+    jobject jcls = (jobject)(uintptr_t)a->x[1];
+    const guest_JNINativeMethod *gm = a->x[2]
+        ? (const guest_JNINativeMethod*)G2H(a->x[2]) : NULL;
+    int n = (int)a->x[3];
+    char cname[256];
+    snprintf(cname, sizeof cname, "?");
+    if (jcls && host_fns(ctx))
+        host_class_get_name(ctx, jcls, cname, sizeof cname);
+    void *loader = jet_loader_current(ctx);
+    /* Try Class.getClassLoader if we have a class */
+    if (jcls && host_fns(ctx) && host_env(ctx)) {
+        void **f = host_fns(ctx); void *e = host_env(ctx);
+        typedef jclass (*fn_fc)(void*, const char*);
+        typedef jmethodID (*fn_mid)(void*, jclass, const char*, const char*);
+        typedef jobject (*fn_callA)(void*, jobject, jmethodID, const jvalue*);
+        jclass class_cls = ((fn_fc)f[6])(e, "java/lang/Class");
+        if (class_cls) {
+            jmethodID mid = ((fn_mid)f[33])(e, class_cls, "getClassLoader",
+                                            "()Ljava/lang/ClassLoader;");
+            if (mid) {
+                jobject ldr = ((fn_callA)f[36])(e, jcls, mid, NULL);
+                if (ldr) loader = ldr;
+            }
+        }
+    }
+    if (!gm || n < 0 || n > 4096) return (uint64_t)(int64_t)-1;
+    for (int i = 0; i < n; i++) {
+        if (!gm[i].name || !gm[i].sig || !gm[i].fnPtr) continue;
+        const char *name = (const char*)G2H(gm[i].name);
+        const char *sig  = (const char*)G2H(gm[i].sig);
+        uint64_t fn = gm[i].fnPtr;
+        /* Host trampoline that re-enters the guest (for optional host wiring). */
+        jet_native_trampoline_ex(ctx, fn, loader, cname);
+        if (ctx->nreg_log < 1024) {
+            int k = ctx->nreg_log++;
+            snprintf(ctx->reg_log[k].cls, sizeof ctx->reg_log[k].cls, "%s", cname);
+            snprintf(ctx->reg_log[k].name, sizeof ctx->reg_log[k].name, "%s", name ? name : "");
+            snprintf(ctx->reg_log[k].sig, sizeof ctx->reg_log[k].sig, "%s", sig ? sig : "");
+            ctx->reg_log[k].fn = fn;
+            ctx->reg_log[k].used = 1;
+        }
+        if (ctx->reg_cb) ctx->reg_cb(ctx->reg_cb_user, cname, name, sig, fn);
+    }
+    return 0; /* JNI_OK — never call host RegisterNatives with arm64 ptrs */
+}
+
 #include "jni_host_dispatch.inc"
 #include "jni_fake_dispatch.inc"
 
@@ -589,11 +712,19 @@ int jet_jni_onload(jet_ctx *ctx, jet_lib *lib, int32_t *version_out) {
         jet_set_error(ctx, "JNI_OnLoad not found");
         return -1;
     }
+    jet_lib *prev_onload = ctx->onload_lib;
+    ctx->onload_lib = lib;
+    if (lib->class_loader)
+        jet_loader_push(ctx, lib->class_loader);
+    else if (ctx->default_class_loader)
+        jet_loader_push(ctx, ctx->default_class_loader);
     jet_args a = {0};
     a.x[0] = H2G(ctx->guest_javavm);
     a.x[1] = 0;
     uint64_t ver = 0;
     int rc = jet_native_call(ctx, sym, &a, &ver, NULL);
+    jet_loader_pop(ctx);
+    ctx->onload_lib = prev_onload;
     if (rc != 0) {
         if (ctx->nreg_log > 0) {
             ver = JNI_VERSION_1_6;
