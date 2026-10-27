@@ -28,6 +28,8 @@ public final class JetIosHost {
 
     public static volatile int[] fb; public static volatile int fbW, fbH; public static volatile int fbSeq;
     static final BlockingQueue<float[]> touches = new LinkedBlockingQueue<>();
+    /** Work that must run on the UI loop thread (text input from the host keyboard). */
+    static final java.util.concurrent.ConcurrentLinkedQueue<Runnable> uiTasks = new java.util.concurrent.ConcurrentLinkedQueue<>();
     static final StringBuilder report = new StringBuilder();
     static volatile Thread ui; static volatile View content; static volatile Activity activity;
     static volatile String state = "idle"; static volatile long firstFrameMs = -1;
@@ -63,12 +65,19 @@ public final class JetIosHost {
             // reference) on spare cores while the user is still looking at the import; launch reuses this loader.
             long ti = System.nanoTime();
             DexClassLoader cl = loader(dir);
-            for (String k : new String[]{"application", "mainActivity"}) { String c = p.getProperty(k, ""); if (!c.isEmpty()) cl.prefetch(c); }
             tableTask(bundle, true);
+            // Install-time translation (ART's dex2oat step): every class goes to dexcache now, so launch never runs dex2jar.
+            // jet.import.translate=lazy keeps the old behaviour (translate on first use, lookahead from the entry points).
+            String tr;
+            if ("lazy".equals(System.getProperty("jet.import.translate"))) {
+                for (String k : new String[]{"application", "mainActivity"}) { String c = p.getProperty(k, ""); if (!c.isEmpty()) cl.prefetch(c); }
+                tr = "translate_all=lazy";
+            } else tr = cl.translateAll(Integer.getInteger("jet.import.threads", Runtime.getRuntime().availableProcessors()));
+            log("import_translate", tr);
             long tx = System.nanoTime();
             int dex; try (ZipFile z = new ZipFile(base)) { dex = (int) z.stream().filter(x -> x.getName().matches("classes\\d*\\.dex")).count(); }
-            return String.format(Locale.US, "ok bundle_ms=%.0f dex_index_ms=%.0f total_ms=%.0f%npackage=%s%nlabel=%s%nmainActivity=%s%ndex=%d%nnative_libs=%d%n",
-                    (tb - t0) / 1e6, (tx - ti) / 1e6, (System.nanoTime() - t0) / 1e6, p.getProperty("package", ""), p.getProperty("label", ""), p.getProperty("mainActivity", ""), dex, libs);
+            return String.format(Locale.US, "ok bundle_ms=%.0f dex_index_ms=%.0f total_ms=%.0f%n%s%npackage=%s%nlabel=%s%nmainActivity=%s%ndex=%d%nnative_libs=%d%n",
+                    (tb - t0) / 1e6, (tx - ti) / 1e6, (System.nanoTime() - t0) / 1e6, tr, p.getProperty("package", ""), p.getProperty("label", ""), p.getProperty("mainActivity", ""), dex, libs);
         } catch (Throwable t) { return "error " + root(t) + " @ " + top(root(t)); }
     }
 
@@ -197,6 +206,7 @@ public final class JetIosHost {
             log("screen", W + "x" + H);
             log("first_frame_ms", firstFrameMs + " (launch call -> first frame rendered)");
             log("jvm_uptime_ms", jvmUptimeMs());
+            log("dex_launch", "cache_complete=" + cl.cacheComplete() + " translated_at_launch=" + DexClassLoader.launchTranslated.get() + " cache_hits=" + DexClassLoader.cacheHits.get());
             state = "running";
             firstFrame.countDown();
             loop(root, act);
@@ -243,6 +253,7 @@ public final class JetIosHost {
                     jet.runtime.Looper.dirty = true;
                     t = touches.poll();
                 }
+                for (Runnable r; (r = uiTasks.poll()) != null; ) { try { r.run(); } catch (Throwable x) { log("ui_task_exception", root(x)); } jet.runtime.Looper.dirty = true; }
                 android.os.Looper.jetPump(0);
                 android.content.Intent next = android.content.Context.jetTakeStartedActivity();
                 if (next != null) log("startActivity_ignored", next.getComponent());
@@ -260,6 +271,26 @@ public final class JetIosHost {
         String[] a = arg.split("\n");
         touches.add(new float[]{Integer.parseInt(a[0].trim()), Float.parseFloat(a[1].trim()), Float.parseFloat(a[2].trim())});
         return "ok";
+    }
+    /** type("text"): host keyboard input. Commits text through the served editor's InputConnection (like an IME);
+     *  "\b" deletes one char before the cursor, "\n" sends the editor action. Runs on the UI loop thread. */
+    public static String type(String text) {
+        java.util.concurrent.CompletableFuture<String> f = new java.util.concurrent.CompletableFuture<>();
+        uiTasks.add(() -> {
+            android.view.inputmethod.InputConnection ic = android.view.inputmethod.InputMethodManager.jetConnection();
+            if (ic == null) { f.complete("error no input connection (served=" + android.view.inputmethod.InputMethodManager.jetServedView() + ")"); return; }
+            ic.beginBatchEdit();
+            for (int i = 0; i < text.length(); ) {
+                char c = text.charAt(i);
+                if (c == '\b') { ic.deleteSurroundingText(1, 0); i++; continue; }
+                if (c == '\n') { android.view.inputmethod.EditorInfo ei = android.view.inputmethod.InputMethodManager.jetEditorInfo(); ic.performEditorAction(ei == null ? 6 : (ei.imeOptions & 0xff) == 0 ? 6 : ei.imeOptions & 0xff); i++; continue; }
+                int j = i; while (j < text.length() && text.charAt(j) != '\b' && text.charAt(j) != '\n') j++;
+                ic.commitText(text.substring(i, j), 1); i = j;
+            }
+            ic.endBatchEdit();
+            f.complete("ok served=" + android.view.inputmethod.InputMethodManager.jetServedView().getClass().getName());
+        });
+        try { return f.get(10, TimeUnit.SECONDS); } catch (Exception e) { return "error " + e; }
     }
     /** Wait until the frame sequence passes `seq` (or timeout ms): "seq\ntimeoutMs" -> current seq. */
     public static String waitFrame(String arg) {
@@ -340,6 +371,21 @@ public final class JetIosHost {
         if (a.length >= 7) {
             int s = fbSeq; touch("0\n" + a[4] + "\n" + a[5]); touch("1\n" + a[4] + "\n" + a[5]);
             System.out.println("after tap seq=" + waitFrame(s + "\n5000")); System.out.println(screenshot(a[6]));
+        }
+        String script = System.getProperty("jet.script");   // lines: sleep MS | shot PATH | tap X Y | type TEXT | wait MS
+        if (script != null) for (String ln : java.nio.file.Files.readAllLines(java.nio.file.Path.of(script))) {
+            ln = ln.trim(); if (ln.isEmpty() || ln.startsWith("#")) continue;
+            String[] w = ln.split(" ", 2); String arg = w.length > 1 ? w[1] : "";
+            String r;
+            switch (w[0]) {
+                case "sleep": Thread.sleep(Long.parseLong(arg)); r = "ok"; break;
+                case "shot": r = screenshot(arg); break;
+                case "tap": { String[] xy = arg.split(" "); int s0 = fbSeq; touch("0\n" + xy[0] + "\n" + xy[1]); Thread.sleep(60); touch("1\n" + xy[0] + "\n" + xy[1]); r = "seq=" + waitFrame(s0 + "\n3000"); break; }
+                case "type": r = type(arg.replace("\\n", "\n").replace("\\b", "\b")); break;
+                case "wait": r = "seq=" + waitFrame(fbSeq + "\n" + arg); break;
+                default: r = "unknown";
+            }
+            System.out.println("[script] " + ln + " -> " + r);
         }
         System.out.println(status(""));
         System.exit(0);

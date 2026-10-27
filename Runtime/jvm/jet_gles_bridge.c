@@ -47,9 +47,29 @@ static gl_ent g_int[] = {
     {"eglGetCurrentContext", R_PTR}, {"eglGetCurrentDisplay", R_PTR}, {"eglGetCurrentSurface", R_PTR},
 };
 
+static int g_dbg = -1; static long g_dbg_n;
+static uint32_t (*p_getError)(void);
 static uint64_t h_int(jet_ctx *c, const jet_args *a, void *u) {
     (void)c; gl_ent *e = (gl_ent *)u;
     uint64_t r = ((fn_i6)e->fn)(a->x[0], a->x[1], a->x[2], a->x[3], a->x[4], a->x[5]);
+    if (g_dbg > 0 && g_dbg_n < g_dbg) {   /* JET_GLES_DEBUG=N: first N guest GL calls with args, result and glGetError */
+        g_dbg_n++;
+        uint32_t err = p_getError && strcmp(e->name, "glGetError") ? p_getError() : 0;
+        fprintf(stderr, "[jet-gles] %s(%llx,%llx,%llx,%llx,%llx,%llx) = %llx err=0x%x\n", e->name, (unsigned long long)a->x[0], (unsigned long long)a->x[1],
+                (unsigned long long)a->x[2], (unsigned long long)a->x[3], (unsigned long long)a->x[4], (unsigned long long)a->x[5], (unsigned long long)r, err);
+        if (!strcmp(e->name, "glCompileShader") || !strcmp(e->name, "glLinkProgram")) {
+            int comp = !strcmp(e->name, "glCompileShader"); char log[512] = {0}; int st = -1, n = 0;
+            void (*iv)(uint32_t, uint32_t, int *) = (void (*)(uint32_t, uint32_t, int *))gl_sym(comp ? "glGetShaderiv" : "glGetProgramiv");
+            void (*lg)(uint32_t, int, int *, char *) = (void (*)(uint32_t, int, int *, char *))gl_sym(comp ? "glGetShaderInfoLog" : "glGetProgramInfoLog");
+            if (iv) iv((uint32_t)a->x[0], comp ? 0x8B81 : 0x8B82, &st);
+            if (lg) lg((uint32_t)a->x[0], sizeof log - 1, &n, log);
+            fprintf(stderr, "[jet-gles]   status=%d log=%s\n", st, log);
+        }
+        if (!strcmp(e->name, "glShaderSource") && a->x[2]) {
+            const char *const *src = (const char *const *)(uintptr_t)a->x[2];
+            fprintf(stderr, "[jet-gles]   src: %.300s\n", src[0] ? src[0] : "(null)");
+        }
+    }
     switch (e->ret) {
     case R_U32: return (uint32_t)r;
     case R_S32: return (uint64_t)(int64_t)(int32_t)r;
@@ -74,6 +94,7 @@ int jet_gles_bridge_install(jet_ctx *ctx) {
     for (int i = 0; i < 4 && !g_gl; i++) if (libs[i]) g_gl = dlopen(libs[i], RTLD_LAZY | RTLD_GLOBAL);
     g_egl = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_GLOBAL);
     if (!gl_sym("glClear")) return 0;   /* no host GLES: keep the partner stubs */
+    { const char *d = getenv("JET_GLES_DEBUG"); g_dbg = d ? atoi(d) : 0; p_getError = (uint32_t (*)(void))gl_sym("glGetError"); }
     int n = 0;
     for (size_t i = 0; i < sizeof g_int / sizeof g_int[0]; i++) {
         g_int[i].fn = gl_sym(g_int[i].name);

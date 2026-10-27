@@ -245,9 +245,16 @@ static int guest_jni_call(JNIEnv *env, jlong fn, jobject recv, jstring jdesc, jl
     /* Named call so JET_NATIVE_STATS rows read class.method+sig. jet_native_call_named (v11) copies no stack slots,
        so methods with stack-passed args stay on jet_native_call_ex (stats under fn:<addr>). */
     const char *nm = NULL, *sg = NULL; int rc;
-    if (ns == 0 && name_of((uint64_t)fn, &nm, &sg)) rc = jet_native_call_named(g_ctx, nm, sg, (uint64_t)fn, &a, &x0, &d0);
+    static int named = -1; if (named < 0) { const char *e = getenv("JET_CALL_NAMED"); named = !(e && *e == '0'); }
+    if (named && ns == 0 && name_of((uint64_t)fn, &nm, &sg)) rc = jet_native_call_named(g_ctx, nm, sg, (uint64_t)fn, &a, &x0, &d0);
     else rc = jet_native_call_ex(g_ctx, (uint64_t)fn, &a, ns, &x0, &d0);
     pthread_mutex_unlock(&g_call_mu);
+    { static const char *ad = (const char *)1; if (ad == (const char *)1) ad = getenv("JET_ARGS_DEBUG");
+      static int adn = 0;
+      if (ad && (*ad == '*' || (nm && strstr(nm, ad))) && adn < 20000) { adn++;
+          float f0, f1; memcpy(&f0, &a.d[0], 4); memcpy(&f1, &a.d[1], 4);
+          fprintf(stderr, "[jet-args] fn=%llx %s%s x2=%llx x3=%llx x4=%llx d0=%g d1=%g -> x0=%llx\n", (unsigned long long)fn, nm ? nm : "?", sg ? sg : "", (unsigned long long)a.x[2],
+                  (unsigned long long)a.x[3], (unsigned long long)a.x[4], f0, f1, (unsigned long long)x0); } }
     *rx = x0; memcpy(rdbits, &d0, 8);
     return rc;
 }
@@ -318,6 +325,7 @@ int32_t jet_jni_bridge_init(char *err, int32_t errlen) {
     { const char *lv = getenv("JET_LOG_LEVEL"); g_log_level = lv ? atoi(lv) : 2; }
     jet_config cfg; memset(&cfg, 0, sizeof cfg); cfg.log = jet_bridge_log;
     g_ctx = jet_native_create(&cfg);
+    { extern int jet_bitmap_bridge_install(jet_ctx *); jet_bitmap_bridge_install(g_ctx); }
     { extern int jet_gles_bridge_install(jet_ctx *); int n = jet_gles_bridge_install(g_ctx); if (n) { char m[96]; snprintf(m, sizeof m, "guest GLES forwarded to host GL (%d entry points)", n); jet_bridge_log(NULL, 2, m); } }
     { const char *st = getenv("JET_NATIVE_STATS"); if (g_ctx && st && *st && *st != '0') atexit(jet_bridge_dump_stats); }
     JNIEnv *env = NULL;

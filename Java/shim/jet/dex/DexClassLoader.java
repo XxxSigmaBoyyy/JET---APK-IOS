@@ -85,6 +85,55 @@ public final class DexClassLoader extends ClassLoader {
     }
 
     public int classCount() { return index.size(); }
+
+    // ---- install-time translation (ART dex2oat role): import translates every class into cacheDir, so launch never runs dex2jar ----
+    static final String COMPLETE = ".jet-translated";
+    public static final AtomicLong launchTranslated = new AtomicLong();
+    private volatile Boolean complete;
+    /** Identity of the APK and of this translator build: a cache made by another shim build is not trusted. */
+    String stamp() {
+        long crc = 0;
+        try (InputStream in = DexClassLoader.class.getResourceAsStream("DexClassLoader.class")) { if (in != null) { java.util.zip.CRC32 c = new java.util.zip.CRC32(); c.update(in.readAllBytes()); crc = c.getValue(); } } catch (IOException ignore) {}
+        return "apk=" + apkFile.length() + ":" + apkFile.lastModified() + " classes=" + index.size() + " translator=" + Long.toHexString(crc);
+    }
+    /** True when import translated the whole APK with this translator build (launch then only reads the cache). */
+    public boolean cacheComplete() {
+        Boolean c = complete;
+        if (c == null) {
+            File m = cacheDir == null ? null : new File(cacheDir, COMPLETE);
+            String first = null;
+            try { if (m != null && m.isFile()) first = Files.readAllLines(m.toPath()).get(0); } catch (Exception ignore) {}
+            complete = c = stamp().equals(first);
+        }
+        return c;
+    }
+    /** Translate every class of the APK into cacheDir on `threads` workers; writes the completion stamp. Returns a summary. */
+    public String translateAll(int threads) throws InterruptedException {
+        if (cacheDir == null) return "translate_all=skipped (no cache dir)";
+        long t0 = System.nanoTime(); long n0 = translated.get();
+        List<String> names = new ArrayList<>(index.keySet()); Collections.sort(names);
+        java.util.concurrent.ConcurrentLinkedQueue<String> todo = new java.util.concurrent.ConcurrentLinkedQueue<>(names);
+        java.util.concurrent.ConcurrentLinkedQueue<String> failed = new java.util.concurrent.ConcurrentLinkedQueue<>();
+        java.util.concurrent.atomic.AtomicInteger hits = new java.util.concurrent.atomic.AtomicInteger();
+        Thread[] ts = new Thread[Math.max(1, threads)];
+        for (int i = 0; i < ts.length; i++) {
+            ts[i] = new Thread(null, () -> {
+                for (String n; (n = todo.poll()) != null; ) {
+                    File cf = new File(cacheDir, n.replace('.', '/') + ".class");
+                    if (cf.isFile()) { hits.incrementAndGet(); continue; }
+                    try { translateAndStore(n, index.get(n)); } catch (Throwable t) { failed.add(n + " " + t); }
+                }
+            }, "jet-dex-install-" + i, 64L << 20);
+            ts[i].start();
+        }
+        for (Thread t : ts) t.join();
+        StringBuilder m = new StringBuilder(stamp()).append('\n');
+        for (String f : failed) m.append("failed ").append(f).append('\n');
+        try { Files.write(new File(cacheDir, COMPLETE).toPath(), m.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)); } catch (IOException e) { return "translate_all=error " + e; }
+        complete = Boolean.TRUE;
+        return String.format(Locale.US, "translate_all_ms=%.0f classes=%d translated=%d cached=%d failed=%d threads=%d",
+                (System.nanoTime() - t0) / 1e6, names.size(), translated.get() - n0, hits.get(), failed.size(), ts.length);
+    }
     public boolean hasClass(String name) { return index.containsKey(name); }
 
     @Override protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
@@ -139,6 +188,7 @@ public final class DexClassLoader extends ClassLoader {
             catch (java.util.concurrent.CompletionException ce) { Throwable t = ce.getCause(); throw new ClassNotFoundException(name + " (dex translation failed: " + t + ")", t); }
             if (b != null) { lookaheadHits.incrementAndGet(); prefetchRefs(b, 0); return b; }
         }
+        if (cacheComplete()) launchTranslated.incrementAndGet();   // import left it out (failed there): translate now
         try { b = translateAndStore(name, e); mine.complete(b); }
         catch (Throwable t) { mine.completeExceptionally(t); throw new ClassNotFoundException(name + " (dex translation failed: " + t + ")", t); }
         prefetchRefs(b, 0);
@@ -208,6 +258,7 @@ public final class DexClassLoader extends ClassLoader {
     /** Queue a class for background translation (e.g. Application / launcher activity right after import). */
     public void prefetch(String name) { enqueue(name, 0); }
     void enqueue(String name, int depth) {
+        if (cacheComplete()) return;   // everything is already on disk
         if (!index.containsKey(name) || inflight.containsKey(name) || lookaheadQueued.get() >= LOOKAHEAD_MAX) return;
         java.util.concurrent.ThreadPoolExecutor p = pool(); if (p == null) return;
         java.util.concurrent.CompletableFuture<byte[]> f = new java.util.concurrent.CompletableFuture<>();
