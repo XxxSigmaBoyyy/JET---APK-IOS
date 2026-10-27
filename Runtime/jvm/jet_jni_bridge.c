@@ -14,6 +14,13 @@
 #define HAVE_JNI 0
 #endif
 
+#if HAVE_JNI && __has_include(<jvmti.h>)
+#include <jvmti.h>
+#define HAVE_JVMTI 1
+#else
+#define HAVE_JVMTI 0
+#endif
+
 #if HAVE_JNI
 void *jet_jvm_vm(void); /* from jetjvm.c */
 
@@ -70,6 +77,105 @@ static jboolean JNICALL N_setCwd(JNIEnv *env, jclass cls, jstring jpath) {
     return rc == 0 ? JNI_TRUE : JNI_FALSE;
 }
 
+/* ---- FindClass from guest code ----
+ * The guest JNIEnv now forwards to the real one. HotSpot's FindClass picks the loader of the calling native method's
+ * class, which for every guest call is Natives (system loader), so app classes (e.g. Telegram's JNI_OnLoad
+ * FindClass("org/telegram/messenger/AnimatedFileDrawableStream")) fail. Android uses the loader of the class that
+ * called System.loadLibrary. Override FindClass via JVMTI SetJNIFunctionTable: real lookup first; only on a thread
+ * that is currently running guest code, and only on failure, retry Class.forName(name, false, appLoader). */
+static __thread int t_in_guest;
+static jobject g_app_loader;                 /* global ref, set by Natives.setAppLoader */
+static jclass (JNICALL *g_orig_find_class)(JNIEnv *, const char *);
+static jclass g_class_cls; static jmethodID g_for_name;
+
+static jclass JNICALL jet_find_class(JNIEnv *env, const char *name) {
+    jclass c = g_orig_find_class(env, name);
+    if (c || !t_in_guest || !g_app_loader || !name || !g_for_name) return c;
+    jthrowable pend = (*env)->ExceptionOccurred(env);
+    (*env)->ExceptionClear(env);
+    char dotted[512]; size_t n = strlen(name);
+    if (n >= sizeof dotted) { if (pend) (*env)->Throw(env, pend); return NULL; }
+    for (size_t i = 0; i <= n; i++) dotted[i] = name[i] == '/' ? '.' : name[i];
+    jstring js = (*env)->NewStringUTF(env, dotted);
+    jclass r = js ? (jclass)(*env)->CallStaticObjectMethod(env, g_class_cls, g_for_name, js, JNI_FALSE, g_app_loader) : NULL;
+    if (js) (*env)->DeleteLocalRef(env, js);
+    if (!r || (*env)->ExceptionCheck(env)) {      /* keep the original NoClassDefFoundError */
+        (*env)->ExceptionClear(env);
+        if (pend) (*env)->Throw(env, pend);
+        return NULL;
+    }
+    if (pend) (*env)->DeleteLocalRef(env, pend);
+    return r;
+}
+
+/* RegisterNatives from guest code: the fnPtrs are guest (arm64) addresses and the target methods are not `native`
+ * (DexClassLoader rewrote them into Natives.jni bodies), so the real RegisterNatives must not see them: record them
+ * under the real class name and report success. Host (non-guest) callers go to the real implementation. */
+static jint (JNICALL *g_orig_register_natives)(JNIEnv *, jclass, const JNINativeMethod *, jint);
+static jint (JNICALL *g_orig_unregister_natives)(JNIEnv *, jclass);
+static jmethodID g_get_name;
+
+static jint JNICALL jet_register_natives(JNIEnv *env, jclass c, const JNINativeMethod *m, jint n) {
+    if (!t_in_guest) return g_orig_register_natives(env, c, m, n);
+    char cname[512] = "?";
+    jstring js = (c && g_get_name) ? (jstring)(*env)->CallObjectMethod(env, c, g_get_name) : NULL;
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (js) {
+        const char *u = (*env)->GetStringUTFChars(env, js, NULL);
+        if (u) { snprintf(cname, sizeof cname, "%s", u); (*env)->ReleaseStringUTFChars(env, js, u); }
+        (*env)->DeleteLocalRef(env, js);
+        for (char *p = cname; *p; p++) if (*p == '.') *p = '/';
+    }
+    for (jint i = 0; m && i < n; i++)
+        on_register(NULL, cname, m[i].name, m[i].signature, (uint64_t)(uintptr_t)m[i].fnPtr);
+    fprintf(stderr, "[jetjni] guest RegisterNatives %s x%d\n", cname, (int)n);
+    return JNI_OK;
+}
+static jint JNICALL jet_unregister_natives(JNIEnv *env, jclass c) {
+    return t_in_guest ? JNI_OK : g_orig_unregister_natives(env, c);
+}
+
+static void install_find_class_override(JNIEnv *env) {
+#if HAVE_JVMTI
+    static int done;
+    if (done || !g_vm) return;
+    done = 1;
+    jclass cc = (*env)->FindClass(env, "java/lang/Class");
+    if (!cc) { (*env)->ExceptionClear(env); return; }
+    g_class_cls = (jclass)(*env)->NewGlobalRef(env, cc);
+    g_for_name = (*env)->GetStaticMethodID(env, cc, "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;");
+    if (!g_for_name) { (*env)->ExceptionClear(env); return; }
+    jvmtiEnv *ti = NULL;
+    if ((*g_vm)->GetEnv(g_vm, (void **)&ti, JVMTI_VERSION_1_2) != JNI_OK || !ti) {
+        fprintf(stderr, "[jetjni] no JVMTI: guest FindClass of app classes will fail\n"); return;
+    }
+    jniNativeInterface *tbl = NULL;
+    if ((*ti)->GetJNIFunctionTable(ti, &tbl) != JVMTI_ERROR_NONE || !tbl) return;
+    g_get_name = (*env)->GetMethodID(env, cc, "getName", "()Ljava/lang/String;");
+    if (!g_get_name) (*env)->ExceptionClear(env);
+    g_orig_find_class = tbl->FindClass;
+    tbl->FindClass = jet_find_class;
+    g_orig_register_natives = tbl->RegisterNatives;
+    tbl->RegisterNatives = jet_register_natives;
+    g_orig_unregister_natives = tbl->UnregisterNatives;
+    tbl->UnregisterNatives = jet_unregister_natives;
+    jvmtiError e = (*ti)->SetJNIFunctionTable(ti, tbl);
+    (*ti)->Deallocate(ti, (unsigned char *)tbl);
+    if (e != JVMTI_ERROR_NONE) fprintf(stderr, "[jetjni] SetJNIFunctionTable failed: %d\n", (int)e);
+#else
+    (void)env;
+#endif
+}
+
+static void JNICALL N_setAppLoader(JNIEnv *env, jclass cls, jobject loader) {
+    (void)cls;
+    pthread_mutex_lock(&g_mu);
+    if (g_app_loader) (*env)->DeleteGlobalRef(env, g_app_loader);
+    g_app_loader = loader ? (*env)->NewGlobalRef(env, loader) : NULL;
+    install_find_class_override(env);
+    pthread_mutex_unlock(&g_mu);
+}
+
 static jet_lib *find_lib(const char *path) {
     for (int i = 0; i < g_nlibs; i++) if (!strcmp(g_libnames[i], path)) return g_libs[i];
     return NULL;
@@ -96,7 +202,11 @@ static jboolean JNICALL N_loadPath(JNIEnv *env, jclass cls, jstring jpath) {
             g_nlibs++;
         }
         int32_t ver = 0;
-        if (jet_jni_onload(g_ctx, lib, &ver) == JET_NATIVE_OK)
+        jet_jni_bind(g_ctx, g_vm, env);
+        t_in_guest++;
+        int orc = jet_jni_onload(g_ctx, lib, &ver);
+        t_in_guest--;
+        if (orc == JET_NATIVE_OK)
             fprintf(stderr, "[jetjni] JNI_OnLoad => 0x%x\n", (unsigned)ver);
     }
     pthread_mutex_unlock(&g_mu);
@@ -200,7 +310,9 @@ static int guest_jni_call(JNIEnv *env, jlong fn, jobject recv, jstring jdesc, jl
     pthread_mutex_lock(&g_call_mu);
     jet_jni_bind(g_ctx, g_vm, env);   /* the guest's JNI calls go to this thread's env */
     uint64_t x0 = 0; double d0 = 0;
+    t_in_guest++;
     int rc = jet_native_call_ex(g_ctx, (uint64_t)fn, &a, ns, &x0, &d0);
+    t_in_guest--;
     pthread_mutex_unlock(&g_call_mu);
     *rx = x0; memcpy(rdbits, &d0, 8);
     return rc;
@@ -238,6 +350,7 @@ static int register_natives_class(JNIEnv *env) {
     JNINativeMethod m[] = {
         { "loadPath", "(Ljava/lang/String;)Z", (void *)N_loadPath },
         { "setCwd",   "(Ljava/lang/String;)Z", (void *)N_setCwd },
+        { "setAppLoader", "(Ljava/lang/ClassLoader;)V", (void *)N_setAppLoader },
         { "resolve",  "(Ljava/lang/String;Ljava/lang/String;)J", (void *)N_resolve },
         { "call",     "(J[J[D)J", (void *)N_call },
         { "registered", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)J", (void *)N_registered },
@@ -266,6 +379,7 @@ int32_t jet_jni_bridge_init(char *err, int32_t errlen) {
         jet_jni_bind(g_ctx, vm, env);
         jet_jni_on_register_natives(g_ctx, on_register, NULL);
     }
+    install_find_class_override(env);
     if (register_natives_class(env) != 0) {
         snprintf(err, errlen, "Natives class not on classpath yet (soft)");
         return 0;

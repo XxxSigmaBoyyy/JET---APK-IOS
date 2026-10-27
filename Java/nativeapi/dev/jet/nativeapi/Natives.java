@@ -17,9 +17,16 @@ public final class Natives {
 
     /** Guest process cwd (getcwd, relative paths) for the partner runtime; must be absolute. */
     public static native boolean setCwd(String absDir);
+    /** Loader used when guest JNI FindClass misses on the system loader (Android: the loadLibrary caller's loader). */
+    public static native void setAppLoader(ClassLoader cl);
+    private static ClassLoader loaderSet;
     private static String cwdSet;
     /** Point the guest cwd at the package's absolute getFilesDir() (jet.files.dir, else jet.data.dir/jet.package/files). */
     static synchronized void ensureCwd() {
+        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        if (cl != null && cl != loaderSet && cl != ClassLoader.getSystemClassLoader()) {
+            try { setAppLoader(cl); loaderSet = cl; } catch (UnsatisfiedLinkError e) { System.err.println("[jet.natives] setAppLoader unavailable: " + e); }
+        }
         String d = System.getProperty("jet.files.dir");
         if (d == null) {
             String data = System.getProperty("jet.data.dir"), pkg = System.getProperty("jet.package");
