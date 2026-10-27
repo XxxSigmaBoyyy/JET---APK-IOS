@@ -1,11 +1,11 @@
 --- a/make/modules/java.desktop/lib/Awt2dLibraries.gmk
 +++ b/make/modules/java.desktop/lib/Awt2dLibraries.gmk
-@@ -500,6 +500,13 @@ ifeq ($(call isTargetOs, windows), true)
+@@ -508,6 +508,12 @@
    LIBFONTMANAGER_EXCLUDE_FILES += X11FontScaler.c \
        X11TextRenderer.c
    LIBFONTMANAGER_OPTIMIZATION := HIGHEST
 +else ifeq ($(call isTargetOs, macosx), true)
-+  # JET_IOS: Pojav maps ios→macosx; FreeType only (no X11 bitmap fonts).
++  # JET_IOS: Pojav maps ios to macosx; FreeType only (no X11 bitmap fonts).
 +  LIBFONTMANAGER_EXCLUDE_FILES += X11FontScaler.c \
 +      X11TextRenderer.c \
 +      fontpath.c \
