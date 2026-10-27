@@ -105,7 +105,7 @@ mv src/java.desktop/macosx_NOTIOS/native/libjsound src/java.desktop/macosx/nativ
 # JET local patches (if any)
 for p in "$ROOT"/scripts/jre/patches/*.diff; do [ -f "$p" ] && { log "apply $(basename "$p")"; git apply --whitespace=nowarn "$p"; }; done
 
-FLAGS="-DHEADLESS=1 -I$INC -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-function-pointer-types -DTARGET_OS_OSX -DLE_STANDALONE -O2"
+FLAGS="-DJET_IOS=1 -DHEADLESS=1 -I$INC -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-function-pointer-types -DTARGET_OS_OSX -DLE_STANDALONE -O2"
 export BUILD_SYSROOT_CFLAGS="-isysroot $MACSYSROOT"
 export HOTSPOT_DISABLE_DTRACE_PROBES=1
 log "configure ($SDK, zero)"
@@ -128,8 +128,8 @@ bash ./configure \
 tail -40 "$W/jdk-configure.log"
 BD=$(ls -d build/*/ | head -1)
 log "make images ($BD)"
-make -C "$BD" JOBS="$(sysctl -n hw.ncpu)" images LOG=warn > "$W/jdk-make.log" 2>&1 || {
-  grep -n -E "error:|Error [0-9]|failed" "$W/jdk-make.log" | head -60; tail -80 "$W/jdk-make.log"; exit 1; }
+make -k -C "$BD" JOBS="$(sysctl -n hw.ncpu)" images LOG=warn > "$W/jdk-make.log" 2>&1 || {
+  grep -E "error:" "$W/jdk-make.log" | sort -u | head -80; tail -80 "$W/jdk-make.log"; exit 1; }
 log "jlink ($JRE_MODULES)"
 rm -rf "$OUT/jre"
 "$BOOT_JDK/bin/jlink" --module-path "$BD/images/jmods" --add-modules "$JRE_MODULES" \

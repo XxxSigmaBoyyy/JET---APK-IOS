@@ -1,0 +1,16 @@
+diff --git a/src/hotspot/os_cpu/bsd_zero/os_bsd_zero.cpp b/src/hotspot/os_cpu/bsd_zero/os_bsd_zero.cpp
+index 55b5efd5f..845b3e332 100644
+--- a/src/hotspot/os_cpu/bsd_zero/os_bsd_zero.cpp
++++ b/src/hotspot/os_cpu/bsd_zero/os_bsd_zero.cpp
+@@ -359,7 +359,11 @@ int os::extra_bang_size_in_bytes() {
+ 
+ #if defined(AARCH64) && defined(__APPLE__)
+ void os::current_thread_enable_wx(WXMode mode) {
++#ifndef JET_IOS
+   pthread_jit_write_protect_np(mode == WXExec);
++#else
++  (void)mode;   // JET/iOS: Zero generates no code and iOS has no MAP_JIT for apps; nothing to toggle
++#endif
+ }
+ #endif
+ 
